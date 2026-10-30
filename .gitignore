@@ -1,0 +1,24 @@
+/target/
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Runtime profiles (when POPCHAT_DATA_DIR points at the repository)
+/settings.json
+/provider_store.json
+/panel.json
+/prompt_history.json
+/shortcuts.json
+/conversations/
+/logs/
+
+# Local build and installer outputs
+*.exe
+*.pdb
+*.msi
+*.msix
+*.log

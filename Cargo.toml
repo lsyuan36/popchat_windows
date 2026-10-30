@@ -1,0 +1,75 @@
+[package]
+name = "popchat_windows"
+version = "0.1.0"
+edition = "2021"
+description = "PopChat Windows port — all-Rust floating chat panel for OpenAI-compatible models"
+license = "MIT"
+
+[[bin]]
+name = "popchat_windows"
+path = "src/main.rs"
+
+[dependencies]
+# UI
+eframe = { version = "0.32", features = ["default_fonts", "glow"] }
+egui = "0.32"
+# Async + HTTP (SSE streaming)
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"] }
+futures = "0.3"
+# Serde
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Errors / utils
+ab_glyph = "0.2"
+anyhow = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+# Platform dirs (legacy plaintext secrets are imported into the native store)
+directories = "6"
+# Tray + global hotkey (Windows)
+tray-icon = "0.2"
+global-hotkey = "0.7"
+winit = "0.30"
+# Clipboard images
+arboard = "3"
+# Attachments: images / xlsx / mime sniffing
+image = "0.25"
+calamine = "0.26"
+mime_guess = "2"
+infer = "0.19"
+lopdf = "0.38"
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
+quick-xml = "0.37"
+encoding_rs = "0.8"
+unicode-segmentation = "1.12"
+unicode-normalization = "0.1"
+rfd = "0.17"
+rwml = { version = "=0.1.5", default-features = false }
+# Markdown helpers (pure rust)
+pulldown-cmark = "0.13"
+# LaTeX AST -> OpenType MATH layout -> embedded glyph-outline SVG -> raster.
+latex-rust = "=2.1.1"
+resvg = { version = "0.48", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
+# Auth / helpers
+open = "5"
+sha2 = "0.10"
+rand = "0.9"
+axum = "0.7"
+# Update check
+self_update = { version = "0.42", default-features = false, features = ["rustls"] }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
+# keyring 3 otherwise defaults to a non-persistent mock credential store.
+keyring = { version = "3", features = ["windows-native"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+tempfile = "3"
+wiremock = "0.6"
+
+[profile.release]
+opt-level = 3
+strip = true
