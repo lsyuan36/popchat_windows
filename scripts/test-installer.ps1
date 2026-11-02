@@ -14,6 +14,25 @@ $name = if ($TestInstaller) { 'PopChat Installer Test' } else { 'PopChat' }
 $keyName = if ($TestInstaller) { 'PopChatWindowsInstallerTest' } else { 'PopChatWindows' }
 $reg = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\$keyName"
 $shell = New-Object -ComObject WScript.Shell
+# Hosted Windows runners may expose TEMP through an 8.3 path (RUNNER~1),
+# while ShellLink resolves the same directory to its long spelling.
+Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class PopChatInstallerTestPath {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern uint GetLongPathName(string path, StringBuilder buffer, uint length);
+    public static string Normalize(string path) {
+        var buffer = new StringBuilder(32768);
+        uint length = GetLongPathName(path, buffer, (uint)buffer.Capacity);
+        if (length == 0 || length >= buffer.Capacity)
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        return buffer.ToString().TrimEnd('\\');
+    }
+}
+'@
 $shortcuts = @(
     (Join-Path ([Environment]::GetFolderPath('StartMenu')) "Programs\$name.lnk"),
     (Join-Path ([Environment]::GetFolderPath('DesktopDirectory')) "$name.lnk")
@@ -57,7 +76,13 @@ for ($pass = 0; $pass -lt 2; $pass++) {
     if ($registration.InstallLocation -ne $dir -or $registration.Publisher -ne 'Evis Lai') { throw 'Installed apps registration mismatch.' }
     foreach ($shortcut in $shortcuts) {
         $link = $shell.CreateShortcut($shortcut)
-        if ($link.TargetPath -ne (Join-Path $dir 'popchat_windows.exe') -or $link.WorkingDirectory -ne $dir) { throw 'Shortcut target/working directory mismatch.' }
+        $target = [PopChatInstallerTestPath]::Normalize($link.TargetPath)
+        $working = [PopChatInstallerTestPath]::Normalize($link.WorkingDirectory)
+        $expectedTarget = [PopChatInstallerTestPath]::Normalize((Join-Path $dir 'popchat_windows.exe'))
+        $expectedWorking = [PopChatInstallerTestPath]::Normalize($dir)
+        if ($target -ne $expectedTarget -or $working -ne $expectedWorking) {
+            throw "Shortcut target/working directory mismatch: shortcut=$shortcut target=$target expected_target=$expectedTarget working=$working expected_working=$expectedWorking"
+        }
     }
 }
 $backups = @(Get-ChildItem -LiteralPath $dir -Directory -Filter '.popchat-before-nsis-*')
