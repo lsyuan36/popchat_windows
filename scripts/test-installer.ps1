@@ -56,7 +56,8 @@ for ($pass = 0; $pass -lt 2; $pass++) {
     $registration = Get-ItemProperty -LiteralPath $reg
     if ($registration.InstallLocation -ne $dir -or $registration.Publisher -ne 'Evis Lai') { throw 'Installed apps registration mismatch.' }
     foreach ($shortcut in $shortcuts) {
-        if ($shell.CreateShortcut($shortcut).TargetPath -ne (Join-Path $dir 'popchat_windows.exe')) { throw 'Shortcut target mismatch.' }
+        $link = $shell.CreateShortcut($shortcut)
+        if ($link.TargetPath -ne (Join-Path $dir 'popchat_windows.exe') -or $link.WorkingDirectory -ne $dir) { throw 'Shortcut target/working directory mismatch.' }
     }
 }
 $backups = @(Get-ChildItem -LiteralPath $dir -Directory -Filter '.popchat-before-nsis-*')

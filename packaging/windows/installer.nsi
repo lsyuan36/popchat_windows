@@ -203,6 +203,7 @@ Section "PopChat" SEC_APP
   SetOutPath "$INSTDIR\licenses\nsis"
   File /oname=COPYING "${NSIS_LICENSE}"
   IfErrors install_failed
+  SetOutPath "$INSTDIR"
   Call WriteManifest
   WriteUninstaller "$INSTDIR\Uninstall.exe"
   CreateShortcut "$SMPROGRAMS\${SHORTCUT_NAME}.lnk" "$INSTDIR\popchat_windows.exe"
