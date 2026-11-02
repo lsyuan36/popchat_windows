@@ -98,6 +98,21 @@ cargo build --locked --release --bins --target x86_64-pc-windows-msvc --target-d
 開發工作樹的使用者層級安裝／自訂服務匯入流程見 [INSTALL.md](INSTALL.md)。
 新使用者不需要執行該匯入流程；使用發行 ZIP 即可。
 
+## GitHub Actions 直接打包 EXE
+
+到 **[Actions → Build Windows EXE](https://github.com/lsyuan36/popchat_windows/actions/workflows/windows-build.yml)**
+按 **Run workflow**。`build_ref` 留空會建置目前分支，也可指定 tag／commit。
+推送 `main`、`v*` tag 或建立 PR 時也會自動執行。
+
+成功後，在該次工作流程頁面的 **Artifacts** 下載：
+
+- **PopChat-Windows-x64-EXE**：`popchat_windows.exe`、`popchat_updater.exe` 與必要授權文件。
+- **PopChat-Windows-x64-Release**：完整發行 ZIP、`SHA256SUMS.txt` 和來源 manifest。
+
+使用 GitHub 的 Windows 2022／MSVC runner 和 Rust stable，不需要自行安裝字體、
+提供 API 金鑰或在 runner 開啟桌面 UI。流程驗證更新安全測試與真正的 ZIP，
+不會自動發佈 Release 或修改使用者資料。Artifacts 保留 14 天；長期下載請使用 Releases。
+
 ## 已知限制
 
 LOCAL BUILD 仍在迭代，並非完整移植宣告。真實 provider／訂閱帳號、

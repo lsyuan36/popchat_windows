@@ -1,0 +1,144 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_ref:
+        description: "Optional branch, tag or commit to build (blank = this workflow ref)"
+        required: false
+        type: string
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-exe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-x64:
+    name: Windows x64 · LOCAL BUILD
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_TERM_COLOR: always
+      RUSTUP_TOOLCHAIN: stable
+      CARGO_INCREMENTAL: "0"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.build_ref || github.ref }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install Rust and MSVC target
+        id: rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustc --version
+          cargo --version
+          $version = (rustc --version).Split(' ')[1]
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Restore Cargo cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/button-review
+          key: windows-msvc-release-v1-${{ steps.rust.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            windows-msvc-release-v1-${{ steps.rust.outputs.version }}-
+            windows-msvc-release-v1-
+
+      - name: Fetch locked dependency metadata
+        run: |
+          # The offline license-inventory check also reads manifests of target-
+          # specific crates. Fetch the lockfile, but build only the MSVC target.
+          cargo fetch --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Check Rust formatting
+        run: |
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # These suites do not require optional installed fonts, API credentials,
+      # a desktop session, or a second PopChat UI on the hosted runner.
+      - name: Test release and update safety
+        run: |
+          cargo test --locked --release --target x86_64-pc-windows-msvc --target-dir target/button-review --lib update::tests -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --release --target x86_64-pc-windows-msvc --target-dir target/button-review --lib updater::tests -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build EXEs and release ZIP
+        id: package
+        run: |
+          & .\scripts\package-release.ps1
+          $manifests = @(Get-ChildItem -LiteralPath target/releases -Filter release-manifest.json -Recurse -File)
+          if ($manifests.Count -ne 1) { throw 'Expected exactly one release package.' }
+          $dir = $manifests[0].DirectoryName
+          $manifest = Get-Content -LiteralPath $manifests[0].FullName -Raw | ConvertFrom-Json
+          if ($manifest.source_dirty -or $manifest.skip_build) { throw 'Publishable artifacts require a clean, built source checkout.' }
+          "package_dir=$dir" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "version=$($manifest.version)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "source_commit=$($manifest.source_commit)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Validate the real ZIP with the updater
+        env:
+          PACKAGE_DIR: ${{ steps.package.outputs.package_dir }}
+        run: |
+          $manifest = Get-Content -LiteralPath (Join-Path $env:PACKAGE_DIR 'release-manifest.json') -Raw | ConvertFrom-Json
+          $env:POPCHAT_TEST_RELEASE_ARCHIVE = Join-Path $env:PACKAGE_DIR $manifest.assetname
+          $env:POPCHAT_TEST_RELEASE_SHA256 = $manifest.sha256
+          cargo test --locked --release --target x86_64-pc-windows-msvc --target-dir target/button-review --lib updater::tests::release_zip_matches_updater_contract -- --ignored --exact --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload EXEs with required notices
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: PopChat-Windows-x64-EXE
+          path: ${{ steps.package.outputs.package_dir }}/staging/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload complete release package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: PopChat-Windows-x64-Release
+          path: |
+            ${{ steps.package.outputs.package_dir }}/PopChat-Windows-x64.zip
+            ${{ steps.package.outputs.package_dir }}/SHA256SUMS.txt
+            ${{ steps.package.outputs.package_dir }}/release-manifest.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Summarize downloads
+        env:
+          BUILD_VERSION: ${{ steps.package.outputs.version }}
+          BUILD_COMMIT: ${{ steps.package.outputs.source_commit }}
+        run: |
+          @"
+          ## PopChat $env:BUILD_VERSION — LOCAL BUILD
+          Author: **Evis Lai**
+
+          - **PopChat-Windows-x64-EXE**: main EXE, updater EXE and required notices.
+          - **PopChat-Windows-x64-Release**: portable ZIP, SHA256SUMS and release manifest.
+          - Source commit: $env:BUILD_COMMIT
+          - Windows x64, unsigned. No installed TT Norms Pro or Arial files are bundled.
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
