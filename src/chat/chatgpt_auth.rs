@@ -40,16 +40,32 @@ pub const SCOPE: &str = "openid profile email offline_access";
 pub const ORIGINATOR: &str = "popchat";
 pub const USER_AGENT: &str = "PopChat/1.0 (Windows)";
 
-pub const DEFAULT_MODEL: &str = "gpt-5.5";
-/// The Codex backend serves a fixed catalog — no /models endpoint. Mirrors
-/// opencode's allowlist.
-pub const MODEL_CATALOG: &[&str] = &["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"];
+pub const DEFAULT_MODEL: &str = "gpt-6.1-sol";
+/// Subscription catalog snapshot checked against OpenAI's Codex model guide
+/// on 2026-11-02: https://learn.chatgpt.com/docs/models . Not an account-specific
+/// availability probe; plans/workspaces/rollouts may restrict individual models.
+/// GPT-5.5/5.4/5.4-mini/Spark have retired from ChatGPT-authenticated Codex.
+pub const MODEL_CATALOG: &[&str] = &["gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-astra", "gpt-6-luna"];
+
+/// Only known retired subscription choices are migrated. An offline catalog
+/// must not erase a manually entered newer/account-specific model on restart.
+pub const RETIRED_SUBSCRIPTION_MODELS: &[&str] = &[
+    "gpt-5.5",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5.3-codex-spark",
+    "gpt-5.3-codex",
+    "gpt-5.2",
+];
 
 /// Hand-maintained per-model reasoning-effort table: the direct subscription
 /// backend has no capabilities endpoint, and an effort it rejects turns EVERY
 /// turn into a 400 (`reasoning.effort` goes on the wire verbatim).
 pub fn supported_reasoning_efforts(model: &str) -> &'static [&'static str] {
     match model {
+        "gpt-6.1-sol" | "gpt-6.1-terra" | "gpt-6-astra" | "gpt-6-luna" => {
+            &["low", "medium", "high", "xhigh", "max"]
+        }
         "gpt-5.5" | "gpt-5.4" | "gpt-5.4-mini" => &["low", "medium", "high", "xhigh"],
         "gpt-5.3-codex-spark" => &["low", "medium", "high", "xhigh"],
         _ => &[],
@@ -58,6 +74,9 @@ pub fn supported_reasoning_efforts(model: &str) -> &'static [&'static str] {
 
 pub fn default_reasoning_effort(model: &str) -> Option<&'static str> {
     match model {
+        "gpt-6.1-sol" | "gpt-6.1-terra" => Some("medium"),
+        "gpt-6-astra" => Some("low"),
+        "gpt-6-luna" => Some("high"),
         "gpt-5.5" | "gpt-5.4" | "gpt-5.4-mini" => Some("medium"),
         "gpt-5.3-codex-spark" => Some("high"),
         _ => None,
@@ -967,6 +986,24 @@ fn html_escape(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn subscription_catalog_uses_current_models_with_valid_reasoning_defaults() {
+        assert_eq!(super::DEFAULT_MODEL, "gpt-6.1-sol");
+        assert_eq!(
+            super::MODEL_CATALOG,
+            &["gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-astra", "gpt-6-luna"]
+        );
+        for model in super::MODEL_CATALOG {
+            let efforts = super::supported_reasoning_efforts(model);
+            assert!(efforts.contains(&super::default_reasoning_effort(model).unwrap()));
+            assert!(efforts.contains(&"max"));
+            assert!(
+                !efforts.contains(&"none"),
+                "subscription picker conservatively exposes reasoning modes only"
+            );
+        }
+        assert!(super::supported_reasoning_efforts("unknown-model").is_empty());
+    }
     use super::*;
 
     #[test]

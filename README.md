@@ -1,0 +1,119 @@
+# PopChat for Windows · LOCAL BUILD
+
+輕量的 Windows 浮動 AI 聊天面板，以 **Rust + egui/eframe** 實作。
+
+**Windows 移植／維護：Evis Lai** · 目前版本：**0.2.0 — LOCAL BUILD**
+
+> 本專案移植自 **Le Chen / lec77** 的 macOS 專案
+> **[lec77/PopChat](https://github.com/lec77/PopChat)**。
+> 感謝原作者的設計與開源實作。這是獨立的 Windows 移植版，並非原專案官方發行，
+> 也不宣稱已完全等同原版。原始 MIT 版權聲明保留於 [LICENSE](LICENSE)。
+
+## 下載與啟動
+
+從 **[本專案 Releases](https://github.com/lsyuan36/popchat_windows/releases/latest)**
+下載 `PopChat-Windows-x64.zip`。
+
+1. 將整個 ZIP 解壓縮到有寫入權限的資料夾。
+2. 保留 `popchat_windows.exe`、`popchat_updater.exe` 和授權文件在同一個資料夾。
+3. 執行 `popchat_windows.exe`，在設定中加入服務、端點與模型。
+
+請勿直接在 ZIP 內執行，也不需要以系統管理員身分執行。
+目前提供 **Windows x64** LOCAL BUILD；執行檔尚未進行程式碼簽章，
+Windows SmartScreen 可能顯示未識別的應用程式。請核對來源與發行頁的 SHA-256。
+
+## 功能
+
+- 可設定的全域快捷鍵喚出／收起、系統匣待命、視窗釘選與拖曳。
+- OpenAI 相容服務與自訂模型；另有 ChatGPT 訂閱／Codex 整合。
+- 串流回覆、思考內容收合、停止、重試、編輯提問、建立分支。
+- 歷史紀錄、聊天搜尋、附件、貼上圖片／檔案及拖放檔案。
+- Markdown、程式碼、表格與公式；訊息、程式碼及整張表格複製。
+- 淺色米黃／深色主題、透明度、位置設定與頁面切換動畫。
+- 中英字體分開選擇；中文預設內建 **獅尾圓體**。
+- 英文預設 **已安裝的 TT Norms Pro → Arial**；這兩種字體不隨程式散佈。
+- 聊天文字大小 **12–24 pt**、即時預覽；全域快捷鍵支援按鍵錄製。
+- 圖示 hover 顯示功能、快捷鍵與停用原因。
+- 從此 repo 的 Releases 檢查、下載更新，確認後安裝並重新啟動。
+
+ChatGPT／Codex 整合的可用性取決於帳號、方案、外部工具及服務變更；
+這不是 OpenAI 官方用戶端。不要把離線測試通過視為所有真實帳號皆已驗收。
+
+## 常用操作
+
+| 快捷鍵 | 功能 |
+|---|---|
+| `Alt+Down` | 預設全域喚出／收起，可在設定內錄製其他組合 |
+| `Ctrl+N` / `Ctrl+Y` | 新聊天／聊天歷史 |
+| `Ctrl+F` | 搜尋目前聊天 |
+| `Ctrl+G` / `Ctrl+Shift+G` | 下一個／上一個搜尋結果 |
+| `Ctrl+O` | 加入附件 |
+| `Ctrl+E` | 展開／收合輸入框 |
+| `Enter` / `Shift+Enter` | 一般輸入框送出／換行 |
+| `Ctrl+Enter` | 大編輯器內送出 |
+| `Ctrl+,` | 開啟／關閉設定 |
+| `Ctrl+P` / `Ctrl+W` | 釘選／隱藏視窗 |
+
+輸入法組字期間的 Enter 優先用於選字；指令補完開啟時 Enter 先選取指令。
+`Alt+Space` 是 Windows 保留組合，不接受設為全域快捷鍵。
+
+## 更新
+
+設定中的自動檢查每天最多執行一次，也可按「立即檢查更新」。
+更新來源僅為 **`lsyuan36/popchat_windows` 的正式 GitHub Releases**，
+不是原 macOS 專案。
+
+有新版時先下載並驗證 GitHub 資產 SHA-256，再由使用者確認安裝和重新啟動。
+更新助手等待目前程式完全退出，才替換執行檔；不會同時開兩個聊天 UI。
+安裝不更換資料目錄、不重匯入服務、不讀寫遷移憑證。
+請在確認重新啟動前完成尚未送出的訊息與未儲存的 API 編輯。
+若自動更新無法使用，仍可從 Releases 下載 ZIP 手動更新。
+
+## 資料與隱私
+
+- 一般資料位於 `%APPDATA%\PopChat\PopChat\config`；包含偏好、服務設定和聊天歷史。
+- 金鑰／登入憑證使用 Windows Credential Manager，不應放進 repo 或 issue。
+- 對模型服務、搜尋服務或登入服務的請求會依使用者設定傳送必要資料；
+  更新檢查則會連線 GitHub。這不是完全離線的應用程式。
+- 一般外觀偏好即時保存，**不會順帶提交未儲存的 API 端點／金鑰草稿**。
+- `POPCHAT_DATA_DIR` 是開發／隔離測試選項，日常使用請勿隨意切換，
+  以免看見另一份服務設定或歷史。
+
+## 開發與驗證
+
+需求：Windows x64、Rust stable、MSVC C++ Build Tools 與 Windows SDK。
+
+```powershell
+cargo fmt --all -- --check
+cargo check --locked --all-targets
+cargo test --locked --all-targets --quiet
+cargo build --locked --release --bins --target x86_64-pc-windows-msvc --target-dir target/button-review
+```
+
+```powershell
+# 從已驗證的 release build 產生 ZIP、SHA256SUMS 和 release-manifest：
+.\scripts\package-release.ps1 -SkipBuild
+```
+
+開發工作樹的使用者層級安裝／自訂服務匯入流程見 [INSTALL.md](INSTALL.md)。
+新使用者不需要執行該匯入流程；使用發行 ZIP 即可。
+
+## 已知限制
+
+LOCAL BUILD 仍在迭代，並非完整移植宣告。真實 provider／訂閱帳號、
+原生注音、多螢幕與混合 DPI、無障礙及部分原版動畫仍需更多驗收。
+文件／公式格式也不保證涵蓋所有來源。
+
+完整函式對照與缺口：[FUNCTION_PARITY.md](FUNCTION_PARITY.md)。
+實作與驗證紀錄：[PORT_PROGRESS.md](PORT_PROGRESS.md)。
+
+回報問題請附 Windows 版本、應用程式版本、重現步驟及已去識別化的截圖；
+不要上傳金鑰、聊天歷史、憑證或完整的私人設定檔。
+
+## 授權與致謝
+
+- 原專案：[lec77/PopChat](https://github.com/lec77/PopChat)，**Le Chen**，MIT。
+- Windows Rust 移植與維護：**Evis Lai**，MIT。
+- 字體、圖示及依賴授權：[NOTICE.md](NOTICE.md)、`THIRD_PARTY_NOTICES.md`。
+
+**TT Norms Pro 與 Arial 不包含在本 repo 或發行檔中。**

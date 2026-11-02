@@ -66,6 +66,11 @@ pub struct AppSettings {
     pub bubble_style: theme::BubbleStyle,
     #[serde(default)]
     pub font_preferences: fonts::FontPreferences,
+    #[serde(
+        default = "default_chat_font_size",
+        deserialize_with = "deserialize_chat_font_size"
+    )]
+    pub chat_font_size: u16,
     #[serde(default)]
     pub window_preferences: window_prefs::WindowPreferences,
     #[serde(default = "default_hotkey_binding")]
@@ -74,6 +79,16 @@ pub struct AppSettings {
 
 fn default_hotkey_binding() -> String {
     "Alt+Down".to_owned()
+}
+
+fn default_chat_font_size() -> u16 {
+    crate::ui::typography::DEFAULT_SIZE
+}
+
+fn deserialize_chat_font_size<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u16, D::Error> {
+    u16::deserialize(deserializer).map(crate::ui::typography::normalize)
 }
 
 fn default_true() -> bool {
@@ -104,6 +119,7 @@ impl Default for AppSettings {
             streaming_mode: crate::chat::store::StreamingMode::default(),
             bubble_style: theme::BubbleStyle::default(),
             font_preferences: fonts::FontPreferences::default(),
+            chat_font_size: default_chat_font_size(),
             window_preferences: window_prefs::WindowPreferences::default(),
             hotkey_binding: default_hotkey_binding(),
         }
@@ -185,6 +201,7 @@ impl SettingsTab {
 pub enum SettingsAction {
     /// Register with the OS first, then call `commit_hotkey_binding` on success.
     ChangeHotkey(String),
+    InstallUpdate(crate::updater::PreparedUpdate),
     SignInChatGpt,
     CancelChatGptSignIn,
     SignOutChatGpt,
@@ -239,6 +256,7 @@ pub struct SettingsUi {
     hotkey_update_error: Option<String>,
     current_window_position: Option<egui::Pos2>,
     active_tab: SettingsTab,
+    pane_transition: crate::ui::transition::PageTransition,
     actions: Vec<SettingsAction>,
     chatgpt: ChatGptState,
     codex_checking: bool,
@@ -248,6 +266,9 @@ pub struct SettingsUi {
     search_key_engine: String,
     pending_delete: Option<Uuid>,
     updates: crate::update::UpdateChecker,
+    update_download: crate::update::UpdateDownload,
+    update_install_message: Option<String>,
+    update_install_busy: bool,
     startup_enabled: bool,
     startup_error: Option<String>,
     command_save_error: Option<String>,
@@ -306,6 +327,7 @@ impl SettingsUi {
             hotkey_update_error: None,
             current_window_position: None,
             active_tab: SettingsTab::default(),
+            pane_transition: crate::ui::transition::PageTransition::default(),
             actions: Vec::new(),
             chatgpt: ChatGptState::default(),
             codex_checking: false,
@@ -314,6 +336,9 @@ impl SettingsUi {
             commands_dirty: false,
             pending_delete: None,
             updates: crate::update::UpdateChecker::default(),
+            update_download: crate::update::UpdateDownload::default(),
+            update_install_message: None,
+            update_install_busy: false,
             startup_enabled: false,
             startup_error: None,
             command_save_error: None,
@@ -391,6 +416,15 @@ impl SettingsUi {
         std::mem::take(&mut self.actions)
     }
 
+    pub fn hotkey_recorder_visible(&self) -> bool {
+        self.active_tab == SettingsTab::Hotkey
+    }
+
+    pub fn set_update_install_message(&mut self, message: Option<String>, busy: bool) {
+        self.update_install_message = message;
+        self.update_install_busy = busy;
+    }
+
     pub fn set_chatgpt_state(
         &mut self,
         signed_in: bool,
@@ -421,6 +455,7 @@ impl SettingsUi {
     pub fn poll_services(&mut self, ctx: &egui::Context, runtime: &tokio::runtime::Handle) {
         self.updates
             .poll(ctx, runtime, self.settings.automatic_update_checks);
+        self.update_download.poll(ctx);
         let chosen = match self.codex_picker.as_ref().map(|rx| rx.try_recv()) {
             Some(Ok(path)) => Some(path),
             Some(Err(TryRecvError::Disconnected)) => Some(None),
@@ -543,7 +578,11 @@ impl SettingsUi {
         self.load_provider(
             provider,
             key,
-            providers.remembered_model(id),
+            providers
+                .settings_models
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| providers.remembered_model(id)),
             providers.known_models.get(&id).cloned().unwrap_or_default(),
         );
         self.settings.pdf_pass_through = providers
@@ -692,6 +731,16 @@ impl SettingsUi {
             let palette = theme::current_palette(ui.ctx());
             ui.label(egui::RichText::new("設定").size(26.0).strong());
             muted(ui, "讓 PopChat 更適合你的工作方式");
+            if let Some(path) = crate::paths::config_dir() {
+                let label = if crate::paths::isolated_profile().is_some() {
+                    "自訂資料目錄"
+                } else {
+                    "預設資料目錄"
+                };
+                let text = format!("{label}：{}", path.display());
+                ui.add(egui::Label::new(egui::RichText::new(&text).small().weak()).truncate())
+                    .on_hover_text(text);
+            }
             ui.add_space(10.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
@@ -731,30 +780,37 @@ impl SettingsUi {
                     0.0
                 })
             .max(0.0);
+            let pane_effect = self.pane_transition.update(
+                self.active_tab as u64,
+                ui.input(|input| input.time),
+                crate::ui::transition::motion_enabled(ui.ctx()),
+            );
             ui.allocate_ui_with_layout(
                 egui::vec2(ui.available_width(), body_height),
                 egui::Layout::top_down(egui::Align::Min),
                 |ui| {
-                    egui::ScrollArea::vertical()
-                        .id_salt(("settings_pane", self.active_tab as u8))
-                        .auto_shrink([false, false])
-                        .max_height(body_height)
-                        .min_scrolled_height(0.0)
-                        .scroll_bar_visibility(
-                            egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
-                        )
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            match self.active_tab {
-                                SettingsTab::Service => {
-                                    self.providers_section(ui, runtime, providers, secrets);
+                    crate::ui::transition::show(ui, pane_effect, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt(("settings_pane", self.active_tab as u8))
+                            .auto_shrink([false, false])
+                            .max_height(body_height)
+                            .min_scrolled_height(0.0)
+                            .scroll_bar_visibility(
+                                egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                            )
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                match self.active_tab {
+                                    SettingsTab::Service => {
+                                        self.providers_section(ui, runtime, providers, secrets);
+                                    }
+                                    SettingsTab::Appearance => self.appearance_section(ui),
+                                    SettingsTab::Search => self.search_section(ui),
+                                    SettingsTab::Commands => self.commands_section(ui),
+                                    SettingsTab::Hotkey => self.hotkey_section(ui, runtime),
                                 }
-                                SettingsTab::Appearance => self.appearance_section(ui),
-                                SettingsTab::Search => self.search_section(ui),
-                                SettingsTab::Commands => self.commands_section(ui),
-                                SettingsTab::Hotkey => self.hotkey_section(ui, runtime),
-                            }
-                        });
+                            });
+                    });
                 },
             );
 
@@ -781,7 +837,7 @@ impl SettingsUi {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     save_requested = ui
                         .add_enabled(
-                            self.provider.is_some(),
+                            self.provider.is_some() && providers.load_error().is_none(),
                             egui::Button::new(
                                 egui::RichText::new("儲存設定").color(palette.accent_text),
                             )
@@ -873,6 +929,7 @@ impl SettingsUi {
                 self.saved_settings.bubble_style = self.settings.bubble_style;
                 self.saved_settings.automatic_update_checks = self.settings.automatic_update_checks;
                 self.saved_settings.font_preferences = self.settings.font_preferences.clone();
+                self.saved_settings.chat_font_size = self.settings.chat_font_size;
                 self.saved_settings.window_preferences = self.settings.window_preferences.clone();
                 self.search_key_dirty = false;
                 self.preference_save_error = None;
@@ -1067,6 +1124,14 @@ impl SettingsUi {
             info_card(ui, title, explanation);
             if chatgpt {
                 self.chatgpt_controls(ui);
+                muted(
+                    ui,
+                    "內建模型清單：2026-11-02 更新；實際可用模型依訂閱方案、工作區與開放進度而定。",
+                );
+                ui.hyperlink_to(
+                    "OpenAI 官方訂閱模型說明",
+                    "https://learn.chatgpt.com/docs/models",
+                );
             } else {
                 self.codex_controls(ui);
             }
@@ -1434,24 +1499,23 @@ impl SettingsUi {
             });
         ui.add_space(8.0);
         field_label(ui, "自訂全域快捷鍵");
-        if ui
-            .add_sized(
-                [ui.available_width(), 32.0],
-                egui::TextEdit::singleline(&mut self.hotkey_draft)
-                    .id_salt("settings_hotkey_draft")
-                    .hint_text("例如 Ctrl+Shift+Space"),
-            )
-            .changed()
-        {
+        if crate::ui::hotkey_recorder::show(ui, &mut self.hotkey_draft) {
             self.hotkey_update_error = None;
         }
         ui.horizontal(|ui| {
-            if ui.button("套用快捷鍵").clicked() {
+            if ui
+                .add_enabled(
+                    !crate::ui::hotkey_recorder::is_recording(ui.ctx()),
+                    egui::Button::new("套用快捷鍵"),
+                )
+                .clicked()
+            {
                 self.hotkey_update_error = None;
                 self.actions
                     .push(SettingsAction::ChangeHotkey(self.hotkey_draft.clone()));
             }
             if ui.button("還原預設").clicked() {
+                crate::ui::hotkey_recorder::cancel(ui.ctx());
                 self.hotkey_draft = default_hotkey_binding();
                 self.hotkey_update_error = None;
                 self.actions
@@ -1471,20 +1535,7 @@ impl SettingsUi {
         }
         ui.add_space(12.0);
         field_label(ui, "聊天快捷鍵");
-        for (keys, action) in [
-            ("Ctrl+N", "新聊天"),
-            ("Ctrl+Y", "聊天歷史"),
-            ("Ctrl+F", "尋找目前聊天（不顯示常駐按鈕）"),
-            ("Ctrl+G / Ctrl+Shift+G", "下一個／上一個結果"),
-            ("Ctrl+O", "加入檔案"),
-            ("Ctrl+V / Shift+Insert", "貼上文字、圖片或已複製的檔案"),
-            ("Ctrl+E", "展開／收合輸入框"),
-        ] {
-            ui.horizontal(|ui| {
-                ui.monospace(keys);
-                ui.label(action);
-            });
-        }
+        crate::ui::shortcut_list::show(ui);
         muted(ui, "也可直接將檔案拖入聊天視窗；不需要先點附件按鈕。");
         ui.add_space(12.0);
         let was_enabled = self.startup_enabled;
@@ -1511,8 +1562,12 @@ impl SettingsUi {
             &mut self.settings.automatic_update_checks,
             "自動檢查更新（每天一次）",
         );
-        ui.horizontal(|ui| {
-            ui.label(format!("PopChat {}", env!("CARGO_PKG_VERSION")));
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!(
+                "PopChat {} · {}",
+                env!("CARGO_PKG_VERSION"),
+                crate::BUILD_CHANNEL
+            ));
             if ui
                 .add_enabled(
                     self.updates.state != crate::update::CheckState::Checking,
@@ -1522,6 +1577,12 @@ impl SettingsUi {
             {
                 self.updates.check(ui.ctx(), runtime, true);
             }
+        });
+        muted(ui, &format!("Windows 移植與維護：{}", crate::AUTHOR));
+        ui.horizontal_wrapped(|ui| {
+            ui.hyperlink_to("Windows 專案", env!("CARGO_PKG_REPOSITORY"));
+            ui.label("·");
+            ui.hyperlink_to("原專案：lec77/PopChat", "https://github.com/lec77/PopChat");
         });
         match &self.updates.state {
             crate::update::CheckState::Idle => {}
@@ -1534,10 +1595,77 @@ impl SettingsUi {
                     format!("已有新版本 {} · 開啟發行頁面", release.version),
                     &release.page_url,
                 );
+                let ready = matches!(
+                    self.update_download.state,
+                    crate::update::DownloadState::Ready(_)
+                );
+                let downloading = matches!(
+                    self.update_download.state,
+                    crate::update::DownloadState::Downloading { .. }
+                );
+                if !downloading
+                    && (!ready
+                        || (self.update_install_message.is_some() && !self.update_install_busy))
+                    && ui
+                        .button(if ready {
+                            "重新下載更新"
+                        } else {
+                            "下載更新"
+                        })
+                        .clicked()
+                {
+                    self.update_install_message = None;
+                    self.update_download.start(ui.ctx(), runtime, release);
+                }
             }
             crate::update::CheckState::Failed(error) => {
                 ui.colored_label(ui.visuals().error_fg_color, error);
             }
+        }
+        match &self.update_download.state {
+            crate::update::DownloadState::Idle => {}
+            crate::update::DownloadState::Downloading { received, total } => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("下載並驗證更新中…");
+                });
+                if let Some(total) = total.filter(|total| *total > 0) {
+                    ui.add(
+                        egui::ProgressBar::new((*received as f32 / total as f32).clamp(0.0, 1.0))
+                            .show_percentage(),
+                    );
+                } else {
+                    muted(
+                        ui,
+                        &format!("已下載 {:.1} MiB", *received as f64 / 1_048_576.0),
+                    );
+                }
+            }
+            crate::update::DownloadState::Ready(prepared) => {
+                ui.label(format!("{} 已下載並通過完整性驗證。", prepared.version()));
+                if ui
+                    .add_enabled(
+                        !self.update_install_busy,
+                        egui::Button::new("安裝並重新啟動"),
+                    )
+                    .clicked()
+                {
+                    self.actions
+                        .push(SettingsAction::InstallUpdate(prepared.clone()));
+                }
+            }
+            crate::update::DownloadState::Failed(error) => {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(format!("更新下載失敗：{error}"))
+                            .color(ui.visuals().error_fg_color),
+                    )
+                    .wrap(),
+                );
+            }
+        }
+        if let Some(message) = &self.update_install_message {
+            ui.add(egui::Label::new(message).wrap());
         }
     }
 
@@ -1629,12 +1757,54 @@ impl SettingsUi {
         });
         ui.add_space(22.0);
         fonts::show_font_preferences(ui, &mut self.settings.font_preferences);
+        self.chat_font_size_preferences(ui);
         ui.add_space(22.0);
         window_prefs::show_preferences(
             ui,
             &mut self.settings.window_preferences,
             self.current_window_position,
         );
+    }
+
+    /// Chat-only typography; the surrounding settings UI keeps its normal scale.
+    fn chat_font_size_preferences(&mut self, ui: &mut egui::Ui) -> egui::Response {
+        use crate::ui::{preference_layout as form, typography};
+        ui.add_space(12.0);
+        form::heading(ui, "文字大小");
+        form::card(ui, |ui| {
+            let slider = form::row(ui, "聊天文字大小", |ui| {
+                ui.spacing_mut().slider_width = (ui.available_width() - 58.0).max(60.0);
+                let response = ui.add(
+                    egui::Slider::new(
+                        &mut self.settings.chat_font_size,
+                        typography::MIN_SIZE..=typography::MAX_SIZE,
+                    )
+                    .show_value(false)
+                    .step_by(1.0),
+                );
+                ui.label(format!("{} pt", self.settings.chat_font_size));
+                response
+            });
+            form::caption(
+                ui,
+                "套用至訊息、Markdown、表格、程式碼、思考內容與輸入框；不改變介面縮放。",
+            );
+            ui.add_space(4.0);
+            if ui.small_button("還原預設大小").clicked() {
+                self.settings.chat_font_size = typography::DEFAULT_SIZE;
+            }
+            form::divider(ui);
+            form::caption(ui, "大小預覽");
+            ui.scope(|ui| {
+                typography::apply(ui, self.settings.chat_font_size);
+                ui.add(
+                    egui::Label::new("讓想法，自然成為對話。\nThe quick brown fox · 0123456789")
+                        .wrap(),
+                );
+            });
+            slider
+        })
+        .inner
     }
 
     /// Web Search 引擎選擇。
@@ -1731,6 +1901,7 @@ fn general_preferences(settings: &AppSettings) -> serde_json::Map<String, serde_
         "bubble_style",
         "automatic_update_checks",
         "font_preferences",
+        "chat_font_size",
         "window_preferences",
     ] {
         preferences.insert(name.to_owned(), value[name].clone());
@@ -2670,6 +2841,7 @@ mod tests {
         };
         draft.font_preferences.english = "Test English".to_owned();
         draft.font_preferences.chinese = "測試中文字型".to_owned();
+        draft.chat_font_size = 22;
         draft.window_preferences.opacity_percent = 70;
         draft.window_preferences.fixed_x = -100;
         draft.window_preferences.fixed_y = 200;
@@ -2694,6 +2866,7 @@ mod tests {
         assert!(!restored.web_search_enabled);
         assert_eq!(restored.bubble_style, theme::BubbleStyle::AccentFill);
         assert_eq!(restored.font_preferences, draft.font_preferences);
+        assert_eq!(restored.chat_font_size, 22);
         assert_eq!(restored.window_preferences, draft.window_preferences);
         assert_eq!(restored.hotkey_binding, "Ctrl+Shift+Space");
 
@@ -2708,6 +2881,115 @@ mod tests {
         assert!(restored.api_key.is_empty());
         assert!(restored.search_engine_key.is_empty());
         assert_eq!(restored.font_preferences, draft.font_preferences);
+        assert_eq!(restored.chat_font_size, 22);
         assert_eq!(restored.window_preferences, draft.window_preferences);
+    }
+
+    #[test]
+    fn chat_font_size_missing_fields_default_and_out_of_range_is_bounded() {
+        let mut old = serde_json::to_value(AppSettings::default()).unwrap();
+        old.as_object_mut().unwrap().remove("chat_font_size");
+        assert_eq!(
+            serde_json::from_value::<AppSettings>(old.clone())
+                .unwrap()
+                .chat_font_size,
+            15
+        );
+        for (stored, expected) in [(0, 12), (12, 12), (19, 19), (24, 24), (65535, 24)] {
+            old["chat_font_size"] = stored.into();
+            let decoded: AppSettings = serde_json::from_value(old.clone()).unwrap();
+            assert_eq!(decoded.chat_font_size, expected);
+            let encoded = serde_json::to_value(decoded).unwrap();
+            assert_eq!(encoded["chat_font_size"], expected);
+        }
+    }
+
+    #[test]
+    fn chat_font_size_preference_preview_is_local_and_responsive() {
+        for width in [300.0, 380.0, 520.0] {
+            for dark in [false, true] {
+                for size in [12, 15, 24] {
+                    let ctx = egui::Context::default();
+                    theme::apply(&ctx, if dark { "Dark" } else { "Light" }, DEFAULT_ACCENT);
+                    let mut draft = draft();
+                    draft.settings.chat_font_size = size;
+                    let output = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(width, 800.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                let before = ui.style().text_styles.clone();
+                                draft.chat_font_size_preferences(ui);
+                                assert_eq!(ui.style().text_styles, before);
+                                assert!(ui.min_rect().right() <= width + 0.5);
+                            });
+                        },
+                    );
+                    assert_eq!(draft.settings.chat_font_size, size);
+                    assert!(draft.take_actions().is_empty());
+                    assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                        egui::Shape::Text(text) if text.galley.job.text.contains("The quick brown fox")
+                            && text.galley.job.sections.iter().all(|section| (section.format.font_id.size - size as f32).abs() < 0.1))));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn actual_font_size_slider_keyboard_edit_changes_preview_and_only_general_preferences() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx, "Light", DEFAULT_ACCENT);
+        let mut draft = draft();
+        draft.settings.base_url = "https://unsubmitted.invalid/v1".into();
+        let before = draft.settings.clone();
+        let frame = |events| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(520.0, 700.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(frame(vec![]), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                draft.chat_font_size_preferences(ui).request_focus();
+            });
+        });
+        let output = ctx.run(
+            frame(vec![egui::Event::Key {
+                key: egui::Key::ArrowRight,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }]),
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    draft.chat_font_size_preferences(ui);
+                });
+            },
+        );
+        assert_eq!(draft.settings.chat_font_size, 16);
+        assert_eq!(draft.settings.base_url, before.base_url);
+        assert!(
+            draft.take_actions().is_empty(),
+            "size editing must not Apply API or hotkeys"
+        );
+        assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+            egui::Shape::Text(text) if text.galley.job.text.contains("The quick brown fox")
+                && text.galley.job.sections.iter().all(|section| (section.format.font_id.size - 16.0).abs() < 0.1))));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let saved = AppSettings::default();
+        std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        save_preference_values_only(&path, general_preferences(&draft.settings)).unwrap();
+        let stored: AppSettings = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(stored.chat_font_size, 16);
+        assert_eq!(stored.base_url, saved.base_url);
     }
 }

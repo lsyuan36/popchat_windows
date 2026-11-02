@@ -1,0 +1,15 @@
+Swei Gothic / 獅尾圓體
+
+Copyright (c) 2020, Chun yu Yao
+
+The bundled font's name-table license notice (name ID 13) begins:
+
+Copyright (c) 2020, Chun yu Yao (<URL|email>),
+with Reserved Font Name Untitled6.
+
+This Font Software is licensed under the SIL Open Font License, Version 1.1.
+See SIL_Open_Font_License_1.1.txt for the original upstream license.
+
+Upstream credits: Swei Gothic by Max (max32002), based on Source Han Sans
+developed by Adobe and Google. The unmodified font retains its original
+copyright and license metadata. These credits do not imply endorsement.

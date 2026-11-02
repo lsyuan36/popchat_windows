@@ -10,6 +10,10 @@
 # Runtime profiles (when POPCHAT_DATA_DIR points at the repository)
 /settings.json
 /provider_store.json
+/secrets.json
+/chatgpt-oauth.json
+/provider_store.before-custom-import-*.json
+/.popchat-*.tmp
 /panel.json
 /prompt_history.json
 /shortcuts.json

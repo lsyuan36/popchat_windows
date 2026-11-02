@@ -78,6 +78,104 @@ pub fn ime_blocks_shortcuts(composing: &mut bool, events: &[egui::Event]) -> boo
     blocked
 }
 
+/// An IME-confirming Return stays owned by the IME until key-up, including
+/// auto-repeat after Commit. A fresh Return after release remains available.
+fn ime_blocks_return(held: &mut bool, ime_blocked: bool, events: &[egui::Event]) -> bool {
+    let mut blocked = ime_blocked || *held;
+    for event in events {
+        match event {
+            egui::Event::Key {
+                key: Key::Enter,
+                pressed: true,
+                ..
+            } if ime_blocked || *held => {
+                *held = true;
+                blocked = true;
+            }
+            egui::Event::Key {
+                key: Key::Enter,
+                pressed: false,
+                ..
+            }
+            | egui::Event::WindowFocused(false) => *held = false,
+            _ => {}
+        }
+    }
+    blocked
+}
+
+/// Keep egui's real IME text/cursor/undo handling. Only its Return binding and
+/// temporary preedit selection appearance differ from an ordinary TextEdit.
+fn ime_text_edit(
+    ui: &mut egui::Ui,
+    mut edit: egui::TextEdit<'_>,
+    block_return: bool,
+    preedit: bool,
+    size: Option<egui::Vec2>,
+) -> egui::text_edit::TextEditOutput {
+    if block_return {
+        // Merely blocking ComposerAction::Send is insufficient: egui's
+        // multiline widget would still turn that same candidate key into \n.
+        edit = edit.return_key(None);
+    }
+    ui.scope(|ui| {
+        if preedit {
+            let foreground = ui.visuals().text_color();
+            ui.visuals_mut().selection.bg_fill = egui::Color32::TRANSPARENT;
+            ui.visuals_mut().selection.stroke.color = foreground;
+        }
+        let output = if let Some(size) = size {
+            let mut output = None;
+            ui.add_sized(size, |ui: &mut egui::Ui| {
+                let result = edit.show(ui);
+                let response = result.response.clone();
+                output = Some(result);
+                response
+            });
+            output.expect("sized TextEdit executes its widget once")
+        } else {
+            edit.show(ui)
+        };
+        if preedit && output.response.has_focus() {
+            paint_preedit_underline(ui, &output);
+        }
+        output
+    })
+    .inner
+}
+
+fn paint_preedit_underline(ui: &egui::Ui, output: &egui::text_edit::TextEditOutput) {
+    let Some(range) = output.cursor_range else {
+        return;
+    };
+    let start = range.primary.index.min(range.secondary.index);
+    let end = range.primary.index.max(range.secondary.index);
+    if start == end {
+        return;
+    }
+    let painter = ui.painter().with_clip_rect(output.text_clip_rect);
+    let stroke = egui::Stroke::new(1.0_f32, ui.visuals().weak_text_color());
+    let mut index = 0;
+    for row in &output.galley.rows {
+        let mut span: Option<egui::Rect> = None;
+        for glyph in &row.glyphs {
+            if (start..end).contains(&index) {
+                let rect = glyph
+                    .logical_rect()
+                    .translate(output.galley_pos.to_vec2() + row.pos.to_vec2());
+                span = Some(span.map_or(rect, |span| span.union(rect)));
+            }
+            index += 1;
+        }
+        if let Some(span) = span {
+            painter.hline(span.x_range(), span.bottom() - 1.0, stroke);
+        }
+        if row.ends_with_newline {
+            index += 1;
+        }
+    }
+}
+
 /// Transient typing state for the composer. Owns the draft so keystrokes
 /// never reach the transcript; the host only sees [`ComposerAction::Send`].
 #[derive(Debug, Clone)]
@@ -95,6 +193,7 @@ pub struct Composer {
     send_enabled: bool,
     input_focused: bool,
     ime_composing: bool,
+    ime_return_held: bool,
     streaming: bool,
 }
 
@@ -113,6 +212,7 @@ impl Composer {
             send_enabled: true,
             input_focused: false,
             ime_composing: false,
+            ime_return_held: false,
             streaming: false,
         }
     }
@@ -192,8 +292,11 @@ impl Composer {
                     for attachment in &self.attachments {
                         let response =
                             crate::ui::controls::button(ui, format!("{}  ×", attachment.filename));
-                        let response = response
-                            .on_hover_text(attachment.note.as_deref().unwrap_or("移除附件"));
+                        let help = attachment.note.as_ref().map_or_else(
+                            || "移除附件".to_owned(),
+                            |note| format!("移除附件\n{note}"),
+                        );
+                        let response = crate::ui::icons::hover_help(response, &help);
                         if response.clicked() {
                             remove = Some(attachment.id);
                         }
@@ -241,9 +344,11 @@ impl Composer {
 
         // ---- Frame-global key snapshot (read before any widget consumes them).
         let ime_blocked = ui.input(|i| ime_blocks_shortcuts(&mut self.ime_composing, &i.events));
+        let return_blocked =
+            ui.input(|i| ime_blocks_return(&mut self.ime_return_held, ime_blocked, &i.events));
         let (enter_pressed, tab_pressed, up_pressed, down_pressed, esc_pressed) = ui.input(|i| {
             (
-                !ime_blocked && i.key_pressed(Key::Enter),
+                !return_blocked && i.key_pressed(Key::Enter),
                 !ime_blocked && i.key_pressed(Key::Tab),
                 !ime_blocked && i.key_pressed(Key::ArrowUp),
                 !ime_blocked && i.key_pressed(Key::ArrowDown),
@@ -266,7 +371,7 @@ impl Composer {
         }
         if self.show_large_editor {
             self.popup_visible = false;
-            return self.show_expanded(ui, history, ctrl_down && enter_pressed);
+            return self.show_expanded(ui, history, ctrl_down && enter_pressed, return_blocked);
         }
 
         let input_id = egui::Id::new("popchat_composer_text");
@@ -369,7 +474,8 @@ impl Composer {
                 "加入附件（也可貼上圖片或拖入檔案）",
             )
             .clicked();
-            let te = ui.add(
+            let te = ime_text_edit(
+                ui,
                 egui::TextEdit::multiline(&mut self.text)
                     .id(input_id)
                     .hint_text("輸入訊息，或用 / 呼叫快捷指令…")
@@ -377,7 +483,11 @@ impl Composer {
                     .desired_width(field_width)
                     .margin(egui::Margin::ZERO)
                     .frame(false),
-            );
+                return_blocked,
+                self.ime_composing,
+                None,
+            )
+            .response;
             if self.focus_requested && !self.show_large_editor {
                 te.request_focus();
                 self.focus_requested = false;
@@ -408,6 +518,10 @@ impl Composer {
                         true,
                         if self.streaming {
                             "停止回覆"
+                        } else if !self.send_enabled {
+                            "正在讀取附件，完成後可送出"
+                        } else if !can_send {
+                            "送出訊息（請先輸入文字或加入附件）"
                         } else {
                             "送出 · Enter（Shift+Enter 換行）"
                         },
@@ -524,6 +638,7 @@ impl Composer {
         ui: &mut egui::Ui,
         history: &mut PromptHistory,
         shortcut_send: bool,
+        return_blocked: bool,
     ) -> ComposerAction {
         let mut close = false;
         let mut pick = false;
@@ -551,14 +666,19 @@ impl Composer {
             .max_height(height)
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                let field = ui.add_sized(
-                    [ui.available_width(), height],
+                let size = egui::vec2(ui.available_width(), height);
+                let field = ime_text_edit(
+                    ui,
                     egui::TextEdit::multiline(&mut self.text)
                         .id(editor_id)
                         .hint_text("把完整的想法寫下來…")
                         .frame(false)
                         .margin(egui::Margin::ZERO),
-                );
+                    return_blocked,
+                    self.ime_composing,
+                    Some(size),
+                )
+                .response;
                 if self.focus_requested {
                     field.request_focus();
                     self.focus_requested = false;
@@ -884,6 +1004,483 @@ mod tests {
             &[egui::Event::Ime(egui::ImeEvent::Disabled)]
         ));
         assert!(!ime_blocks_shortcuts(&mut composing, &[]));
+    }
+
+    struct ImeHarness {
+        ctx: egui::Context,
+        composer: Composer,
+        commands: ShortcutStore,
+        history: PromptHistory,
+        measured_layout: bool,
+        font_size: Option<u16>,
+        _directory: tempfile::TempDir,
+    }
+
+    impl ImeHarness {
+        fn new(expanded: bool) -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let mut result = Self {
+                ctx: egui::Context::default(),
+                composer: Composer::new(),
+                commands: ShortcutStore { shortcuts: vec![] },
+                history: PromptHistory::with_storage_path(directory.path().join("history.json")),
+                measured_layout: false,
+                font_size: None,
+                _directory: directory,
+            };
+            result.composer.set_text("draft ".into());
+            result.composer.show_large_editor = expanded;
+            result.frame(vec![], Modifiers::NONE);
+            result.frame(vec![], Modifiers::NONE);
+            let id = egui::Id::new("popchat_composer_text");
+            let mut state = egui::TextEdit::load_state(&result.ctx, id).unwrap();
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::one(
+                    egui::text::CCursor::new(result.composer.text().chars().count()),
+                )));
+            state.store(&result.ctx, id);
+            result
+        }
+
+        fn frame(
+            &mut self,
+            events: Vec<egui::Event>,
+            modifiers: Modifiers,
+        ) -> (ComposerAction, egui::FullOutput) {
+            let mut action = ComposerAction::None;
+            let output = self.ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(600.0, 460.0),
+                    )),
+                    events,
+                    modifiers,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        if let Some(size) = self.font_size {
+                            super::super::typography::apply(ui, size);
+                        }
+                        if self.measured_layout {
+                            super::super::chat_layout::bottom_panel(
+                                ui,
+                                egui::Id::new("ime_layout"),
+                                |ui| {
+                                    action =
+                                        self.composer.show(ui, &self.commands, &mut self.history);
+                                },
+                            );
+                        } else {
+                            action = self.composer.show(ui, &self.commands, &mut self.history);
+                        }
+                    });
+                },
+            );
+            (action, output)
+        }
+    }
+
+    fn ime_return(pressed: bool, repeat: bool, modifiers: Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key: Key::Enter,
+            physical_key: Some(Key::Enter),
+            pressed,
+            repeat,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn resized_editor_keeps_cursor_undo_and_active_ime_in_both_layouts() {
+        for expanded in [false, true] {
+            let mut h = ImeHarness::new(expanded);
+            let id = egui::Id::new("popchat_composer_text");
+            let before = egui::TextEdit::load_state(&h.ctx, id).unwrap();
+            let range = before.cursor.char_range().unwrap();
+            let mut state = before;
+            let mut undo = state.undoer();
+            undo.add_undo(&(range, "before".to_owned()));
+            state.set_undoer(undo);
+            state.store(&h.ctx, id);
+            for size in [12, 14, 20, 24] {
+                h.font_size = Some(size);
+                assert_eq!(h.frame(vec![], Modifiers::NONE).0, ComposerAction::None);
+                let state = egui::TextEdit::load_state(&h.ctx, id).unwrap();
+                assert_eq!(state.cursor.char_range(), Some(range));
+                assert!(state
+                    .undoer()
+                    .has_undo(&(range, h.composer.text().to_owned())));
+            }
+            h.frame(
+                vec![
+                    egui::Event::Ime(egui::ImeEvent::Enabled),
+                    egui::Event::Ime(egui::ImeEvent::Preedit("ㄋㄧˇ".into())),
+                ],
+                Modifiers::NONE,
+            );
+            assert_eq!(h.composer.text(), "draft ㄋㄧˇ");
+            h.font_size = Some(20);
+            assert_eq!(h.frame(vec![], Modifiers::NONE).0, ComposerAction::None);
+            assert!(h.composer.ime_composing);
+            assert_eq!(h.composer.text(), "draft ㄋㄧˇ");
+            assert_eq!(
+                h.frame(
+                    vec![
+                        egui::Event::Ime(egui::ImeEvent::Commit("你".into())),
+                        ime_return(true, false, Modifiers::NONE)
+                    ],
+                    Modifiers::NONE
+                )
+                .0,
+                ComposerAction::None
+            );
+            assert_eq!(h.composer.text(), "draft 你");
+            assert!(h.history.entries().is_empty());
+            assert!(!h._directory.path().join("history.json").exists());
+        }
+    }
+
+    #[test]
+    fn actual_composer_text_relayouts_at_chat_sizes_with_stable_controls() {
+        for appearance in ["light", "dark"] {
+            for width in [320.0, 520.0] {
+                let mut previous_height = 0.0;
+                for size in [12, 14, 15, 20, 24] {
+                    let ctx = egui::Context::default();
+                    super::super::theme::apply(
+                        &ctx,
+                        appearance,
+                        super::super::theme::DEFAULT_ACCENT_HEX,
+                    );
+                    let mut composer = Composer::new();
+                    let draft = "first line\nsecond line\nthird line";
+                    composer.set_text(draft.into());
+                    let commands = ShortcutStore { shortcuts: vec![] };
+                    let dir = tempfile::tempdir().unwrap();
+                    let mut history =
+                        PromptHistory::with_storage_path(dir.path().join("history.json"));
+                    let mut bounds = egui::Rect::NOTHING;
+                    let output = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(width, 600.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                super::super::typography::apply(ui, size);
+                                bounds = ui
+                                    .scope(|ui| {
+                                        assert_eq!(
+                                            composer.show(ui, &commands, &mut history),
+                                            ComposerAction::None
+                                        )
+                                    })
+                                    .response
+                                    .rect;
+                            });
+                        },
+                    );
+                    let text = output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| match &shape.shape {
+                            egui::Shape::Text(text) if text.galley.text() == draft => Some(text),
+                            _ => None,
+                        })
+                        .expect("real TextEdit draft galley");
+                    assert!(
+                        (text.galley.job.sections[0].format.font_id.size - f32::from(size)).abs()
+                            < 0.001
+                    );
+                    assert!(bounds.height() >= previous_height);
+                    previous_height = bounds.height();
+                    assert!(
+                        bounds.right() <= width + 0.1,
+                        "composer overflow at {size}pt, width {width}: {bounds:?}"
+                    );
+                    assert!(text.pos.y + text.galley.size().y <= bounds.bottom() + 0.1);
+                    assert!(history.entries().is_empty());
+                    assert!(!dir.path().join("history.json").exists());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zhuyin_candidate_returns_neither_insert_newlines_nor_send_in_both_editors() {
+        for expanded in [false, true] {
+            for modifiers in [Modifiers::NONE, Modifiers::SHIFT, Modifiers::CTRL] {
+                for ime_first in [false, true] {
+                    let mut h = ImeHarness::new(expanded);
+                    let mut preedit = vec![
+                        egui::Event::Ime(egui::ImeEvent::Enabled),
+                        egui::Event::Ime(egui::ImeEvent::Preedit("ㄋㄧˇ".into())),
+                    ];
+                    if ime_first {
+                        preedit.push(ime_return(true, false, modifiers));
+                    } else {
+                        preedit.insert(0, ime_return(true, false, modifiers));
+                    }
+                    assert_eq!(h.frame(preedit, modifiers).0, ComposerAction::None);
+                    assert_eq!(h.composer.text(), "draft ㄋㄧˇ");
+                    h.frame(vec![ime_return(false, false, modifiers)], modifiers);
+
+                    let commit = egui::Event::Ime(egui::ImeEvent::Commit("你".into()));
+                    let events = if ime_first {
+                        vec![commit, ime_return(true, false, modifiers)]
+                    } else {
+                        vec![ime_return(true, false, modifiers), commit]
+                    };
+                    assert_eq!(h.frame(events, modifiers).0, ComposerAction::None);
+                    assert_eq!(h.composer.text(), "draft 你");
+                    // Holding the candidate-confirm key after Commit must not
+                    // turn its auto-repeat into a newline or a new submission.
+                    assert_eq!(
+                        h.frame(vec![ime_return(true, true, modifiers)], modifiers)
+                            .0,
+                        ComposerAction::None
+                    );
+                    assert_eq!(h.composer.text(), "draft 你");
+                    assert!(h.history.entries().is_empty());
+                    assert!(!h._directory.path().join("history.json").exists());
+
+                    h.frame(vec![ime_return(false, false, modifiers)], Modifiers::NONE);
+                    let action = h
+                        .frame(
+                            vec![ime_return(true, false, Modifiers::NONE)],
+                            Modifiers::NONE,
+                        )
+                        .0;
+                    if expanded {
+                        assert_eq!(action, ComposerAction::None);
+                        assert_eq!(h.composer.text(), "draft 你\n");
+                        h.frame(
+                            vec![ime_return(false, false, Modifiers::NONE)],
+                            Modifiers::NONE,
+                        );
+                        assert_eq!(
+                            h.frame(
+                                vec![ime_return(true, false, Modifiers::CTRL)],
+                                Modifiers::CTRL
+                            )
+                            .0,
+                            ComposerAction::Send("draft 你".into())
+                        );
+                    } else {
+                        assert_eq!(action, ComposerAction::Send("draft 你".into()));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_shift_enter_and_pasted_newlines_are_preserved_after_ime() {
+        let mut h = ImeHarness::new(false);
+        assert_eq!(
+            h.frame(
+                vec![ime_return(true, false, Modifiers::SHIFT)],
+                Modifiers::SHIFT
+            )
+            .0,
+            ComposerAction::None
+        );
+        assert_eq!(h.composer.text(), "draft \n");
+        h.frame(
+            vec![ime_return(false, false, Modifiers::SHIFT)],
+            Modifiers::NONE,
+        );
+        h.frame(
+            vec![egui::Event::Paste("第一行\n第二行".into())],
+            Modifiers::NONE,
+        );
+        assert_eq!(h.composer.text(), "draft \n第一行\n第二行");
+        assert!(h.history.entries().is_empty());
+    }
+
+    #[test]
+    fn ime_return_latch_clears_on_release_and_focus_loss_not_disable() {
+        let mut held = false;
+        assert!(ime_blocks_return(
+            &mut held,
+            true,
+            &[ime_return(true, false, Modifiers::NONE)]
+        ));
+        assert!(held);
+        assert!(ime_blocks_return(
+            &mut held,
+            false,
+            &[egui::Event::Ime(egui::ImeEvent::Disabled)]
+        ));
+        assert!(held, "IME disable is not a physical key release");
+        assert!(ime_blocks_return(
+            &mut held,
+            false,
+            &[ime_return(false, false, Modifiers::NONE)]
+        ));
+        assert!(!held);
+        assert!(!ime_blocks_return(
+            &mut held,
+            false,
+            &[ime_return(true, false, Modifiers::NONE)]
+        ));
+        assert!(!held);
+        ime_blocks_return(&mut held, true, &[ime_return(true, false, Modifiers::NONE)]);
+        assert!(ime_blocks_return(
+            &mut held,
+            false,
+            &[egui::Event::WindowFocused(false)]
+        ));
+        assert!(!held);
+        assert!(!ime_blocks_return(&mut held, false, &[]));
+    }
+
+    #[test]
+    fn cancelled_preedit_keeps_the_prefix_and_reenables_expanded_newline() {
+        let mut h = ImeHarness::new(true);
+        h.frame(
+            vec![
+                egui::Event::Ime(egui::ImeEvent::Enabled),
+                egui::Event::Ime(egui::ImeEvent::Preedit("ㄋㄧˇ".into())),
+            ],
+            Modifiers::NONE,
+        );
+        assert_eq!(h.composer.text(), "draft ㄋㄧˇ");
+        h.frame(
+            vec![
+                egui::Event::Ime(egui::ImeEvent::Preedit(String::new())),
+                egui::Event::Ime(egui::ImeEvent::Disabled),
+            ],
+            Modifiers::NONE,
+        );
+        assert_eq!(h.composer.text(), "draft ");
+        assert!(!h.composer.ime_composing);
+        assert_eq!(
+            h.frame(
+                vec![ime_return(true, false, Modifiers::NONE)],
+                Modifiers::NONE
+            )
+            .0,
+            ComposerAction::None
+        );
+        assert_eq!(h.composer.text(), "draft \n");
+        assert!(h.history.entries().is_empty());
+    }
+
+    #[test]
+    fn measured_bottom_panel_discard_does_not_duplicate_or_drop_ime_text() {
+        for expanded in [false, true] {
+            let mut h = ImeHarness::new(expanded);
+            h.measured_layout = true;
+            assert_eq!(
+                h.frame(
+                    vec![
+                        egui::Event::Ime(egui::ImeEvent::Enabled),
+                        egui::Event::Ime(egui::ImeEvent::Preedit("ㄋㄧˇ".into()))
+                    ],
+                    Modifiers::NONE
+                )
+                .0,
+                ComposerAction::None
+            );
+            assert_eq!(h.composer.text(), "draft ㄋㄧˇ");
+            assert_eq!(
+                h.frame(
+                    vec![
+                        egui::Event::Ime(egui::ImeEvent::Commit("你".into())),
+                        ime_return(true, false, Modifiers::NONE)
+                    ],
+                    Modifiers::NONE
+                )
+                .0,
+                ComposerAction::None
+            );
+            assert_eq!(h.composer.text(), "draft 你");
+            assert!(h.history.entries().is_empty());
+        }
+    }
+
+    #[test]
+    fn preedit_is_underlined_without_blue_background_and_normal_selection_stays_blue() {
+        for expanded in [false, true] {
+            for appearance in ["light", "dark"] {
+                let mut h = ImeHarness::new(expanded);
+                crate::ui::theme::apply(&h.ctx, appearance, crate::ui::theme::DEFAULT_ACCENT_HEX);
+                let selection = h.ctx.style().visuals.selection;
+                let weak = h.ctx.style().visuals.weak_text_color();
+                let (_, output) = h.frame(
+                    vec![
+                        egui::Event::Ime(egui::ImeEvent::Enabled),
+                        egui::Event::Ime(egui::ImeEvent::Preedit("ㄋㄧˇ".into())),
+                    ],
+                    Modifiers::NONE,
+                );
+                let galley = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.text() == "draft ㄋㄧˇ" => {
+                            Some(&text.galley)
+                        }
+                        _ => None,
+                    })
+                    .expect("preedit text must actually paint");
+                assert!(
+                    !galley
+                        .rows
+                        .iter()
+                        .flat_map(|r| &r.visuals.mesh.vertices)
+                        .any(|v| v.color == selection.bg_fill),
+                    "IME preedit must not use blue selection fill"
+                );
+                assert!(output.shapes.iter().any(|s| matches!(&s.shape,
+                    egui::Shape::LineSegment { points, stroke }
+                        if stroke.color == weak && stroke.width == 1.0
+                            && (points[0].y - points[1].y).abs() < 0.1 && points[1].x > points[0].x)),
+                    "marked range needs a visible underline");
+                assert_eq!(h.ctx.style().visuals.selection.bg_fill, selection.bg_fill);
+                assert_eq!(h.ctx.style().visuals.selection.stroke, selection.stroke);
+
+                h.frame(
+                    vec![egui::Event::Ime(egui::ImeEvent::Commit("你".into()))],
+                    Modifiers::NONE,
+                );
+                let id = egui::Id::new("popchat_composer_text");
+                let mut state = egui::TextEdit::load_state(&h.ctx, id).unwrap();
+                state
+                    .cursor
+                    .set_char_range(Some(egui::text::CCursorRange::two(
+                        egui::text::CCursor::new(0),
+                        egui::text::CCursor::new(h.composer.text().chars().count()),
+                    )));
+                state.store(&h.ctx, id);
+                let (_, output) = h.frame(vec![], Modifiers::NONE);
+                let galley = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.text() == "draft 你" => {
+                            Some(&text.galley)
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert!(
+                    galley
+                        .rows
+                        .iter()
+                        .flat_map(|r| &r.visuals.mesh.vertices)
+                        .any(|v| v.color == selection.bg_fill),
+                    "ordinary text selection must retain its highlight"
+                );
+            }
+        }
     }
 
     #[test]

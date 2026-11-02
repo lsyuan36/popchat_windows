@@ -9,6 +9,7 @@
 use eframe::egui;
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
+use super::typography;
 use crate::ui::panel::{split_inline_math, InlinePart, MathTextures, INLINE_MATH_FONT_SIZE};
 
 // ---------------------------------------------------------------------------
@@ -1099,18 +1100,37 @@ fn selection_island(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
 /// 渲染入口：prose（panel 已剝 fence/`$$`，但這裡自己再切一次 fence 以策安全，
 /// 殘留 fence 照樣是 code 塊）→ pulldown 排版 → 行內公式混排。
 pub fn show_prose(ui: &mut egui::Ui, text: &str, math: &mut MathTextures) {
+    show_prose_with_end_gap(ui, text, math, true);
+}
+
+/// The last prose segment of a reply has no following prose block to separate.
+/// Keep all internal paragraph/list spacing, but not a spacer before its toolbar.
+pub(crate) fn show_prose_compact_end(ui: &mut egui::Ui, text: &str, math: &mut MathTextures) {
+    show_prose_with_end_gap(ui, text, math, false);
+}
+
+fn show_prose_with_end_gap(ui: &mut egui::Ui, text: &str, math: &mut MathTextures, end_gap: bool) {
     if text.trim().is_empty() {
         return;
     }
-    for block in split_fences(text) {
+    let blocks = split_fences(text);
+    let last_block = blocks.len().saturating_sub(1);
+    for (block_index, block) in blocks.into_iter().enumerate() {
         match block {
             FenceBlock::Code { language, content } => {
                 show_code_block(ui, language.as_deref(), &content);
             }
             FenceBlock::Prose(prose) => {
                 prose_selection_island(ui, |ui| {
-                    for flow in parse_prose(&prose) {
-                        show_flow_block(ui, math, flow);
+                    let flows = parse_prose(&prose);
+                    let last_flow = flows.len().saturating_sub(1);
+                    for (flow_index, flow) in flows.into_iter().enumerate() {
+                        show_flow_block_with_gap(
+                            ui,
+                            math,
+                            flow,
+                            end_gap || block_index != last_block || flow_index != last_flow,
+                        );
                     }
                 });
             }
@@ -1119,7 +1139,12 @@ pub fn show_prose(ui: &mut egui::Ui, text: &str, math: &mut MathTextures) {
 }
 
 /// QuoteBlockView: markdown-aware text with a secondary tone and a 2pt rule.
-pub(crate) fn show_quote(ui: &mut egui::Ui, text: &str, math: &mut MathTextures) {
+pub(crate) fn show_quote(
+    ui: &mut egui::Ui,
+    text: &str,
+    math: &mut MathTextures,
+    trailing_gap: bool,
+) {
     prose_selection_island(ui, |ui| {
         ui.horizontal_top(|ui| {
             ui.add_space(10.0);
@@ -1127,8 +1152,10 @@ pub(crate) fn show_quote(ui: &mut egui::Ui, text: &str, math: &mut MathTextures)
             let response = ui
                 .vertical(|ui| {
                     ui.visuals_mut().override_text_color = Some(color);
-                    for block in parse_prose(text) {
-                        show_flow_block(ui, math, block);
+                    let blocks = parse_prose(text);
+                    let last = blocks.len().saturating_sub(1);
+                    for (index, block) in blocks.into_iter().enumerate() {
+                        show_flow_block_with_gap(ui, math, block, trailing_gap || index != last);
                     }
                 })
                 .response;
@@ -1141,7 +1168,9 @@ pub(crate) fn show_quote(ui: &mut egui::Ui, text: &str, math: &mut MathTextures)
                 egui::Stroke::new(2.0_f32, color),
             );
         });
-        ui.add_space(8.0);
+        if trailing_gap {
+            ui.add_space(8.0);
+        }
     });
 }
 
@@ -1174,9 +1203,10 @@ fn table_cell_inlines(text: &str) -> Vec<Inline> {
     result
 }
 
-/// TableBlockView: header-first grid, inline markdown, selectable cells. Keep
-/// ragged rows (including extra cells), just as the original Grid does.
-pub(crate) fn show_table(ui: &mut egui::Ui, header: &[String], rows: &[Vec<String>]) {
+const TABLE_CELL_PADDING: egui::Vec2 = egui::vec2(8.0, 4.0);
+const TABLE_COLUMN_GAP: f32 = 12.0;
+
+fn table_as_markdown(header: &[String], rows: &[Vec<String>]) -> String {
     let columns = rows
         .iter()
         .map(Vec::len)
@@ -1184,84 +1214,268 @@ pub(crate) fn show_table(ui: &mut egui::Ui, header: &[String], rows: &[Vec<Strin
         .max()
         .unwrap_or(1)
         .max(1);
-    let width = ((ui.available_width() - 20.0 * columns as f32) / columns as f32).max(80.0);
-    egui::ScrollArea::horizontal()
-        .id_salt(ui.next_auto_id())
-        .show(ui, |ui| {
-            egui::Grid::new(ui.next_auto_id().with("markdown-table"))
-                .spacing(egui::vec2(20.0, 10.0))
-                .striped(true)
-                .show(ui, |ui| {
-                    for (row_index, row) in std::iter::once(header)
-                        .chain(rows.iter().map(Vec::as_slice))
-                        .enumerate()
-                    {
-                        for cell in row {
-                            show_table_cell(ui, cell, width, row_index == 0);
-                        }
-                        ui.end_row();
-                    }
-                });
-        });
-    ui.add_space(8.0);
+    let row = |cells: &[String]| {
+        let cells: Vec<_> = (0..columns)
+            .map(|column| {
+                cells
+                    .get(column)
+                    .map_or("", String::as_str)
+                    .replace("\r\n", "\n")
+                    .replace('\r', "\n")
+                    .replace('|', "\\|")
+                    .replace('\n', "<br>")
+            })
+            .collect();
+        format!("| {} |", cells.join(" | "))
+    };
+    let mut lines = vec![
+        row(header),
+        format!("| {} |", vec!["---"; columns].join(" | ")),
+    ];
+    lines.extend(rows.iter().map(|cells| row(cells)));
+    lines.join("\n")
 }
 
-fn show_table_cell(ui: &mut egui::Ui, cell: &str, width: f32, header: bool) {
-    selection_island(ui, |ui| {
-        ui.allocate_ui_with_layout(
-            egui::vec2(width, 0.0),
-            egui::Layout::top_down(egui::Align::Min),
-            |ui| {
-                ui.set_max_width(width);
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    let mut job = egui::text::LayoutJob::default();
-                    let mut links = Vec::new();
-                    for inline in table_cell_inlines(cell) {
-                        let (text, strike, link) = match &inline {
-                            Inline::Text(text, style) => (text, style.strike, None),
-                            Inline::Link { label, style, url } => (label, style.strike, Some(url)),
-                            Inline::Code(text) => (text, false, None),
-                            _ => continue,
-                        };
-                        // tableCell resets parsed fonts to 12pt; links and strike remain.
-                        let rich = styled_rich(
-                            text,
-                            SpanStyle {
-                                strike,
-                                ..Default::default()
-                            },
-                            Some(12.0),
-                            false,
-                            header,
-                            ui,
-                        );
-                        let rich = if let Some(url) = link {
-                            let start = job.text.chars().count();
-                            links.push((start..start + text.chars().count(), url.clone()));
-                            rich.color(ui.visuals().hyperlink_color)
-                        } else {
-                            rich
-                        };
-                        rich.append_to(
-                            &mut job,
-                            ui.style(),
-                            egui::FontSelection::Default,
-                            egui::Align::Center,
-                        );
+fn table_copy_button(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    header: &[String],
+    rows: &[Vec<String>],
+) -> egui::Response {
+    use super::icons::{self, Icon};
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    header.hash(&mut hasher);
+    rows.hash(&mut hasher);
+    let signature = hasher.finish();
+    let feedback_id = id.with("whole-table-copy");
+    let now = ui.input(|input| input.time);
+    let copied_at = ui
+        .ctx()
+        .data(|data| data.get_temp::<(u64, f64)>(feedback_id))
+        .filter(|(saved, time)| {
+            *saved == signature && now >= *time && now - time < COPY_FEEDBACK_SECS
+        })
+        .map(|(_, time)| time);
+    let copied = copied_at.is_some();
+    let response = icons::button(
+        ui,
+        if copied { Icon::Check } else { Icon::Copy },
+        copied,
+        if copied {
+            "已複製表格"
+        } else {
+            "複製整張表格（Markdown）"
+        },
+    );
+    if response.clicked() {
+        ui.ctx().copy_text(table_as_markdown(header, rows));
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(feedback_id, (signature, now)));
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_secs_f64(COPY_FEEDBACK_SECS));
+    } else if let Some(time) = copied_at {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_secs_f64(
+                (time + COPY_FEEDBACK_SECS - now).max(0.0),
+            ));
+    }
+    response
+}
+
+fn table_column_widths(preferred: &[f32], available: f32) -> Vec<f32> {
+    const MIN_COLUMN: f32 = 80.0;
+    if preferred.is_empty() {
+        return vec![];
+    }
+    let gaps = TABLE_COLUMN_GAP * preferred.len().saturating_sub(1) as f32;
+    let minimum = MIN_COLUMN * preferred.len() as f32;
+    let available = if available.is_finite() {
+        available
+    } else {
+        preferred.iter().sum::<f32>() + gaps
+    };
+    let extra = (available - gaps - minimum).max(0.0);
+    let weights: Vec<_> = preferred
+        .iter()
+        .map(|width| (width.min(360.0) - MIN_COLUMN).max(16.0))
+        .collect();
+    let total = weights.iter().sum::<f32>();
+    weights
+        .into_iter()
+        .map(|weight| MIN_COLUMN + extra * weight / total)
+        .collect()
+}
+
+/// Fixed column rectangles and a measured height shared by every cell in a row.
+/// Grid's shrink-to-content cells and vertical centering cannot guarantee either.
+/// Keep ragged rows, inline formatting/links and independent cell selection.
+pub(crate) fn show_table(
+    ui: &mut egui::Ui,
+    header: &[String],
+    rows: &[Vec<String>],
+    trailing_gap: bool,
+) {
+    let columns = rows
+        .iter()
+        .map(Vec::len)
+        .chain([header.len()])
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let available = ui.available_width();
+    let mut preferred = vec![80.0_f32; columns];
+    let cells: Vec<Vec<_>> = std::iter::once(header)
+        .chain(rows.iter().map(Vec::as_slice))
+        .enumerate()
+        .map(|(row_index, row)| {
+            (0..columns)
+                .map(|column| {
+                    let (job, links) = table_cell_job(
+                        ui,
+                        row.get(column).map_or("", String::as_str),
+                        row_index == 0,
+                    );
+                    let natural = ui.fonts(|fonts| fonts.layout_job(job.clone())).size().x;
+                    preferred[column] = preferred[column].max(natural + 2.0 * TABLE_CELL_PADDING.x);
+                    (job, links)
+                })
+                .collect()
+        })
+        .collect();
+    let widths = table_column_widths(&preferred, available);
+    let table_width =
+        widths.iter().sum::<f32>() + TABLE_COLUMN_GAP * columns.saturating_sub(1) as f32;
+    let viewport_width = if available.is_finite() {
+        available.max(1.0)
+    } else {
+        table_width
+    };
+    let id = ui.next_auto_id().with("markdown-table");
+    ui.scope(|ui| {
+        // The copy control is outside the horizontal scroller, so it remains
+        // available even for wide tables. No extra gap above the column header.
+        ui.spacing_mut().item_spacing.y = 0.0;
+        ui.horizontal(|ui| {
+            ui.add(egui::Label::new(egui::RichText::new("表格").small().weak()).selectable(false));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                table_copy_button(ui, id, header, rows);
+            });
+        });
+        egui::ScrollArea::horizontal()
+            .id_salt(id)
+            .max_width(viewport_width)
+            .min_scrolled_width(0.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                ui.set_min_width(table_width);
+                ui.spacing_mut().item_spacing.y = 0.0;
+                for (row_index, row) in cells.into_iter().enumerate() {
+                    let laid_out: Vec<_> = row
+                        .into_iter()
+                        .zip(&widths)
+                        .map(|((mut job, links), width)| {
+                            job.wrap.max_width = (width - 2.0 * TABLE_CELL_PADDING.x).max(1.0);
+                            (ui.fonts(|fonts| fonts.layout_job(job)), links)
+                        })
+                        .collect();
+                    let height = laid_out
+                        .iter()
+                        .map(|(galley, _)| galley.size().y + 2.0 * TABLE_CELL_PADDING.y)
+                        .fold(24.0_f32, f32::max);
+                    let (rect, _) = ui
+                        .allocate_exact_size(egui::vec2(table_width, height), egui::Sense::hover());
+                    if row_index == 0 || row_index % 2 == 1 {
+                        ui.painter()
+                            .rect_filled(rect, 0.0, ui.visuals().faint_bg_color);
                     }
-                    if !job.text.is_empty() {
-                        show_text_job(ui, job, &links);
+                    ui.painter().hline(
+                        rect.x_range(),
+                        rect.bottom(),
+                        ui.visuals().widgets.noninteractive.bg_stroke,
+                    );
+                    let mut x = rect.left();
+                    for (column, ((galley, links), width)) in
+                        laid_out.into_iter().zip(&widths).enumerate()
+                    {
+                        let outer = egui::Rect::from_min_size(
+                            egui::pos2(x, rect.top()),
+                            egui::vec2(*width, height),
+                        );
+                        let content = outer.shrink2(TABLE_CELL_PADDING);
+                        let mut cell = ui.new_child(
+                            egui::UiBuilder::new()
+                                .id_salt(id.with((row_index, column)))
+                                .max_rect(content)
+                                .layout(egui::Layout::top_down(egui::Align::Min)),
+                        );
+                        cell.set_clip_rect(outer.intersect(ui.clip_rect()));
+                        selection_island(&mut cell, |ui| {
+                            if !galley.text().is_empty() {
+                                show_text_label(ui, egui::Label::new(galley), &links);
+                            }
+                        });
+                        x += width + TABLE_COLUMN_GAP;
                     }
-                });
-            },
-        );
+                }
+            });
     });
+    if trailing_gap {
+        ui.add_space(8.0);
+    }
+}
+
+fn table_cell_job(
+    ui: &egui::Ui,
+    cell: &str,
+    header: bool,
+) -> (egui::text::LayoutJob, Vec<(std::ops::Range<usize>, String)>) {
+    let mut job = egui::text::LayoutJob::default();
+    let mut links = Vec::new();
+    for inline in table_cell_inlines(cell) {
+        let (text, strike, link) = match &inline {
+            Inline::Text(text, style) => (text, style.strike, None),
+            Inline::Link { label, style, url } => (label, style.strike, Some(url)),
+            Inline::Code(text) => (text, false, None),
+            _ => continue,
+        };
+        // tableCell resets parsed fonts to 12pt; links and strike remain.
+        let rich = styled_rich(
+            text,
+            SpanStyle {
+                strike,
+                ..Default::default()
+            },
+            Some(12.0),
+            false,
+            header,
+            ui,
+        );
+        let rich = if let Some(url) = link {
+            let start = job.text.chars().count();
+            links.push((start..start + text.chars().count(), url.clone()));
+            rich.color(ui.visuals().hyperlink_color)
+        } else {
+            rich
+        };
+        rich.append_to(
+            &mut job,
+            ui.style(),
+            egui::FontSelection::Default,
+            egui::Align::Center,
+        );
+    }
+    (job, links)
 }
 
 /// PasteableBlockView: a lifted, titled card. Both display and clipboard receive
 /// the exact captured body, without markdown, math or fence interpretation.
-pub(crate) fn show_pasteable(ui: &mut egui::Ui, title: Option<&str>, content: &str) {
+pub(crate) fn show_pasteable(
+    ui: &mut egui::Ui,
+    title: Option<&str>,
+    content: &str,
+    trailing_gap: bool,
+) {
     selection_island(ui, |ui| {
         let dark = ui.visuals().dark_mode;
         let fill = if dark {
@@ -1277,7 +1491,10 @@ pub(crate) fn show_pasteable(ui: &mut egui::Ui, title: Option<&str>, content: &s
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    ui.add(egui::Label::new(egui::RichText::new("▣").weak()).selectable(false));
+                    ui.add(
+                        egui::Label::new(egui::RichText::new("▣").size(15.0).weak())
+                            .selectable(false),
+                    );
                     // Reserve the action's width before letting a long title grow.
                     let title_width = (ui.available_width() - 80.0).max(0.0);
                     ui.add_sized(
@@ -1298,23 +1515,37 @@ pub(crate) fn show_pasteable(ui: &mut egui::Ui, title: Option<&str>, content: &s
                 ui.add_space(4.0);
                 show_text_label(
                     ui,
-                    egui::Label::new(egui::RichText::new(content).size(12.5)).wrap(),
+                    egui::Label::new(
+                        egui::RichText::new(content).size(typography::scaled(ui, 12.5)),
+                    )
+                    .wrap(),
                     &[],
                 );
             });
-        ui.add_space(8.0);
+        if trailing_gap {
+            ui.add_space(8.0);
+        }
     });
 }
 
-fn show_flow_block(ui: &mut egui::Ui, math: &mut MathTextures, block: FlowBlock) {
+fn show_flow_block_with_gap(
+    ui: &mut egui::Ui,
+    math: &mut MathTextures,
+    block: FlowBlock,
+    trailing_gap: bool,
+) {
     match block {
         FlowBlock::Heading { level, inlines } => {
             show_inline_rows(ui, math, &inlines, Some(heading_size(level)), false, true);
-            ui.add_space(8.0);
+            if trailing_gap {
+                ui.add_space(8.0);
+            }
         }
         FlowBlock::Paragraph(inlines) => {
             show_inline_rows(ui, math, &inlines, None, false, false);
-            ui.add_space(9.0);
+            if trailing_gap {
+                ui.add_space(9.0);
+            }
         }
         FlowBlock::Quote(inlines) => {
             ui.horizontal_top(|ui| {
@@ -1334,7 +1565,9 @@ fn show_flow_block(ui: &mut egui::Ui, math: &mut MathTextures, block: FlowBlock)
                     );
                 }
             });
-            ui.add_space(9.0);
+            if trailing_gap {
+                ui.add_space(9.0);
+            }
         }
         FlowBlock::List(items) => {
             for item in &items {
@@ -1358,7 +1591,9 @@ fn show_flow_block(ui: &mut egui::Ui, math: &mut MathTextures, block: FlowBlock)
                     });
                 });
             }
-            ui.add_space(9.0);
+            if trailing_gap {
+                ui.add_space(9.0);
+            }
         }
         FlowBlock::Code { language, content } => {
             // Indented code belongs to the surrounding Swift prose text field;
@@ -1367,7 +1602,9 @@ fn show_flow_block(ui: &mut egui::Ui, math: &mut MathTextures, block: FlowBlock)
         }
         FlowBlock::Rule => {
             ui.add(egui::Separator::default().horizontal());
-            ui.add_space(2.0);
+            if trailing_gap {
+                ui.add_space(2.0);
+            }
         }
     }
 }
@@ -1565,7 +1802,7 @@ fn styled_rich(
         rich = rich.strikethrough();
     }
     if let Some(s) = size {
-        rich = rich.size(s);
+        rich = rich.size(typography::scaled(ui, s));
     }
     if weak {
         rich = rich.color(ui.visuals().weak_text_color());
@@ -1626,7 +1863,8 @@ fn show_one_inline(
 /// 失敗退回 `$latex$` 等寬原文，不擋主流程。
 fn show_inline_math(ui: &mut egui::Ui, math: &mut MathTextures, latex: &str) {
     let tint = ui.visuals().text_color();
-    let Some(handle) = math.texture_for(ui.ctx(), latex, INLINE_MATH_FONT_SIZE, false) else {
+    let font_size = typography::scaled(ui, INLINE_MATH_FONT_SIZE);
+    let Some(handle) = math.texture_for(ui.ctx(), latex, font_size, false) else {
         show_text_label(
             ui,
             egui::Label::new(egui::RichText::new(format!("${latex}$")).monospace()),
@@ -1643,7 +1881,7 @@ fn show_inline_math(ui: &mut egui::Ui, math: &mut MathTextures, latex: &str) {
         );
         return;
     }
-    let height = (INLINE_MATH_FONT_SIZE * 1.35).ceil();
+    let height = (font_size * 1.35).ceil();
     let width = (height * size.x / size.y).min(ui.available_width().max(16.0));
     ui.add(
         egui::Image::from_texture(&handle)
@@ -1742,7 +1980,10 @@ fn show_code_block_body(ui: &mut egui::Ui, language: Option<&str>, content: &str
                         "\n",
                         0.0,
                         egui::TextFormat {
-                            font_id: egui::FontId::monospace(CODE_FONT_SIZE),
+                            font_id: egui::FontId::monospace(typography::scaled(
+                                ui,
+                                CODE_FONT_SIZE,
+                            )),
                             color: visuals.text_color(),
                             ..Default::default()
                         },
@@ -1758,7 +1999,10 @@ fn show_code_block_body(ui: &mut egui::Ui, language: Option<&str>, content: &str
                         &span.text,
                         0.0,
                         egui::epaint::text::TextFormat {
-                            font_id: egui::FontId::monospace(CODE_FONT_SIZE),
+                            font_id: egui::FontId::monospace(typography::scaled(
+                                ui,
+                                CODE_FONT_SIZE,
+                            )),
                             color: hl_color(span.kind, dark, &visuals),
                             ..Default::default()
                         },
@@ -1776,6 +2020,60 @@ fn show_code_block_body(ui: &mut egui::Ui, language: Option<&str>, content: &str
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compact_reply_end_removes_only_trailing_gap_not_internal_markdown_spacing() {
+        let source =
+            "# Heading\n\nFirst paragraph.\n\nSecond paragraph.\n\n- First item\n- Final item";
+        let draw = |compact| {
+            let ctx = egui::Context::default();
+            let mut math = super::MathTextures::new();
+            let mut height = 0.0;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(520.0, 600.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        height = ui
+                            .scope(|ui| {
+                                if compact {
+                                    super::show_prose_compact_end(ui, source, &mut math);
+                                } else {
+                                    super::show_prose(ui, source, &mut math);
+                                }
+                            })
+                            .response
+                            .rect
+                            .height();
+                    });
+                },
+            );
+            let text: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some((text.galley.text().to_owned(), text.pos)),
+                    _ => None,
+                })
+                .collect();
+            (height, text)
+        };
+        let (normal_height, normal_text) = draw(false);
+        let (compact_height, compact_text) = draw(true);
+        assert!(!normal_text.is_empty());
+        assert_eq!(
+            normal_text, compact_text,
+            "internal heading/paragraph/list layout must not change"
+        );
+        assert!(
+            normal_height - compact_height >= 9.0,
+            "only the unused terminal gap is removed"
+        );
+    }
     use super::*;
 
     #[test]
@@ -1858,11 +2156,23 @@ mod tests {
         time: f64,
         events: Vec<egui::Event>,
     ) -> egui::FullOutput {
+        sized_headless_frame(ctx, math, source, width, time, events, None)
+    }
+
+    fn sized_headless_frame(
+        ctx: &egui::Context,
+        math: &mut MathTextures,
+        source: &str,
+        width: f32,
+        time: f64,
+        events: Vec<egui::Event>,
+        size: Option<u16>,
+    ) -> egui::FullOutput {
         ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    egui::vec2(width, 1200.0),
+                    egui::vec2(width, 2000.0),
                 )),
                 time: Some(time),
                 events,
@@ -1870,6 +2180,9 @@ mod tests {
             },
             |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
+                    if let Some(size) = size {
+                        typography::apply(ui, size);
+                    }
                     math.show_assistant_message(ui, source);
                 });
             },
@@ -1931,10 +2244,20 @@ mod tests {
         to: (&str, usize),
         width: f32,
     ) -> Vec<egui::OutputCommand> {
+        sized_drag_copy(source, from, to, width, None)
+    }
+
+    fn sized_drag_copy(
+        source: &str,
+        from: (&str, usize),
+        to: (&str, usize),
+        width: f32,
+        size: Option<u16>,
+    ) -> Vec<egui::OutputCommand> {
         let ctx = egui::Context::default();
         let mut math = MathTextures::new();
-        let _ = headless_frame(&ctx, &mut math, source, width, 0.0, vec![]);
-        let output = headless_frame(&ctx, &mut math, source, width, 0.1, vec![]);
+        let _ = sized_headless_frame(&ctx, &mut math, source, width, 0.0, vec![], size);
+        let output = sized_headless_frame(&ctx, &mut math, source, width, 0.1, vec![], size);
         let start = text_cursor(&output, from.0, from.1);
         let end = text_cursor(&output, to.0, to.1);
         let button = |pos, pressed| egui::Event::PointerButton {
@@ -1955,7 +2278,7 @@ mod tests {
             (0.6, vec![egui::Event::Copy]),
         ] {
             commands.extend(
-                headless_frame(&ctx, &mut math, source, width, time, events)
+                sized_headless_frame(&ctx, &mut math, source, width, time, events, size)
                     .platform_output
                     .commands,
             );
@@ -1967,6 +2290,173 @@ mod tests {
             "drag must not open links: {commands:?}"
         );
         commands
+    }
+
+    fn text_shapes(output: &egui::FullOutput) -> Vec<&egui::epaint::TextShape> {
+        fn collect<'a>(shape: &'a egui::Shape, out: &mut Vec<&'a egui::epaint::TextShape>) {
+            match shape {
+                egui::Shape::Text(text) => out.push(text),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut result = Vec::new();
+        for shape in &output.shapes {
+            collect(&shape.shape, &mut result);
+        }
+        result
+    }
+
+    #[test]
+    fn chat_font_size_relayouts_real_assistant_blocks_and_wrapped_table_rows() {
+        let prose =
+            "Prose bold linked text long enough to wrap over several lines in a narrow chat.";
+        let table =
+            "A long table cell whose wrapped text must determine the entire shared row height";
+        let source = format!("# Heading\n\n{prose}\n\n> Quoted text\n\n| Name | Other |\n| - | - |\n| {table} | short |\n| next row | last |\n```rust\nlet code = 1;\n```\n<pasteable title=\"Card\">\nPasteable body\n</pasteable>\n\nFinal paragraph");
+        for appearance in ["light", "dark"] {
+            for width in [320.0, 520.0] {
+                for size in [12, 14, 15, 20, 24] {
+                    let ctx = egui::Context::default();
+                    super::super::theme::apply(
+                        &ctx,
+                        appearance,
+                        super::super::theme::DEFAULT_ACCENT_HEX,
+                    );
+                    let mut math = MathTextures::new();
+                    let output = sized_headless_frame(
+                        &ctx,
+                        &mut math,
+                        &source,
+                        width,
+                        0.0,
+                        vec![],
+                        Some(size),
+                    );
+                    let shapes = text_shapes(&output);
+                    let shape = |text| {
+                        *shapes
+                            .iter()
+                            .find(|shape| shape.galley.text() == text)
+                            .unwrap_or_else(|| panic!("missing {text:?}"))
+                    };
+                    for (text, base) in [
+                        ("Heading", heading_size(1)),
+                        (prose, 15.0),
+                        ("Quoted text", 15.0),
+                        (table, 12.0),
+                        ("let code = 1;", 13.0),
+                        ("Pasteable body", 12.5),
+                    ] {
+                        let actual = shape(text);
+                        for section in &actual.galley.job.sections {
+                            assert!(
+                                (section.format.font_id.size - base * typography::scale(size))
+                                    .abs()
+                                    < 0.001,
+                                "{appearance} {width} {size}: {text}"
+                            );
+                        }
+                        for rows in actual.galley.rows.windows(2) {
+                            assert!(rows[0].rect().bottom() <= rows[1].rect().top() + 0.01);
+                        }
+                    }
+                    let rect = |text| {
+                        let s = shape(text);
+                        egui::Rect::from_min_size(s.pos, s.galley.size())
+                    };
+                    assert!(rect("Heading").bottom() <= rect(prose).top());
+                    assert!(rect(prose).bottom() <= rect("Quoted text").top());
+                    assert!(
+                        rect(table).bottom() <= rect("next row").top(),
+                        "table row must use tallest wrapped cell"
+                    );
+                    assert!(rect("short").bottom() <= rect("next row").top());
+                    assert!(rect("next row").bottom() <= rect("let code = 1;").top());
+                    assert!(rect("let code = 1;").bottom() <= rect("Pasteable body").top());
+                    assert!(rect("Pasteable body").bottom() <= rect("Final paragraph").top());
+                    for text in [prose, table, "Pasteable body", "Final paragraph"] {
+                        assert!(
+                            rect(text).right() <= width + 0.1,
+                            "wrapped {text} outside {width}"
+                        );
+                    }
+                    // Action labels are chrome, not chat text.
+                    assert_eq!(
+                        shape("Copy").galley.job.sections[0].format.font_id.size,
+                        13.0
+                    );
+                    assert_eq!(ctx.style().text_styles[&egui::TextStyle::Body].size, 15.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn large_chat_font_preserves_real_selection_copy_and_link_hit_testing() {
+        let source = "Alpha **bold** [link](https://example.invalid) tail";
+        let text = "Alpha bold link tail";
+        for size in [12, 14, 20, 24] {
+            assert_copy(
+                &sized_drag_copy(
+                    source,
+                    (text, 0),
+                    (text, text.chars().count()),
+                    320.0,
+                    Some(size),
+                ),
+                text,
+            );
+            let ctx = egui::Context::default();
+            let mut math = MathTextures::new();
+            let frame = |math: &mut MathTextures, events| {
+                sized_headless_frame(&ctx, math, source, 320.0, 0.0, events, Some(size))
+            };
+            frame(&mut math, vec![]);
+            let output = frame(&mut math, vec![]);
+            let pos = text_cursor(&output, text, 12);
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            frame(
+                &mut math,
+                vec![egui::Event::PointerMoved(pos), button(true)],
+            );
+            let output = frame(&mut math, vec![button(false)]);
+            assert!(output.platform_output.commands.iter().any(|command| matches!(command, egui::OutputCommand::OpenUrl(url) if url.url == "https://example.invalid")));
+            for (source, body) in [
+                (
+                    "```rust\nlet x = 1;\n\n// tail\n```",
+                    "let x = 1;\n\n// tail",
+                ),
+                (
+                    "<pasteable>\n**literal** $x$\n\n  tail\n</pasteable>",
+                    "**literal** $x$\n\n  tail",
+                ),
+                (
+                    "| Header | Other |\n| - | - |\n| a[link](https://example.invalid)b | next |",
+                    "alinkb",
+                ),
+            ] {
+                assert_copy(
+                    &sized_drag_copy(
+                        source,
+                        (body, 0),
+                        (body, body.chars().count()),
+                        320.0,
+                        Some(size),
+                    ),
+                    body,
+                );
+            }
+        }
     }
 
     fn assert_copy(commands: &[egui::OutputCommand], expected: &str) {
@@ -2263,6 +2753,231 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn pdf_comparison_table_wraps_in_fixed_top_aligned_columns_without_row_overlap() {
+        let a = "把整頁截圖放進 PDF，最接近畫面原貌，但文字通常無法選取、搜尋。";
+        let b = "文字通常可選取、搜尋，但網頁可能套用列印版型，排版不一定跟畫面一樣。";
+        let token = "VeryLongUnbrokenToken".repeat(16);
+        let source = format!("| PDF 類型 | 說明 |\n| --- | --- |\n| 截圖式 PDF | {a} |\n| 列印式 PDF | {b} |\n| Token | {token} |\n\nAfter table");
+        for width in [320.0, 404.0, 520.0, 752.0] {
+            for appearance in ["light", "dark"] {
+                let ctx = egui::Context::default();
+                crate::ui::theme::apply(&ctx, appearance, crate::ui::theme::DEFAULT_ACCENT_HEX);
+                let mut math = MathTextures::new();
+                for frame in 0..3 {
+                    let output =
+                        headless_frame(&ctx, &mut math, &source, width, frame as f64 * 0.1, vec![]);
+                    let text = painted_text(&output);
+                    let rect = |value: &str| {
+                        text.iter()
+                            .find(|(s, _)| s == value)
+                            .unwrap_or_else(|| panic!("missing table cell {value:?}"))
+                            .1
+                    };
+                    let labels = [
+                        rect("PDF 類型"),
+                        rect("截圖式 PDF"),
+                        rect("列印式 PDF"),
+                        rect("Token"),
+                    ];
+                    let descriptions = [rect("說明"), rect(a), rect(b), rect(&token)];
+                    for (label, description) in labels.iter().zip(descriptions.iter()) {
+                        assert!((label.left() - labels[0].left()).abs() < 0.5);
+                        assert!((description.left() - descriptions[0].left()).abs() < 0.5);
+                        assert!(
+                            (label.top() - description.top()).abs() < 0.5,
+                            "cells must align at top, not center"
+                        );
+                        assert!(label.right() < description.left());
+                        assert!(
+                            description.right() <= width - 8.0 + 0.5,
+                            "cell escaped viewport at {width}: {description:?}"
+                        );
+                    }
+                    for row in 0..3 {
+                        assert!(
+                            labels[row + 1].top()
+                                >= labels[row].bottom().max(descriptions[row].bottom()) + 7.5,
+                            "row height must include its tallest wrapped cell"
+                        );
+                    }
+                    assert!(rect("After table").top() > descriptions[3].bottom());
+                    assert!(
+                        descriptions[3].height() > labels[3].height(),
+                        "unbroken tokens must actually wrap"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn table_width_plan_prefers_description_and_keeps_wide_tables_scrollable_not_expanding_panel() {
+        let widths = table_column_widths(&[80.0, 360.0], 400.0);
+        assert!(widths[1] > widths[0] * 2.0);
+        assert!((widths.iter().sum::<f32>() + TABLE_COLUMN_GAP - 400.0).abs() < 0.1);
+        let wide = table_column_widths(&[100.0; 6], 300.0);
+        assert!(wide.iter().all(|width| *width >= 80.0));
+        let ctx = egui::Context::default();
+        let mut math = MathTextures::new();
+        let source = "| A | B | C | D | E | F |\n| - | - | - | - | - | - |\n| a | b | c | d | e | f |\n| empty trailing cells |";
+        for _ in 0..2 {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(320.0, 500.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let limit = ui.max_rect().right();
+                        math.show_assistant_message(ui, source);
+                        assert!(
+                            ui.min_rect().right() <= limit + 0.5,
+                            "wide content must scroll inside its viewport"
+                        );
+                    });
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn copied_table_markdown_preserves_formatting_and_pads_ragged_rows() {
+        let header = vec!["Name".into(), "Note".into()];
+        let rows = vec![
+            vec!["**A**".into(), "a|b\r\nnext".into()],
+            vec!["B".into()],
+            vec!["C".into(), "D".into(), "extra".into()],
+        ];
+        assert_eq!(table_as_markdown(&header, &rows),
+            "| Name | Note |  |\n| --- | --- | --- |\n| **A** | a\\|b<br>next |  |\n| B |  |  |\n| C | D | extra |");
+    }
+
+    #[test]
+    fn actual_table_copy_icon_copies_only_the_table_and_feedback_expires_or_tracks_changes() {
+        let source = "Before table\n\n| **Type** | Description |\n| --- | --- |\n| A | cell B |\n\nAfter table";
+        let expected = "| **Type** | Description |\n| --- | --- |\n| A | cell B |";
+        let ctx = egui::Context::default();
+        let mut math = MathTextures::new();
+        let _ = headless_frame(&ctx, &mut math, source, 520.0, 0.0, vec![]);
+        let initial = headless_frame(&ctx, &mut math, source, 520.0, 0.1, vec![]);
+        let pos = initial
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Circle(circle) if (circle.radius - 14.0).abs() < 0.1 => {
+                    Some(circle.center)
+                }
+                _ => None,
+            })
+            .expect("table copy icon must paint");
+        let icon = |output: &egui::FullOutput| {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Mesh(mesh) => Some(mesh.texture_id),
+                    _ => None,
+                })
+                .expect("Font Awesome icon texture must paint")
+        };
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let _ = headless_frame(
+            &ctx,
+            &mut math,
+            source,
+            520.0,
+            0.2,
+            vec![egui::Event::PointerMoved(pos), button(true)],
+        );
+        let copied = headless_frame(&ctx, &mut math, source, 520.0, 0.3, vec![button(false)]);
+        assert_copy(&copied.platform_output.commands, expected);
+        assert!(!copied
+            .platform_output
+            .commands
+            .iter()
+            .any(|command| matches!(command, egui::OutputCommand::OpenUrl(_))));
+        let feedback = headless_frame(&ctx, &mut math, source, 520.0, 0.4, vec![]);
+        assert_ne!(
+            icon(&initial),
+            icon(&feedback),
+            "copy becomes the official check icon"
+        );
+        let changed = headless_frame(
+            &ctx,
+            &mut math,
+            &source.replace("cell B", "cell changed"),
+            520.0,
+            0.5,
+            vec![],
+        );
+        assert_eq!(
+            icon(&initial),
+            icon(&changed),
+            "changed table is no longer the copied snapshot"
+        );
+        let expired = headless_frame(&ctx, &mut math, source, 520.0, 2.0, vec![]);
+        assert_eq!(icon(&initial), icon(&expired), "success feedback expires");
+    }
+
+    #[test]
+    fn identical_tables_have_independent_copy_feedback() {
+        let table = "| A | B |\n| - | - |\n| one | two |";
+        let source = format!("{table}\n\nBetween\n\n{table}");
+        let ctx = egui::Context::default();
+        let mut math = MathTextures::new();
+        let _ = headless_frame(&ctx, &mut math, &source, 520.0, 0.0, vec![]);
+        let initial = headless_frame(&ctx, &mut math, &source, 520.0, 0.1, vec![]);
+        let icons = |output: &egui::FullOutput| {
+            output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Mesh(mesh) => Some(mesh.texture_id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(icons(&initial).len(), 2);
+        let pos = initial
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Circle(circle) if (circle.radius - 14.0).abs() < 0.1 => {
+                    Some(circle.center)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let _ = headless_frame(
+            &ctx,
+            &mut math,
+            &source,
+            520.0,
+            0.2,
+            vec![egui::Event::PointerMoved(pos), button(true)],
+        );
+        let _ = headless_frame(&ctx, &mut math, &source, 520.0, 0.3, vec![button(false)]);
+        let feedback = headless_frame(&ctx, &mut math, &source, 520.0, 0.4, vec![]);
+        let textures = icons(&feedback);
+        assert_ne!(textures[0], textures[1]);
+        assert_eq!(textures[1], icons(&initial)[1]);
     }
 
     #[test]

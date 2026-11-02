@@ -1,4 +1,4 @@
-//! Searchable installed fonts, independent language choices and glyph fallbacks.
+//! Bundled Chinese default, searchable installed fonts and independent script choices.
 
 use super::preference_layout as form;
 use super::{font_catalog, font_cmap};
@@ -7,10 +7,11 @@ use ab_glyph::Font as _;
 use font_catalog::{fonts_dir, read_font};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Empty strings retain egui's English fonts and the original automatic CJK fallback.
-/// Old filename values remain readable; new choices identify installed files/faces.
+/// Empty strings use installed TT Norms Pro / Arial and bundled Swei Gothic TC.
+/// Old filename values and explicit installed file/face choices remain readable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct FontPreferences {
@@ -19,6 +20,23 @@ pub struct FontPreferences {
 }
 
 const CACHE_TTL: Duration = Duration::from_secs(60);
+const DEFAULT_ENGLISH_LABEL: &str = "TT Norms Pro（未安裝時使用 Arial）";
+const BUNDLED_SWEI_ID: &str = "bundled:swei-gothic-tc";
+const BUNDLED_SWEI_LABEL: &str = "獅尾圓體 TC Regular（內建）";
+const BUNDLED_SWEI_DEFAULT_LABEL: &str = "獅尾圓體（內建預設）";
+const BUNDLED_SWEI_BYTES: &[u8] =
+    include_bytes!("../../assets/fonts/swei-gothic/SweiGothicCJKtc-Regular.ttf");
+
+/// Filter once per process, not per frame or per egui context. The distributed
+/// asset stays byte-for-byte upstream; only the in-memory cmap is partitioned.
+fn bundled_chinese() -> Result<Arc<egui::FontData>, String> {
+    static DATA: OnceLock<Result<Arc<egui::FontData>, String>> = OnceLock::new();
+    DATA.get_or_init(|| {
+        font_cmap::subset(BUNDLED_SWEI_BYTES.to_vec(), 0, font_cmap::Script::Chinese)
+            .map(|bytes| Arc::new(egui::FontData::from_owned(bytes)))
+    })
+    .clone()
+}
 
 #[derive(Clone, Default)]
 struct AppliedFonts {
@@ -29,8 +47,19 @@ struct AppliedFonts {
 }
 
 fn load_choice(value: &str, chinese: bool) -> Result<egui::FontData, String> {
-    let (path, index) = font_catalog::resolve_selection(value)?;
-    let bytes = read_font(&path)?;
+    let (bytes, index) = if value == BUNDLED_SWEI_ID {
+        if chinese {
+            return bundled_chinese().map(|data| (*data).clone());
+        }
+        (BUNDLED_SWEI_BYTES.to_vec(), 0)
+    } else {
+        let (path, index) = font_catalog::resolve_selection(value)?;
+        (read_font(&path)?, index)
+    };
+    subset_choice(bytes, index, chinese)
+}
+
+fn subset_choice(bytes: Vec<u8>, index: u32, chinese: bool) -> Result<egui::FontData, String> {
     let bytes = font_cmap::subset(
         bytes,
         index,
@@ -45,6 +74,63 @@ fn load_choice(value: &str, chinese: bool) -> Result<egui::FontData, String> {
     Ok(data)
 }
 
+#[derive(Clone)]
+struct DefaultEnglish {
+    data: Option<Arc<egui::FontData>>,
+    source: Option<(PathBuf, u32)>,
+    status: String,
+}
+
+fn resolve_default_english(
+    choices: &[font_catalog::FontChoice],
+    mut load: impl FnMut(&font_catalog::FontChoice) -> Result<egui::FontData, String>,
+) -> DefaultEnglish {
+    let mut ranked: Vec<_> = choices
+        .iter()
+        .filter_map(|face| font_catalog::default_english_rank(face).map(|rank| (rank, face)))
+        .collect();
+    ranked.sort_by_key(|(rank, face)| (*rank, face.path.clone(), face.index));
+    for (rank, face) in ranked {
+        let Ok(data) = load(face) else { continue };
+        let Ok(font) = ab_glyph::FontRef::try_from_slice_and_index(&data.font, data.index) else {
+            continue;
+        };
+        // A readable metadata record alone is insufficient: reject broken cmaps
+        // and non-renderable defaults before falling back to the next candidate.
+        if !((' '..='~').all(|c| font.glyph_id(c).0 != 0)
+            && font.outline(font.glyph_id('A')).is_some())
+        {
+            continue;
+        }
+        return DefaultEnglish {
+            data: Some(Arc::new(data)),
+            source: Some((face.path.clone(), face.index)),
+            status: if rank == 0 {
+                "目前使用：TT Norms Pro（已安裝）".into()
+            } else {
+                "目前使用：Arial（TT Norms Pro 未安裝或無法讀取）".into()
+            },
+        };
+    }
+    DefaultEnglish {
+        data: None,
+        source: None,
+        status: "目前使用：egui 備援（TT Norms Pro 與 Arial 均未安裝或無法讀取）".into(),
+    }
+}
+
+/// Immutable process cache: neither successful nor missing defaults trigger
+/// registry queries, file reads or cmap work on subsequent frames/contexts.
+fn default_english() -> &'static DefaultEnglish {
+    static DEFAULT: OnceLock<DefaultEnglish> = OnceLock::new();
+    DEFAULT.get_or_init(|| {
+        let catalog = font_catalog::default_english_candidates();
+        resolve_default_english(&catalog.choices, |face| {
+            subset_choice(read_font(&face.path)?, face.index, false)
+        })
+    })
+}
+
 #[derive(Clone, Default)]
 struct PickerSearch {
     query: String,
@@ -57,6 +143,12 @@ fn font_picker(
     value: &mut String,
     catalog: &font_catalog::FontCatalog,
 ) -> egui::Response {
+    let chinese = label == "中文字體";
+    let default_label = if chinese {
+        BUNDLED_SWEI_DEFAULT_LABEL
+    } else {
+        DEFAULT_ENGLISH_LABEL
+    };
     let search_id = ui.make_persistent_id(("installed-font-search", label));
     let mut search = ui
         .data_mut(|data| data.get_temp::<PickerSearch>(search_id))
@@ -71,7 +163,9 @@ fn font_picker(
                     .is_some_and(|f| f.eq_ignore_ascii_case(value.as_str())))
     });
     let selected_text = if value.is_empty() {
-        "預設字體".to_owned()
+        default_label.to_owned()
+    } else if value == BUNDLED_SWEI_ID {
+        BUNDLED_SWEI_LABEL.to_owned()
     } else {
         selected.map(|face| face.label.clone()).unwrap_or_else(|| {
             value
@@ -99,11 +193,25 @@ fn font_picker(
                 edit.request_focus();
             }
             ui.add_space(4.0);
-            if ui.selectable_label(value.is_empty(), "預設字體").clicked() {
+            if ui.selectable_label(value.is_empty(), default_label).clicked() {
                 value.clear();
                 ui.close();
             }
             let query = search.query.trim().to_lowercase();
+            // Available immediately, even while the installed catalog is scanning.
+            let show_bundled = chinese
+                && format!("{BUNDLED_SWEI_LABEL} swei gothic tc regular bundled 獅尾圓體 內建 預設 繁體中文")
+                    .to_lowercase()
+                    .contains(&query);
+            if show_bundled
+                && ui
+                    .selectable_label(value == BUNDLED_SWEI_ID, BUNDLED_SWEI_LABEL)
+                    .on_hover_text("隨程式內建的繁體中文字體，無須安裝或連線。")
+                    .clicked()
+            {
+                *value = BUNDLED_SWEI_ID.to_owned();
+                ui.close();
+            }
             let choices: Vec<_> = catalog
                 .choices
                 .iter()
@@ -139,18 +247,21 @@ fn font_picker(
                         ));
                     }
                 });
-            if choices.is_empty() {
+            if choices.is_empty() && !show_bundled {
                 form::caption(ui, "沒有符合的字體，試試英文名稱或其他關鍵字。");
             }
-            form::caption(ui, &format!("{} 個結果", choices.len()));
+            form::caption(
+                ui,
+                &format!("{} 個結果", choices.len() + usize::from(show_bundled)),
+            );
         });
     search.open = response.inner.is_some();
     ui.data_mut(|data| data.insert_temp(search_id, search));
     response.response
 }
 
-/// The complete supported installed outline catalog, searchable without loading
-/// a new font for every row. Scanning never runs on the UI thread.
+/// Bundled Chinese plus the installed outline catalog, searchable without loading
+/// a new font for every row. Installed scanning never runs on the UI thread.
 pub fn show_font_preferences(ui: &mut egui::Ui, prefs: &mut FontPreferences) {
     let snapshot = font_catalog::catalog(ui.ctx(), false);
     let catalog = &snapshot.catalog;
@@ -164,6 +275,13 @@ pub fn show_font_preferences(ui: &mut egui::Ui, prefs: &mut FontPreferences) {
                 font_picker(ui, label, value, catalog);
             });
             ui.add_space(4.0);
+            if label == "英文字體" && value.is_empty() {
+                let default = default_english();
+                let response = ui.label(egui::RichText::new(&default.status).size(12.0).weak());
+                if let Some((path, index)) = &default.source {
+                    response.on_hover_text(format!("{} · 字面 {index}", path.display()));
+                }
+            }
             if let Some(face) = catalog.choices.iter().find(|face| &face.id == value) {
                 if label == "中文字體" && !face.has_chinese {
                     form::caption(ui, "所選字體未含常用中文，將由備援字體補足。");
@@ -209,6 +327,8 @@ fn build_definitions(
     prefs: &FontPreferences,
 ) -> Result<(egui::FontDefinitions, Option<String>), String> {
     let mut defs = egui::FontDefinitions::default();
+    let default = prefs.english.is_empty().then(default_english);
+    let has_english = !prefs.english.is_empty() || default.is_some_and(|d| d.data.is_some());
     if !prefs.english.is_empty() {
         let data = load_choice(&prefs.english, false)?;
         defs.font_data
@@ -217,48 +337,45 @@ fn build_definitions(
             .get_mut(&egui::FontFamily::Proportional)
             .unwrap()
             .insert(0, "selected-english".to_owned());
+    } else if let Some(data) = default.and_then(|d| d.data.as_ref()) {
+        defs.font_data
+            .insert("default-english".into(), Arc::clone(data));
+        defs.families
+            .get_mut(&egui::FontFamily::Proportional)
+            .unwrap()
+            .insert(0, "default-english".into());
     }
-    if !prefs.chinese.is_empty() {
+    let custom_chinese = !prefs.chinese.is_empty() && prefs.chinese != BUNDLED_SWEI_ID;
+    if custom_chinese {
         let data = load_choice(&prefs.chinese, true)?;
         defs.font_data
             .insert("selected-chinese".to_owned(), std::sync::Arc::new(data));
         defs.families
             .get_mut(&egui::FontFamily::Proportional)
             .unwrap()
-            .insert(
-                usize::from(!prefs.english.is_empty()),
-                "selected-chinese".to_owned(),
-            );
+            .insert(usize::from(has_english), "selected-chinese".to_owned());
         defs.families
             .get_mut(&egui::FontFamily::Monospace)
             .unwrap()
             .push("selected-chinese".to_owned());
     }
-    // Always retain full-coverage CJK backup, even when the chosen face has holes.
-    let cjk = find_cjk_font()
-        .map(|path| {
-            read_font(&path).map(|bytes| {
-                (
-                    egui::FontData::from_owned(bytes),
-                    path.display().to_string(),
-                )
-            })
-        })
-        .transpose()?;
-    let mut cjk_path = None;
-    if let Some((data, path)) = cjk {
-        defs.font_data
-            .insert("cjk-fallback".to_owned(), std::sync::Arc::new(data));
-        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            // Embedded Latin/code/emoji fonts remain intact and ahead of CJK.
-            defs.families
-                .get_mut(&family)
-                .unwrap()
-                .push("cjk-fallback".to_owned());
-        }
-        cjk_path = Some(path);
-    }
-    Ok((defs, cjk_path))
+    // A self-contained CJK default AND permanent backup for incomplete custom
+    // faces. No OS-font probing/read can break the bundled default. Its cmap has
+    // no Latin/code glyphs, so the English choice and egui fallbacks stay intact.
+    defs.font_data
+        .insert("cjk-fallback".to_owned(), bundled_chinese()?);
+    defs.families
+        .get_mut(&egui::FontFamily::Proportional)
+        .unwrap()
+        .insert(
+            usize::from(has_english) + usize::from(custom_chinese),
+            "cjk-fallback".to_owned(),
+        );
+    defs.families
+        .get_mut(&egui::FontFamily::Monospace)
+        .unwrap()
+        .push("cjk-fallback".to_owned());
+    Ok((defs, Some(BUNDLED_SWEI_ID.to_owned())))
 }
 
 /// Atomically apply a pair. Invalid selections leave the last working fonts intact.
@@ -349,7 +466,7 @@ pub fn find_cjk_font() -> Option<PathBuf> {
     None
 }
 
-/// 載入並掛到 egui。回傳選中的檔名（供 log）；None 表示沒找到。
+/// 載入內建中文字體並掛到 egui。回傳內建 ID（供 log）；None 表示載入失敗。
 pub fn install_cjk_font(ctx: &egui::Context) -> Option<String> {
     apply_font_preferences(ctx, &FontPreferences::default()).ok()?;
     let name = ctx.data_mut(|data| {
@@ -383,6 +500,140 @@ mod tests {
         })
     }
 
+    fn default_face(family: &str, path: &str, index: u32) -> font_catalog::FontChoice {
+        font_catalog::FontChoice {
+            id: font_catalog::selection_id(&PathBuf::from(path), index),
+            label: family.into(),
+            search: family.to_lowercase(),
+            path: path.into(),
+            index,
+            families: vec![family.into()],
+            style: resvg::usvg::fontdb::Style::Normal,
+            weight: 400,
+            stretch: resvg::usvg::fontdb::Stretch::Normal,
+            has_latin: true,
+            has_chinese: false,
+        }
+    }
+
+    fn embedded_english() -> egui::FontData {
+        let defs = egui::FontDefinitions::default();
+        subset_choice(defs.font_data["Ubuntu-Light"].font.to_vec(), 0, false).unwrap()
+    }
+
+    #[test]
+    fn default_resolution_ranks_metadata_preserves_user_ttc_face_and_handles_failures() {
+        let tt = default_face(
+            "TT Norms Pro Normal",
+            r"C:\Users\test\Fonts\odd-name.ttc",
+            2,
+        );
+        let arial = default_face("Arial", r"C:\Windows\Fonts\arial.ttf", 0);
+        let choices = [arial.clone(), tt.clone()];
+        let mut requested = Vec::new();
+        let resolved = resolve_default_english(&choices, |face| {
+            requested.push((face.path.clone(), face.index));
+            Ok(embedded_english())
+        });
+        assert_eq!(resolved.source, Some((tt.path.clone(), 2)));
+        assert_eq!(requested, vec![(tt.path.clone(), 2)]);
+        assert!(resolved.status.contains("TT Norms Pro（已安裝）"));
+        let resolved = resolve_default_english(&choices, |face| {
+            if face.index == 2 {
+                Err("unreadable".into())
+            } else {
+                Ok(embedded_english())
+            }
+        });
+        assert_eq!(resolved.source, Some((arial.path.clone(), 0)));
+        assert!(resolved.status.contains("Arial（TT Norms Pro"));
+        let resolved = resolve_default_english(&choices, |face| {
+            if face.index == 2 {
+                Ok(egui::FontData::from_owned(b"broken font".to_vec()))
+            } else {
+                Ok(embedded_english())
+            }
+        });
+        assert_eq!(resolved.source, Some((arial.path.clone(), 0)));
+        let resolved = resolve_default_english(&choices, |face| {
+            if face.index == 2 {
+                Ok((*bundled_chinese().unwrap()).clone())
+            } else {
+                Ok(embedded_english())
+            }
+        });
+        assert_eq!(
+            resolved.source,
+            Some((arial.path, 0)),
+            "invalid Latin cmap must fall back"
+        );
+        for choices in [&[][..], &choices[..]] {
+            let missing = resolve_default_english(choices, |_| Err("missing".into()));
+            assert!(missing.data.is_none());
+            assert!(missing.source.is_none());
+            assert!(missing.status.contains("egui 備援"));
+        }
+    }
+
+    #[test]
+    fn automatic_english_is_cached_partitioned_and_does_not_replace_manual_choices() {
+        let default = default_english();
+        assert!(std::ptr::eq(default, default_english()));
+        let prefs = FontPreferences::default();
+        let defs = build_definitions(&prefs).unwrap().0;
+        if let Some(data) = &default.data {
+            assert!(Arc::ptr_eq(data, &defs.font_data["default-english"]));
+            assert_eq!(
+                defs.families[&egui::FontFamily::Proportional][0],
+                "default-english"
+            );
+            let font = ab_glyph::FontRef::try_from_slice_and_index(&data.font, data.index).unwrap();
+            assert!(font.codepoint_ids().all(|(_, c)| !font_cmap::is_chinese(c)));
+            assert_eq!(font.glyph_id('中').0, 0);
+        }
+        assert!(!defs.families[&egui::FontFamily::Monospace]
+            .iter()
+            .any(|name| name == "default-english"));
+        let manual = FontPreferences {
+            english: "arial.ttf".into(),
+            chinese: "kaiu.ttf".into(),
+        };
+        let manual_defs = build_definitions(&manual).unwrap().0;
+        assert!(!manual_defs.font_data.contains_key("default-english"));
+        assert_eq!(
+            manual_defs.font_data["selected-english"].font,
+            load_choice("arial.ttf", false).unwrap().font
+        );
+        assert_eq!(
+            manual_defs.font_data["selected-chinese"].font,
+            load_choice("kaiu.ttf", true).unwrap().font
+        );
+        let automatic = fonts_for(&prefs);
+        let explicit = fonts_for(&FontPreferences {
+            english: "arial.ttf".into(),
+            ..Default::default()
+        });
+        for (text, id) in [
+            ("中文，呼叫搜尋。", egui::FontId::proportional(18.0)),
+            ("let answer = 42; 中文", egui::FontId::monospace(18.0)),
+        ] {
+            let width = |fonts: &egui::epaint::text::Fonts| {
+                fonts
+                    .layout_no_wrap(text.into(), id.clone(), egui::Color32::WHITE)
+                    .size()
+                    .x
+            };
+            assert_eq!(width(&automatic), width(&explicit));
+        }
+        let ctx = egui::Context::default();
+        for _ in 0..8 {
+            apply_font_preferences(&ctx, &prefs).unwrap();
+        }
+        assert_eq!(applied(&ctx).rebuilds, 1);
+        // Diagnostic includes only the resolved font path/face, no other user data.
+        eprintln!("Default English resolved: {:?}", default.source);
+    }
+
     #[test]
     fn preferences_are_eq_serializable_and_missing_fields_default() {
         let prefs: FontPreferences = serde_json::from_str(r#"{"english":"arial.ttf"}"#).unwrap();
@@ -396,6 +647,101 @@ mod tests {
             serde_json::from_str::<FontPreferences>("{}").unwrap(),
             FontPreferences::default()
         );
+        let manual = FontPreferences {
+            english: "arial.ttf".into(),
+            chinese: "SweiGothicCJKtc-DemiLight.ttf".into(),
+        };
+        assert_eq!(
+            serde_json::from_str::<FontPreferences>(&serde_json::to_string(&manual).unwrap())
+                .unwrap(),
+            manual,
+            "loading preferences must not migrate explicit manual choices"
+        );
+    }
+
+    #[test]
+    fn bundled_asset_matches_pinned_upstream_and_covers_traditional_chinese() {
+        use sha2::{Digest, Sha256};
+        assert_eq!(BUNDLED_SWEI_BYTES.len(), 16_193_916);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(BUNDLED_SWEI_BYTES)),
+            "0cb199c63ec23fda70905decf82e1a7f3657092a653323063e9e5f50adfc3f7f"
+        );
+        let data = bundled_chinese().unwrap();
+        assert!(Arc::ptr_eq(&data, &bundled_chinese().unwrap()));
+        let font = ab_glyph::FontRef::try_from_slice(&data.font).unwrap();
+        for c in MUST_HAVE
+            .iter()
+            .copied()
+            .chain("繁體中文獅尾圓體臺灣「」『』，。！？：；（）【】、ㄅㄆㄇ".chars())
+        {
+            assert_ne!(font.glyph_id(c).0, 0, "bundled font lacks {c}");
+        }
+        for c in
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 !,.;:(){}[]".chars()
+        {
+            assert_eq!(font.glyph_id(c).0, 0, "bundled CJK must not capture {c}");
+        }
+        assert!(font.codepoint_ids().all(|(_, c)| font_cmap::is_chinese(c)));
+    }
+
+    #[test]
+    fn default_and_explicit_bundled_definitions_retain_self_contained_chinese() {
+        for chinese in ["", BUNDLED_SWEI_ID] {
+            let prefs = FontPreferences {
+                chinese: chinese.into(),
+                ..Default::default()
+            };
+            let (defs, source) = build_definitions(&prefs).unwrap();
+            assert_eq!(source.as_deref(), Some(BUNDLED_SWEI_ID));
+            assert!(!defs.font_data.contains_key("selected-chinese"));
+            assert!(Arc::ptr_eq(
+                &defs.font_data["cjk-fallback"],
+                &bundled_chinese().unwrap()
+            ));
+            for (name, data) in egui::FontDefinitions::default().font_data {
+                assert_eq!(defs.font_data[&name].font, data.font);
+            }
+            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                assert!(fonts_for(&prefs).has_glyphs(
+                    &egui::FontId::new(18.0, family),
+                    "繁體中文「呼叫」ABC123，。！？"
+                ));
+            }
+        }
+        let ctx = egui::Context::default();
+        assert_eq!(install_cjk_font(&ctx).as_deref(), Some(BUNDLED_SWEI_ID));
+    }
+
+    #[test]
+    fn bundled_and_manual_chinese_leave_english_and_code_glyphs_independent() {
+        let default_english = fonts_for(&FontPreferences::default());
+        let manual_chinese = fonts_for(&FontPreferences {
+            chinese: "kaiu.ttf".into(),
+            ..Default::default()
+        });
+        let egui_fonts = egui::epaint::text::Fonts::new(
+            1.0,
+            2048,
+            egui::epaint::image::AlphaFromCoverage::default(),
+            egui::FontDefinitions::default(),
+        );
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            let width = |fonts: &egui::epaint::text::Fonts| {
+                fonts
+                    .layout_no_wrap(
+                        "The quick brown fox WWW iii 0123456789; let x = 42;".into(),
+                        egui::FontId::new(18.0, family.clone()),
+                        egui::Color32::WHITE,
+                    )
+                    .size()
+                    .x
+            };
+            assert_eq!(width(&manual_chinese), width(&default_english));
+            if family == egui::FontFamily::Monospace {
+                assert_eq!(width(&default_english), width(&egui_fonts));
+            }
+        }
     }
 
     #[test]
@@ -501,7 +847,11 @@ mod tests {
             b.font_data["selected-english"].font
         );
         for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            assert_eq!(b.families[&family].last().unwrap(), "cjk-fallback");
+            let chain = &b.families[&family];
+            assert!(
+                chain.iter().position(|name| name == "selected-chinese")
+                    < chain.iter().position(|name| name == "cjk-fallback")
+            );
             assert!(fonts_for(&second)
                 .has_glyphs(&egui::FontId::new(16.0, family), "呼叫下方輸入開始聊天"));
         }
@@ -621,6 +971,10 @@ mod tests {
         assert!(texts.contains(&"即時預覽"));
         assert!(texts
             .iter()
+            .any(|text| text.contains(DEFAULT_ENGLISH_LABEL)));
+        assert!(texts.contains(&default_english().status.as_str()));
+        assert!(texts
+            .iter()
             .any(|text| text.contains("The quick brown fox")));
         assert!(texts
             .iter()
@@ -711,6 +1065,81 @@ mod tests {
     }
 
     #[test]
+    fn bundled_picker_is_searchable_and_clickable_before_installed_catalog_exists() {
+        fn find(shape: &egui::Shape, label: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Text(text) if text.galley.text() == label => {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| find(s, label)),
+                _ => None,
+            }
+        }
+        fn pointer(pos: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        }
+        let ctx = egui::Context::default();
+        apply_font_preferences(&ctx, &FontPreferences::default()).unwrap();
+        let catalog = font_catalog::FontCatalog::default();
+        let mut value = "SweiGothicCJKtc-DemiLight.ttf".to_owned();
+        let mut draw = |events| {
+            let mut rect = egui::Rect::NOTHING;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(604.0, 644.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        rect = font_picker(ui, "中文字體", &mut value, &catalog).rect;
+                    });
+                },
+            );
+            (output, rect)
+        };
+        let (_, rect) = draw(vec![]);
+        draw(vec![]);
+        for pressed in [true, false] {
+            draw(pointer(rect.center(), pressed));
+        }
+        draw(vec![]);
+        let (output, _) = draw(vec![egui::Event::Text("swei".into())]);
+        let pos = output
+            .shapes
+            .iter()
+            .find_map(|s| find(&s.shape, BUNDLED_SWEI_LABEL))
+            .expect("bundled choice remains searchable with an empty catalog");
+        let default_pos = output
+            .shapes
+            .iter()
+            .find_map(|s| find(&s.shape, BUNDLED_SWEI_DEFAULT_LABEL))
+            .expect("bundled default remains first");
+        assert!(default_pos.y < pos.y);
+        for pressed in [true, false] {
+            draw(pointer(pos, pressed));
+        }
+        drop(draw);
+        assert_eq!(value, BUNDLED_SWEI_ID);
+        assert!(build_definitions(&FontPreferences {
+            chinese: value,
+            ..Default::default()
+        })
+        .is_ok());
+    }
+
+    #[test]
     fn searchable_picker_filters_and_selects_an_actual_installed_face() {
         let ctx = egui::Context::default();
         let catalog = font_catalog::FontCatalog {
@@ -727,9 +1156,13 @@ mod tests {
                     font_catalog::FontChoice {
                         id: font_catalog::selection_id(&path, 0),
                         search: label.to_lowercase(),
-                        label,
+                        label: label.clone(),
                         path,
                         index: 0,
+                        families: vec![label.clone()],
+                        style: resvg::usvg::fontdb::Style::Normal,
+                        weight: 400,
+                        stretch: resvg::usvg::fontdb::Stretch::Normal,
                         has_latin: true,
                         has_chinese: false,
                     }
@@ -808,10 +1241,7 @@ mod tests {
 
     #[test]
     fn cjk_font_covers_ui_chars() {
-        let path = find_cjk_font().expect("系統應有可用 CJK 字型");
-        logf!("選中字型：{}", path.display());
-        let bytes = std::fs::read(&path).unwrap();
-        let font = ab_glyph::FontRef::try_from_slice(&bytes).unwrap();
+        let font = ab_glyph::FontRef::try_from_slice(BUNDLED_SWEI_BYTES).unwrap();
         let missing: Vec<char> = MUST_HAVE
             .iter()
             .copied()
@@ -824,25 +1254,7 @@ mod tests {
     fn egui_fallback_resolves_cjk() {
         // 端到端：用與 install 完全相同的 defs 建 epaint Fonts，
         // 確認 fallback 真的解得到中文（而不只是字型檔能解析）。
-        let path = find_cjk_font().expect("系統應有可用 CJK 字型");
-        let bytes = std::fs::read(&path).unwrap();
-        let mut defs = egui::FontDefinitions::default();
-        defs.font_data.insert(
-            "cjk-fallback".to_owned(),
-            std::sync::Arc::new(egui::FontData::from_owned(bytes)),
-        );
-        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            defs.families
-                .get_mut(&family)
-                .unwrap()
-                .push("cjk-fallback".to_owned());
-        }
-        let fonts = egui::epaint::text::Fonts::new(
-            1.0,
-            2048,
-            egui::epaint::image::AlphaFromCoverage::default(),
-            defs,
-        );
+        let fonts = fonts_for(&FontPreferences::default());
         let id = egui::FontId::new(14.0, egui::FontFamily::Proportional);
         assert!(fonts.has_glyph(&id, '呼'), "Proportional 解不到 呼");
         assert!(
@@ -852,12 +1264,10 @@ mod tests {
     }
 
     #[test]
-    fn kaiu_glyph_rasterizes_nonblank() {
+    fn bundled_glyph_rasterizes_nonblank() {
         // cmap 有字不代表畫得出來：實際光柵化「呼」並斷言有墨點。
         use ab_glyph::Font as _;
-        let path = find_cjk_font().expect("系統應有可用 CJK 字型");
-        let bytes = std::fs::read(&path).unwrap();
-        let font = ab_glyph::FontRef::try_from_slice(&bytes).unwrap();
+        let font = ab_glyph::FontRef::try_from_slice(BUNDLED_SWEI_BYTES).unwrap();
         let glyph = font
             .glyph_id('呼')
             .with_scale_and_position(32.0, ab_glyph::point(0.0, 0.0));

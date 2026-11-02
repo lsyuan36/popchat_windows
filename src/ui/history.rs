@@ -222,7 +222,10 @@ pub fn row(
             );
         }
     }
-    delete_response.on_hover_text("刪除聊天 · Ctrl+Backspace（或聚焦後按 Enter / Space）");
+    super::icons::hover_help(
+        delete_response,
+        "刪除聊天 · Ctrl+Backspace（或聚焦後按 Enter / Space）",
+    );
     HistoryRowResponse {
         response,
         open,

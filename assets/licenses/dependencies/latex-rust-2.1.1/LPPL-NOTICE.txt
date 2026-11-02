@@ -1,0 +1,47 @@
+latex-rust 2.1.1 includes color-name data derived from the LaTeX graphics
+bundle. This notice supplements, and does not replace, upstream NOTICE.
+
+The original header in data/dvipsnames.tsv states:
+
+THIS FILE HAS BEEN MODIFIED. It is not the original dvipsnam.def, and it
+is not a replacement for that file.
+
+Source: the `%<*dvipsnames>` section of drivers.dtx in the LaTeX graphics
+bundle, which generates dvipsnam.def. Checked against
+https://github.com/latex3/latex2e/blob/develop/required/graphics/drivers.dtx
+on 2026-10-06.
+
+Copyright 1994 David Carlisle and Sebastian Rahtz
+Copyright 1995-1999 David Carlisle
+Copyright 2000-2026 The LaTeX Project
+
+This file may be distributed and/or modified under the conditions of the
+LaTeX Project Public License, either version 1.3c of this license or (at
+your option) any later version. The full LPPL 1.3c is in LPPL-1.3c.txt.
+
+The original authors and The LaTeX Project do not maintain or support this
+modified file.
+
+Modifications from dvipsnam.def / drivers.dtx, by Jeffrey S Carr
+(2026-09-01; notice and TealBlue correction 2026-10-06):
+- The \DefineNamedColor lines were rewritten as a tab-separated table
+  with the header name, c, m, y, k.
+- Rows were re-sorted alphabetically by name. Upstream keeps the dvips
+  color-wheel order.
+- CMYK tuples are the upstream values, including TealBlue
+  (0.86, 0, 0.34, 0.02).
+
+PopChat does not modify the published dependency or its color table.
+The exact modified source, including the original header and table, is
+available to all recipients in the complete published crate:
+https://crates.io/api/v1/crates/latex-rust/2.1.1/download
+https://github.com/jscarr64/LaTeX-Rust/tree/e377ecb4af876b8b75e62b8b83e8a9535499944c
+
+A complete, unmodified copy of the original Work (the graphics bundle,
+including drivers.dtx) can be obtained from:
+https://github.com/latex3/latex2e/tree/develop/required/graphics
+https://ctan.org/pkg/graphics
+CTAN path: macros/latex/required/graphics
+
+License-text source:
+https://www.latex-project.org/lppl/lppl-1-3c.txt

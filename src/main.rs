@@ -10,6 +10,9 @@
 //!   無 key 警告列），`Ready` 經 tokio 串流 [`client::run`]（reqwest SSE），
 //!   [`ChatStreamEvent`] 由背景 task 經 std mpsc 送回 UI 執行緒即時更新。
 
+// A desktop application, not a console executable. Keep test harness output.
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
+
 use eframe::egui;
 use popchat_windows::chat::client::{self, ChatStreamEvent};
 use popchat_windows::chat::commands::ShortcutStore as CommandsShortcutStore;
@@ -37,7 +40,7 @@ use popchat_windows::ui::{
     reasoning::{self, WaitingView},
     settings::{SettingsAction, SettingsUi},
     surface::{self, CARD_MARGIN},
-    switcher, theme,
+    switcher, theme, transition,
     tray::{PopchatTray, TrayEvent},
     window_prefs,
 };
@@ -130,6 +133,34 @@ fn prepare_message_action(chat: &mut ChatStore, action: MessageAction) -> Prepar
     }
 }
 
+/// This dialog only returns a decision; it never saves drafts, downloads,
+/// starts a helper or closes a viewport by itself.
+fn update_confirmation_dialog(ctx: &egui::Context, version: &str, streaming: bool) -> Option<bool> {
+    let response = egui::Modal::new(egui::Id::new("install-update-confirmation")).show(ctx, |ui| {
+        ui.set_width((ctx.screen_rect().width() - 64.0).clamp(200.0, 400.0));
+        ui.heading(format!("安裝 PopChat {version}？"));
+        ui.add_space(8.0);
+        ui.add(egui::Label::new("將關閉目前視窗，安裝已驗證的更新並重新啟動。設定、服務、金鑰與歷史會保留。").wrap());
+        ui.add_space(6.0);
+        ui.add(egui::Label::new(egui::RichText::new("尚未送出的訊息與未儲存的 API 編輯不會自動保存；請先返回完成編輯。會立即停止仍在生成中的回覆。")
+            .color(ui.visuals().warn_fg_color)).wrap());
+        if streaming {
+            ui.add(egui::Label::new("目前正在生成回覆。確認安裝後將停止生成。").wrap());
+        }
+        ui.add_space(12.0);
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("返回編輯").clicked() { return Some(false); }
+            if ui.button("安裝並重新啟動").clicked() { return Some(true); }
+            None
+        }).inner
+    });
+    if response.should_close() {
+        Some(false)
+    } else {
+        response.inner
+    }
+}
+
 struct PopChatApp {
     chat: ChatStore,
     providers: ProviderStore,
@@ -141,6 +172,10 @@ struct PopChatApp {
     settings_open: bool,
     settings_ui: SettingsUi,
     settings_was_open: bool,
+    page_transition: transition::PageTransition,
+    height_transition: transition::WindowHeightTransition,
+    update_confirmation: Option<popchat_windows::updater::PreparedUpdate>,
+    update_install: Option<popchat_windows::updater::InstallSession>,
     legacy_migration_error: Option<String>,
     secret_migration_warning: Option<String>,
     geometry: PanelGeometry,
@@ -296,6 +331,14 @@ impl PopChatApp {
                 .send_viewport_cmd(egui::ViewportCommand::InnerSize(initial.size()));
         }
         let dismiss_hint = Arc::new(AtomicBool::new(false));
+        let hotkey_suppressed = hotkey.as_ref().map_or_else(
+            || Arc::new(AtomicBool::new(false)),
+            HotkeyManager::suppression_flag,
+        );
+        popchat_windows::ui::hotkey_recorder::set_suppression_flag(
+            &cc.egui_ctx,
+            hotkey_suppressed.clone(),
+        );
         let visibility_driver = Some(spawn_visibility_driver(
             hotkey_drv_rx,
             tray_drv_rx,
@@ -303,6 +346,7 @@ impl PopChatApp {
             visibility.clone(),
             instance.clone(),
             dismiss_hint.clone(),
+            hotkey_suppressed,
         ));
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -341,6 +385,10 @@ impl PopChatApp {
             settings_open: std::env::args().any(|arg| arg == "--settings"),
             settings_ui,
             settings_was_open: false,
+            page_transition: transition::PageTransition::default(),
+            height_transition: transition::WindowHeightTransition::default(),
+            update_confirmation: None,
+            update_install: None,
             legacy_migration_error,
             secret_migration_warning,
             geometry,
@@ -427,6 +475,65 @@ impl PopChatApp {
     fn invalidate_load(&mut self) {
         self.load_generation += 1;
         self.loading_conversation = false;
+    }
+
+    fn poll_update_install(&mut self, ctx: &egui::Context) {
+        let Some(session) = &mut self.update_install else {
+            return;
+        };
+        match session.poll() {
+            Ok(true) => {
+                // The helper already validated both executables, the target
+                // identity and staging hashes. It will wait for this PID to
+                // fully exit before replacing anything or opening a new UI.
+                self.update_install = None;
+                self.visibility.close(ctx);
+            }
+            Ok(false) => ctx.request_repaint_after(std::time::Duration::from_millis(50)),
+            Err(error) => {
+                self.update_install = None;
+                self.settings_ui.set_update_install_message(
+                    Some(format!(
+                        "更新安裝尚未開始：{error:#}。目前程式未關閉，請重試或從發行頁手動下載。"
+                    )),
+                    false,
+                );
+            }
+        }
+    }
+
+    fn show_update_confirmation(&mut self, ctx: &egui::Context) {
+        let Some(prepared) = &self.update_confirmation else {
+            return;
+        };
+        let decision = update_confirmation_dialog(ctx, prepared.version(), self.chat.is_streaming);
+        match decision {
+            Some(false) => {
+                self.update_confirmation = None;
+                self.settings_ui.set_update_install_message(None, false);
+            }
+            Some(true) => {
+                let prepared = self
+                    .update_confirmation
+                    .take()
+                    .expect("confirmation owns the staged update");
+                match popchat_windows::updater::begin_install(&prepared) {
+                    Ok(session) => {
+                        self.update_install = Some(session);
+                        self.settings_ui.set_update_install_message(
+                            Some("正在驗證更新助手；確認可安全安裝後才會關閉目前視窗…".into()),
+                            true,
+                        );
+                        ctx.request_repaint();
+                    }
+                    Err(error) => self.settings_ui.set_update_install_message(
+                        Some(format!("無法準備更新：{error:#}")),
+                        false,
+                    ),
+                }
+            }
+            None => {}
+        }
     }
 
     fn reset_draft(&mut self) {
@@ -836,6 +943,20 @@ impl PopChatApp {
 
     fn settings_actions(&mut self, ctx: &egui::Context) {
         for action in self.settings_ui.take_actions() {
+            if let Some(error) = self.providers.load_error() {
+                if matches!(
+                    &action,
+                    SettingsAction::AddProvider
+                        | SettingsAction::AddProviderTemplate(_)
+                        | SettingsAction::RemoveProvider(_)
+                        | SettingsAction::SelectModel { .. }
+                        | SettingsAction::SetEffort { .. }
+                        | SettingsAction::ClearCapabilityException { .. }
+                ) {
+                    self.ui_error = Some(format!("原服務資料讀取失敗，未執行變更：{error}"));
+                    continue;
+                }
+            }
             match action {
                 SettingsAction::SignInChatGpt => {
                     if self.auth_task.is_some() || self.auth_signing_out {
@@ -904,6 +1025,14 @@ impl PopChatApp {
                         self.providers.invalidate_codex_app_server();
                     }
                     self.inspect_codex(ctx);
+                }
+                SettingsAction::InstallUpdate(prepared) => {
+                    if self.update_confirmation.is_none() && self.update_install.is_none() {
+                        popchat_windows::ui::hotkey_recorder::cancel(ctx);
+                        self.update_confirmation = Some(prepared);
+                        self.settings_ui.set_update_install_message(None, false);
+                        ctx.request_repaint();
+                    }
                 }
                 SettingsAction::ChangeHotkey(binding) => {
                     let result = self
@@ -1183,21 +1312,31 @@ impl PopChatApp {
                 .size(11.0)
                 .weak(),
             );
-            if ui
-                .add_enabled(count > 0, egui::Button::new("↑"))
-                .on_hover_text("上一筆 · Ctrl+Shift+G")
-                .clicked()
+            if icons::hover_help(
+                ui.add_enabled(count > 0, egui::Button::new("↑")),
+                if count > 0 {
+                    "上一筆 · Ctrl+Shift+G"
+                } else {
+                    "上一筆（目前沒有搜尋結果） · Ctrl+Shift+G"
+                },
+            )
+            .clicked()
             {
                 self.step_find(-1);
             }
-            if ui
-                .add_enabled(count > 0, egui::Button::new("↓"))
-                .on_hover_text("下一筆 · Ctrl+G")
-                .clicked()
+            if icons::hover_help(
+                ui.add_enabled(count > 0, egui::Button::new("↓")),
+                if count > 0 {
+                    "下一筆 · Ctrl+G"
+                } else {
+                    "下一筆（目前沒有搜尋結果） · Ctrl+G"
+                },
+            )
+            .clicked()
             {
                 self.step_find(1);
             }
-            if ui.small_button("×").clicked() {
+            if icons::hover_help(ui.small_button("×"), "關閉搜尋 · Esc").clicked() {
                 self.find = FindState::default();
                 self.composer.request_focus();
             }
@@ -1212,6 +1351,11 @@ impl PopChatApp {
     }
 
     fn save_settings(&mut self) -> Result<(), String> {
+        if let Some(error) = self.providers.load_error() {
+            return Err(format!(
+                "服務資料讀取失敗，未改寫服務或金鑰；請修復原檔後重啟：{error}"
+            ));
+        }
         if let Some(error) = &self.legacy_migration_error {
             return Err(format!(
                 "舊金鑰尚未安全遷移；原設定檔已保留。請解決後重啟：{error}"
@@ -1260,6 +1404,9 @@ impl PopChatApp {
         // A manually entered model joins this provider's catalog. Saving a
         // catalog draft never changes the pill's live provider/model/effort.
         if !settings.model.trim().is_empty() {
+            self.providers
+                .settings_models
+                .insert(id, settings.model.trim().to_owned());
             let models = self.providers.known_models.entry(id).or_default();
             if !models.iter().any(|model| model == settings.model.trim()) {
                 models.push(settings.model.trim().to_owned());
@@ -1291,6 +1438,7 @@ impl PopChatApp {
 
     /// 保留 off-screen 隱藏；轉移與 viewport 命令必須一起完成。
     fn hide(&mut self, ctx: &egui::Context) {
+        popchat_windows::ui::hotkey_recorder::cancel(ctx);
         self.first_run_hint_due = None;
         if let Some(tray) = &self.tray {
             tray.dismiss_first_run_hint();
@@ -1339,7 +1487,11 @@ impl PopChatApp {
             2 => 500.0,
             3 => self.geometry.expanded_height_clamped().max(460.0),
             0 => {
-                let extra = (self.composer.inline_rows() - 1) as f32 * 19.0
+                let line_height = popchat_windows::ui::typography::line_height(
+                    self.settings_ui.settings.chat_font_size,
+                );
+                let extra = (self.composer.inline_rows() - 1) as f32 * line_height
+                    + (line_height - 19.0).max(0.0)
                     + self.composer.attachment_height()
                     + if self.find.open { 38.0 } else { 0.0 }
                     + if self.attachment_tasks > 0 { 24.0 } else { 0.0 }
@@ -1441,10 +1593,21 @@ impl PopChatApp {
             &self.monitor_work_areas,
         );
         let max_width = host.map_or(self.geometry.width + padding.x, |area| area.width());
-        let wanted = egui::vec2(
+        let mut wanted = egui::vec2(
             (self.geometry.width + padding.x).min(max_width),
             target.height().max(48.0),
         );
+        let height_frame = self.height_transition.update(
+            mode,
+            wanted.y,
+            current.map(|size| size.y),
+            ctx.input(|input| input.time),
+            transition::motion_enabled(ctx) && !monitors_changed && !self.native_resizing,
+        );
+        wanted.y = height_frame.height;
+        if height_frame.active {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
         let max_height = if mode == 4 {
             host.map_or(wanted.y, |area| area.height())
         } else {
@@ -1460,6 +1623,9 @@ impl PopChatApp {
         );
         let maximum = egui::vec2(max_width, max_height.max(minimum.y));
         if self.size_limits != Some((minimum, maximum)) {
+            // Changing native size limits can itself resize the HWND. Treat
+            // animation/clamp events as programmatic, not saved user geometry.
+            self.viewport_sizing.requested(wanted, now);
             ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(minimum));
             ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(maximum));
             self.size_limits = Some((minimum, maximum));
@@ -1521,68 +1687,74 @@ impl PopChatApp {
         // 之前「消失又回來/叫不回」的抖動即來自此雙重觸發。
         // Alt+Space 在 Windows 是系統視窗選單保留鍵，不再使用。
 
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::W)) {
-            self.settings_open = false;
-            self.history_open = false;
-            self.hide(ctx);
-        }
-        if self.visibility.is_visible() {
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::N)) {
-                self.new_chat();
-            }
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Y)) {
-                self.open_history(ctx);
-            }
-            if !self.settings_open
-                && !self.history_open
-                && !self.loading_conversation
-                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::O))
-            {
-                self.pick_attachments(ctx);
-            }
-            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::F)) {
-                if self.history_open {
-                    self.history_focus = true;
-                } else {
-                    self.settings_open = false;
-                    self.toggle_find();
-                }
-            }
-            if self.find.open {
-                if ctx.input_mut(|i| {
-                    i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::G)
-                }) {
-                    self.step_find(-1);
-                } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::G)) {
-                    self.step_find(1);
-                }
-            }
-        }
-
-        // Esc：優先級 設定窗 > 自動完成彈窗/大編輯器（讓位給 composer 自己關）
-        // > 隱藏浮窗（對應 onCancel/dismiss）。
-        let ime_blocked = ctx.input(|i| {
-            popchat_windows::ui::composer::ime_blocks_shortcuts(&mut self.ime_composing, &i.events)
-        });
-        if !ime_blocked && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            if self.history_open {
-                self.history_open = false;
-                self.composer.request_focus();
-                ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
-            } else if self.find.open {
-                self.find = FindState::default();
-                self.composer.request_focus();
-                ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
-            } else if self.settings_open {
+        if self.update_confirmation.is_none() && self.update_install.is_none() {
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::W)) {
                 self.settings_open = false;
-            } else if !self.composer.popup_visible() && !self.composer.is_large_editor_open() {
+                self.history_open = false;
                 self.hide(ctx);
             }
-        }
+            if self.visibility.is_visible() {
+                if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::N)) {
+                    self.new_chat();
+                }
+                if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Y)) {
+                    self.open_history(ctx);
+                }
+                if !self.settings_open
+                    && !self.history_open
+                    && !self.loading_conversation
+                    && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::O))
+                {
+                    self.pick_attachments(ctx);
+                }
+                if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::F)) {
+                    if self.history_open {
+                        self.history_focus = true;
+                    } else {
+                        self.settings_open = false;
+                        self.toggle_find();
+                    }
+                }
+                if self.find.open {
+                    if ctx.input_mut(|i| {
+                        i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, egui::Key::G)
+                    }) {
+                        self.step_find(-1);
+                    } else if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::G))
+                    {
+                        self.step_find(1);
+                    }
+                }
+            }
 
-        // Ctrl+P：釘選/取消（對應原版 ⌘P pin）。
-        if ctx.input(|i| i.key_pressed(egui::Key::P) && i.modifiers.command) {
-            self.pinned = !self.pinned;
+            // Esc：優先級 設定窗 > 自動完成彈窗/大編輯器（讓位給 composer 自己關）
+            // > 隱藏浮窗（對應 onCancel/dismiss）。
+            let ime_blocked = ctx.input(|i| {
+                popchat_windows::ui::composer::ime_blocks_shortcuts(
+                    &mut self.ime_composing,
+                    &i.events,
+                )
+            });
+            if !ime_blocked && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                if self.history_open {
+                    self.history_open = false;
+                    self.composer.request_focus();
+                    ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+                } else if self.find.open {
+                    self.find = FindState::default();
+                    self.composer.request_focus();
+                    ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+                } else if self.settings_open {
+                    self.settings_open = false;
+                } else if !self.composer.popup_visible() && !self.composer.is_large_editor_open() {
+                    self.hide(ctx);
+                }
+            }
+
+            // Ctrl+P：釘選/取消（對應原版 ⌘P pin）。
+            if ctx.input(|i| i.key_pressed(egui::Key::P) && i.modifiers.command) {
+                self.pinned = !self.pinned;
+            }
         }
 
         // 失焦自動隱藏（對應 windowDidResignKey；設定窗開著時不藏，
@@ -1856,10 +2028,32 @@ impl PopChatApp {
                     controls::ChatNavigation::None => {}
                 }
             }
-            if icons::button(ui, Icon::Pin, self.pinned, "釘選視窗 · Ctrl+P").clicked() {
+            if icons::button(
+                ui,
+                Icon::Pin,
+                self.pinned,
+                if self.pinned {
+                    "取消釘選 · Ctrl+P"
+                } else {
+                    "釘選視窗 · Ctrl+P"
+                },
+            )
+            .clicked()
+            {
                 self.pinned = !self.pinned;
             }
-            if icons::button(ui, Icon::Settings, self.settings_open, "設定 · Ctrl+,").clicked() {
+            if icons::button(
+                ui,
+                Icon::Settings,
+                self.settings_open,
+                if self.settings_open {
+                    "返回聊天 · Ctrl+,"
+                } else {
+                    "開啟設定 · Ctrl+,"
+                },
+            )
+            .clicked()
+            {
                 self.settings_open = !self.settings_open;
             }
             if icons::button(
@@ -1888,6 +2082,7 @@ impl PopChatApp {
     /// error role 紅列（不 throw）、activity 弱色；user 氣泡靠右、
     /// assistant 氣泡靠左（氣泡框在 panel::show_assistant_message 內）。
     fn show_list(&mut self, ui: &mut egui::Ui, height: f32) {
+        popchat_windows::ui::typography::apply(ui, self.settings_ui.settings.chat_font_size);
         let now = std::time::Instant::now();
         self.copied_messages.retain(|_, until| *until > now);
         let hits = self.find_hits();
@@ -1974,7 +2169,6 @@ impl PopChatApp {
                                         }
                                     });
                                 });
-                                ui.add_space(16.0);
                             }
                             ChatRole::Assistant => {
                                 // full_text 回 owned String，避開與 for 迴圈對 self.chat 的orrow。
@@ -2021,8 +2215,6 @@ impl PopChatApp {
                                         );
                                     }
                                 });
-                                ui.add_space(0.0);
-                                ui.add_space(22.0);
                             }
                             ChatRole::Error => {
                                 ui.label(
@@ -2087,46 +2279,47 @@ impl PopChatApp {
                                 egui::UiBuilder::new()
                             };
                             ui.scope_builder(toolbar, |ui| {
-                                ui.horizontal(|ui| {
-                                    let copied = self.copied_messages.get(&msg.id).copied();
-                                    if let Some(until) = copied {
+                                let copied = self.copied_messages.get(&msg.id).copied();
+                                if let Some(until) = copied {
+                                    ui.ctx().request_repaint_after(
+                                        until.saturating_duration_since(now),
+                                    );
+                                }
+                                let rerunnable_row = Some(message_index) == last_response
+                                    || (last_response.is_none()
+                                        && Some(message_index) == last_user);
+                                match controls::message_actions_row(
+                                    ui,
+                                    msg.role == ChatRole::User,
+                                    copied.is_some(),
+                                    !self.chat.is_streaming,
+                                    rerunnable_row,
+                                ) {
+                                    controls::MessageControl::Copy => {
+                                        ui.ctx().copy_text(self.chat.full_text(msg.id));
+                                        self.copied_messages.insert(
+                                            msg.id,
+                                            now + std::time::Duration::from_millis(1200),
+                                        );
                                         ui.ctx().request_repaint_after(
-                                            until.saturating_duration_since(now),
+                                            std::time::Duration::from_millis(1200),
                                         );
                                     }
-                                    let rerunnable_row = Some(message_index) == last_response
-                                        || (last_response.is_none()
-                                            && Some(message_index) == last_user);
-                                    match controls::message_actions_inline(
-                                        ui,
-                                        copied.is_some(),
-                                        !self.chat.is_streaming,
-                                        rerunnable_row,
-                                    ) {
-                                        controls::MessageControl::Copy => {
-                                            ui.ctx().copy_text(self.chat.full_text(msg.id));
-                                            self.copied_messages.insert(
-                                                msg.id,
-                                                now + std::time::Duration::from_millis(1200),
-                                            );
-                                            ui.ctx().request_repaint_after(
-                                                std::time::Duration::from_millis(1200),
-                                            );
-                                        }
-                                        controls::MessageControl::Fork => {
-                                            action = Some(MessageAction::Fork(msg.id))
-                                        }
-                                        controls::MessageControl::Retry => {
-                                            action = Some(MessageAction::Retry)
-                                        }
-                                        controls::MessageControl::Edit => {
-                                            action = Some(MessageAction::Edit)
-                                        }
-                                        controls::MessageControl::None => {}
+                                    controls::MessageControl::Fork => {
+                                        action = Some(MessageAction::Fork(msg.id))
                                     }
-                                });
+                                    controls::MessageControl::Retry => {
+                                        action = Some(MessageAction::Retry)
+                                    }
+                                    controls::MessageControl::Edit => {
+                                        action = Some(MessageAction::Edit)
+                                    }
+                                    controls::MessageControl::None => {}
+                                }
                             });
-                            ui.add_space(8.0);
+                            if msg.role == ChatRole::Error {
+                                ui.add_space(8.0);
+                            }
                         }
                     }
                     // Waiting row：正文還沒到時顯示 transient 狀態；
@@ -2153,6 +2346,7 @@ impl PopChatApp {
     /// Send 走 [`ChatStore::send`] 既有路徑；slash/autocomplete 只做 UI，
     /// 展開仍由 send 驗證鏈執行。
     fn show_composer_capsule(&mut self, ui: &mut egui::Ui) {
+        popchat_windows::ui::typography::apply(ui, self.settings_ui.settings.chat_font_size);
         if let Some(warning) = self.attachment_warning() {
             ui.add(
                 egui::Label::new(
@@ -2247,103 +2441,132 @@ impl PopChatApp {
                             .sync_provider(&self.providers, &self.secrets);
                     }
                     self.settings_was_open = self.settings_open;
-                    if self.settings_open {
-                        if let Some(error) = self
-                            .legacy_migration_error
-                            .as_ref()
-                            .or(self.secret_migration_warning.as_ref())
-                        {
-                            ui.colored_label(
-                                ui.visuals().error_fg_color,
-                                format!("憑證遷移未完成，原始資料已保留：{error}"),
-                            );
-                        }
-                        let runtime = self.runtime.handle().clone();
-                        let save =
-                            self.settings_ui
-                                .show(ui, &runtime, &self.providers, &self.secrets);
-                        if save {
-                            self.apply_settings_to_provider();
-                        }
-                        self.settings_actions(ctx);
-                        return;
+                    if let Some(error) = self.providers.load_error() {
+                        ui.colored_label(
+                            ui.visuals().error_fg_color,
+                            format!(
+                                "無法讀取已儲存的服務，原檔已保留且停止寫入。請修復後重啟：{error}"
+                            ),
+                        );
                     }
-                    if let Some(error) = self.ui_error.clone() {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.colored_label(ui.visuals().error_fg_color, error);
-                            if ui.small_button("×").clicked() {
-                                self.ui_error = None;
-                            }
-                        });
-                    }
-                    if self.history_open {
-                        self.show_history(ui);
-                        return;
-                    }
-                    if self.loading_conversation {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label("正在載入聊天…");
-                        });
-                        return;
-                    }
-                    if self.composer.is_large_editor_open() {
-                        self.show_composer_capsule(ui);
-                        return;
-                    }
-                    // 熱鍵/托盤註冊失敗：紅字 + 重試（原版無此路徑，
-                    // Windows 保留鍵衝突才需要）。
-                    if self.hotkey_error.is_some() || self.tray_error.is_some() {
-                        if let Some(err) = self.hotkey_error.as_deref() {
-                            ui.label(
-                                egui::RichText::new(err)
-                                    .color(egui::Color32::from_rgb(0xFF, 0x6B, 0x6B))
-                                    .size(11.0),
-                            );
-                            if controls::button(ui, "重試熱鍵註冊").clicked() {
-                                self.retry_hotkey();
-                            }
-                        }
-                        if let Some(err) = self.tray_error.as_deref() {
-                            ui.label(
-                                egui::RichText::new(err)
-                                    .color(egui::Color32::from_rgb(0xFF, 0x6B, 0x6B))
-                                    .size(11.0),
-                            );
-                        }
-                        ui.add_space(4.0);
-                    }
-                    // Measure the real bottom stack first. A fixed 92pt reserve
-                    // omitted footer/inter-widget spacing and clipped the card.
-                    chat_layout::bottom_panel(ui, egui::Id::new("chat_bottom"), |ui| {
-                        ui.add_space(10.0);
-                        if self.find.open {
-                            self.show_find(ui);
-                        }
-                        if self.attachment_tasks > 0 {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label(egui::RichText::new("正在讀取附件…").small().weak());
-                            });
-                        }
-                        self.show_composer_capsule(ui);
-                    });
-                    chat_layout::show_body(ui, egui::Id::new("chat_transcript"), |ui| {
-                        let height = ui.available_height().max(0.0);
-                        if self.chat.messages.is_empty() && !self.chat.is_streaming {
-                            if height >= 62.0 {
-                                ui.add_space(((height - 62.0) * 0.5).max(0.0));
-                                ui.label(egui::RichText::new("有什麼想聊的？").size(25.0).strong());
-                                ui.add_space(5.0);
-                                ui.label(
-                                    egui::RichText::new("一個問題、一點靈感，隨時開始。")
-                                        .size(13.0)
-                                        .weak(),
+                    let page = if self.settings_open {
+                        2
+                    } else if self.history_open {
+                        1
+                    } else if self.composer.is_large_editor_open() {
+                        3
+                    } else if self.loading_conversation {
+                        4
+                    } else {
+                        0
+                    };
+                    let effect = self.page_transition.update(
+                        page,
+                        ui.input(|input| input.time),
+                        transition::motion_enabled(ctx),
+                    );
+                    transition::show(ui, effect, |ui| {
+                        if self.settings_open {
+                            if let Some(error) = self
+                                .legacy_migration_error
+                                .as_ref()
+                                .or(self.secret_migration_warning.as_ref())
+                            {
+                                ui.colored_label(
+                                    ui.visuals().error_fg_color,
+                                    format!("憑證遷移未完成，原始資料已保留：{error}"),
                                 );
                             }
-                        } else {
-                            self.show_list(ui, height);
+                            let runtime = self.runtime.handle().clone();
+                            let save =
+                                self.settings_ui
+                                    .show(ui, &runtime, &self.providers, &self.secrets);
+                            if save {
+                                self.apply_settings_to_provider();
+                            }
+                            self.settings_actions(ctx);
+                            return;
                         }
+                        if let Some(error) = self.ui_error.clone() {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.colored_label(ui.visuals().error_fg_color, error);
+                                if icons::hover_help(ui.small_button("×"), "關閉錯誤提示").clicked()
+                                {
+                                    self.ui_error = None;
+                                }
+                            });
+                        }
+                        if self.history_open {
+                            self.show_history(ui);
+                            return;
+                        }
+                        if self.loading_conversation {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("正在載入聊天…");
+                            });
+                            return;
+                        }
+                        if self.composer.is_large_editor_open() {
+                            self.show_composer_capsule(ui);
+                            return;
+                        }
+                        // 熱鍵/托盤註冊失敗：紅字 + 重試（原版無此路徑，
+                        // Windows 保留鍵衝突才需要）。
+                        if self.hotkey_error.is_some() || self.tray_error.is_some() {
+                            if let Some(err) = self.hotkey_error.as_deref() {
+                                ui.label(
+                                    egui::RichText::new(err)
+                                        .color(egui::Color32::from_rgb(0xFF, 0x6B, 0x6B))
+                                        .size(11.0),
+                                );
+                                if controls::button(ui, "重試熱鍵註冊").clicked() {
+                                    self.retry_hotkey();
+                                }
+                            }
+                            if let Some(err) = self.tray_error.as_deref() {
+                                ui.label(
+                                    egui::RichText::new(err)
+                                        .color(egui::Color32::from_rgb(0xFF, 0x6B, 0x6B))
+                                        .size(11.0),
+                                );
+                            }
+                            ui.add_space(4.0);
+                        }
+                        // Measure the real bottom stack first. A fixed 92pt reserve
+                        // omitted footer/inter-widget spacing and clipped the card.
+                        chat_layout::bottom_panel(ui, egui::Id::new("chat_bottom"), |ui| {
+                            ui.add_space(10.0);
+                            if self.find.open {
+                                self.show_find(ui);
+                            }
+                            if self.attachment_tasks > 0 {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.label(egui::RichText::new("正在讀取附件…").small().weak());
+                                });
+                            }
+                            self.show_composer_capsule(ui);
+                        });
+                        chat_layout::show_body(ui, egui::Id::new("chat_transcript"), |ui| {
+                            let height = ui.available_height().max(0.0);
+                            if self.chat.messages.is_empty() && !self.chat.is_streaming {
+                                if height >= 62.0 {
+                                    ui.add_space(((height - 62.0) * 0.5).max(0.0));
+                                    ui.label(
+                                        egui::RichText::new("有什麼想聊的？").size(25.0).strong(),
+                                    );
+                                    ui.add_space(5.0);
+                                    ui.label(
+                                        egui::RichText::new("一個問題、一點靈感，隨時開始。")
+                                            .size(13.0)
+                                            .weak(),
+                                    );
+                                }
+                            } else {
+                                self.show_list(ui, height);
+                            }
+                        });
                     });
                 });
             });
@@ -2870,6 +3093,144 @@ mod endpoint_tests {
 
 #[cfg(test)]
 mod action_tests {
+    fn update_dialog_frame(
+        ctx: &egui::Context,
+        time: f64,
+        events: Vec<egui::Event>,
+    ) -> (Option<bool>, egui::FullOutput) {
+        let mut decision = None;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(520.0, 500.0),
+                )),
+                time: Some(time),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                decision = super::update_confirmation_dialog(ctx, "0.3.0", true);
+            },
+        );
+        assert!(
+            !output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .iter()
+                .any(|command| matches!(command, egui::ViewportCommand::Close)),
+            "confirmation rendering never closes the app by itself"
+        );
+        (decision, output)
+    }
+
+    #[test]
+    fn update_confirmation_requires_an_explicit_install_click_and_escape_cancels() {
+        let ctx = egui::Context::default();
+        assert_eq!(update_dialog_frame(&ctx, 0.0, vec![]).0, None);
+        let _ = update_dialog_frame(&ctx, 0.1, vec![]);
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        assert_eq!(
+            update_dialog_frame(&ctx, 0.2, vec![key(egui::Key::Enter)]).0,
+            None,
+            "Enter while opening must not approve installation"
+        );
+        assert_eq!(
+            update_dialog_frame(&ctx, 0.3, vec![key(egui::Key::Escape)]).0,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn real_update_confirmation_buttons_return_only_the_selected_decision() {
+        for (label, expected) in [("返回編輯", false), ("安裝並重新啟動", true)] {
+            let ctx = egui::Context::default();
+            let _ = update_dialog_frame(&ctx, 0.0, vec![]);
+            let (_, output) = update_dialog_frame(&ctx, 0.2, vec![]);
+            let pos = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.job.text == label => {
+                        Some(text.pos + text.galley.size() / 2.0)
+                    }
+                    _ => None,
+                })
+                .expect("explicit confirmation button must be visible");
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            assert_eq!(
+                update_dialog_frame(
+                    &ctx,
+                    0.3,
+                    vec![egui::Event::PointerMoved(pos), button(true)]
+                )
+                .0,
+                None
+            );
+            assert_eq!(
+                update_dialog_frame(&ctx, 0.4, vec![button(false)]).0,
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn user_bubble_chat_size_changes_text_not_toolbar_targets_or_panel_width() {
+        use popchat_windows::ui::{controls, theme, typography};
+        for width in [320.0, 520.0] {
+            for size in [12, 15, 24] {
+                let ctx = egui::Context::default();
+                let pal = theme::apply(&ctx, "Light", theme::DEFAULT_ACCENT_HEX);
+                let source = "A long user message with a URL https://example.com/very/long/path and repeated words ".repeat(4);
+                let mut toolbar_height = 0.0;
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 1400.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            typography::apply(ui, size);
+                            let w = ui.available_width();
+                            ui.with_layout(theme::bubble_layout(true), |ui| {
+                                ui.set_max_width(w * 0.85);
+                                theme::bubble_frame(true, pal, false).show(ui, |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&source).color(pal.user_text),
+                                        )
+                                        .wrap(),
+                                    );
+                                });
+                            });
+                            let before = ui.cursor().min.y;
+                            controls::message_actions_row(ui, true, false, false, false);
+                            toolbar_height = ui.cursor().min.y - before;
+                            assert!(ui.min_rect().right() <= width + 0.5);
+                        });
+                    },
+                );
+                assert!(toolbar_height >= 28.0 && toolbar_height < 45.0);
+                assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                    egui::Shape::Text(text) if text.galley.job.text == source
+                        && text.galley.job.sections.iter().all(|section| (section.format.font_id.size - size as f32).abs() < 0.1))));
+            }
+        }
+    }
+
     #[test]
     fn composer_capability_notice_matches_source_known_vs_unknown_policy() {
         use super::*;
@@ -3095,6 +3456,9 @@ fn migrate_legacy_settings(
     providers: &mut ProviderStore,
     secrets: &mut SecretStore,
 ) -> Result<(), String> {
+    if let Some(error) = providers.load_error() {
+        return Err(format!("服務資料讀取失敗，未嘗試遷移或改寫憑證：{error}"));
+    }
     let settings = settings_ui.settings.clone();
     if settings.api_key.trim().is_empty() {
         return Ok(());
@@ -3180,6 +3544,7 @@ fn spawn_visibility_driver(
     visibility: Arc<VisibilityController>,
     instance: Arc<InstanceGuard>,
     dismiss_hint: Arc<AtomicBool>,
+    hotkey_suppressed: Arc<AtomicBool>,
 ) -> VisibilityDriver {
     let stop = Arc::new(AtomicBool::new(false));
     let driver_stop = stop.clone();
@@ -3212,8 +3577,12 @@ fn spawn_visibility_driver(
                             if driver_stop.load(Ordering::SeqCst) {
                                 break;
                             }
-                            let shown = visibility.toggle(&ctx, std::time::Instant::now());
-                            logf!("[driver] hotkey Toggle -> visible={shown}");
+                            // The watcher also checks this flag, but a toggle
+                            // may already be queued when recording is armed.
+                            if !hotkey_suppressed.load(Ordering::SeqCst) {
+                                let shown = visibility.toggle(&ctx, std::time::Instant::now());
+                                logf!("[driver] hotkey Toggle -> visible={shown}");
+                            }
                         }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -3290,9 +3659,15 @@ impl eframe::App for PopChatApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Capture before EVERY local/global-binding consumer. Acceptance and
+        // cancellation frames must not become Send/NewChat/Hide or a paste.
+        let recording_frame = popchat_windows::ui::hotkey_recorder::intercept(ctx);
+        if !self.settings_open || !self.settings_ui.hotkey_recorder_visible() {
+            popchat_windows::ui::hotkey_recorder::cancel(ctx);
+        }
         // Consume even while hidden/settings are open, so an old native paste
         // cannot be replayed against a later draft or a different clipboard.
-        let native_paste = self.native_paste.take_requested();
+        let native_paste = self.native_paste.take_requested() && !recording_frame;
         if self.dismiss_hint.swap(false, Ordering::SeqCst) {
             self.first_run_hint_due = None;
             if let Some(tray) = &self.tray {
@@ -3333,7 +3708,10 @@ impl eframe::App for PopChatApp {
         self.poll_events(ctx, frame);
         self.settings_ui
             .set_current_window_position(self.visibility.shown_position());
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Comma)) {
+        if self.update_confirmation.is_none()
+            && self.update_install.is_none()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Comma))
+        {
             self.settings_open = !self.settings_open;
         }
         self.poll_stream(ctx);
@@ -3343,7 +3721,9 @@ impl eframe::App for PopChatApp {
             ctx.request_repaint_after(interval);
         }
         self.poll_background(ctx);
+        self.poll_update_install(ctx);
         if !self.visibility.is_visible() {
+            popchat_windows::ui::hotkey_recorder::cancel(ctx);
             return;
         }
         self.handle_attachment_input(ctx, native_paste);
@@ -3380,6 +3760,10 @@ impl eframe::App for PopChatApp {
         // overlay cannot extend beyond the compact chat viewport.
         self.update_window_geometry(ctx);
         self.show_card(ctx);
+        self.show_update_confirmation(ctx);
+        if !self.settings_open || !self.settings_ui.hotkey_recorder_visible() {
+            popchat_windows::ui::hotkey_recorder::cancel(ctx);
+        }
         if !self.settings_open && !self.history_open && !self.loading_conversation {
             let hovered = ctx.input(|input| input.raw.hovered_files.clone());
             let card = ctx
@@ -3406,7 +3790,17 @@ fn main() -> eframe::Result<()> {
         logf!("[startup] could not record launch: {error:#}");
         true
     });
-    logf!("[boot] PopChat 啟動");
+    logf!(
+        "[boot] PopChat 啟動 pid={} executable={} profile={} isolated={}",
+        std::process::id(),
+        std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
+        popchat_windows::paths::config_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
+        popchat_windows::paths::isolated_profile().is_some()
+    );
     let launch_visible = popchat_windows::startup::should_present_launch(
         first_launch,
         std::env::args().any(|arg| arg == "--login-item"),

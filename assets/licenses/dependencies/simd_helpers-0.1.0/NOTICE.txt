@@ -1,0 +1,21 @@
+simd_helpers 0.1.0
+
+The published Cargo.toml declares:
+  authors = ["Luca Barbato <lu_zero@gentoo.org>"]
+  license = "MIT"
+  repository = "https://github.com/lu-zero/simd_helpers"
+
+The published crate and pinned upstream commit contain no standalone license
+file or copyright notice. MIT.txt reproduces the standard MIT permission,
+conditions and disclaimer identified by that declaration. No copyright year
+or copyright-holder statement is supplied by upstream, and none is invented
+here. The author declaration above is preserved as attribution, not silently
+converted into a new copyright claim. This upstream notice omission is a
+documented limitation of the best-effort license inventory.
+
+Exact source:
+https://crates.io/api/v1/crates/simd_helpers/0.1.0/download
+https://github.com/lu-zero/simd_helpers/tree/ca1a2f84aa386d758e98f8a609d990263932fb85
+
+Standard MIT text reference:
+https://opensource.org/license/mit

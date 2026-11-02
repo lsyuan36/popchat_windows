@@ -19,6 +19,10 @@ pub(super) struct FontChoice {
     pub search: String,
     pub path: PathBuf,
     pub index: u32,
+    pub families: Vec<String>,
+    pub style: fontdb::Style,
+    pub weight: u16,
+    pub stretch: fontdb::Stretch,
     pub has_latin: bool,
     pub has_chinese: bool,
 }
@@ -164,7 +168,7 @@ fn collect_roots(roots: &[PathBuf]) -> BTreeMap<String, PathBuf> {
 }
 
 #[cfg(windows)]
-fn registered_files() -> BTreeMap<String, PathBuf> {
+fn registered_files_matching(matches: impl Fn(&str) -> bool) -> BTreeMap<String, PathBuf> {
     use winreg::{enums::*, RegKey};
     let mut paths = BTreeMap::new();
     for hive in [HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER] {
@@ -176,6 +180,9 @@ fn registered_files() -> BTreeMap<String, PathBuf> {
                 continue;
             };
             for (name, _) in registry.enum_values().flatten() {
+                if !matches(&name) {
+                    continue;
+                }
                 let Ok(value) = registry.get_value::<String, _>(&name) else {
                     continue;
                 };
@@ -194,8 +201,67 @@ fn registered_files() -> BTreeMap<String, PathBuf> {
 }
 
 #[cfg(not(windows))]
-fn registered_files() -> BTreeMap<String, PathBuf> {
+fn registered_files_matching(_matches: impl Fn(&str) -> bool) -> BTreeMap<String, PathBuf> {
     BTreeMap::new()
+}
+
+fn registered_files() -> BTreeMap<String, PathBuf> {
+    registered_files_matching(|_| true)
+}
+
+fn canonical_family(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Metadata, not filenames or display labels, decides the default. In particular,
+/// TT Norms Pro Serif/Condensed and non-regular faces must never win.
+pub(super) fn default_english_rank(face: &FontChoice) -> Option<u8> {
+    if face.style != fontdb::Style::Normal
+        || face.weight != 400
+        || face.stretch != fontdb::Stretch::Normal
+        || !face.has_latin
+    {
+        return None;
+    }
+    face.families
+        .iter()
+        .filter_map(|family| match canonical_family(family).as_str() {
+            "ttnormspro" | "ttnormspronormal" | "ttnormsproregular" => Some(0),
+            "arial" | "arialregular" | "arialnormal" => Some(1),
+            _ => None,
+        })
+        .min()
+}
+
+fn default_candidate_name(name: &str) -> bool {
+    let name = canonical_family(name);
+    // A collection's registry label can list several families joined with '&'.
+    // This is only a candidate filter; exact metadata matching happens above.
+    name.contains("ttnormspro") || name.contains("arial")
+}
+
+/// Startup reads only likely default files, including registry entries with
+/// arbitrary filenames outside the font directories. The full byte scan remains
+/// exclusively on the catalog worker. A caller caches this result for the process.
+pub(super) fn default_english_candidates() -> FontCatalog {
+    let mut paths = registered_files_matching(default_candidate_name);
+    // Directory enumeration is metadata-only; no unrelated font bytes are read.
+    paths.extend(collect_roots(&roots()).into_iter().filter(|(_, path)| {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(default_candidate_name)
+    }));
+    let mut catalog = scan_files(paths.into_values());
+    catalog
+        .choices
+        .retain(|face| default_english_rank(face).is_some());
+    catalog
+        .choices
+        .sort_by_cached_key(|face| (default_english_rank(face), key(&face.path), face.index));
+    catalog
 }
 
 #[cfg(windows)]
@@ -368,6 +434,10 @@ fn scan_files(paths: impl IntoIterator<Item = PathBuf>) -> FontCatalog {
                 search,
                 path: path.clone(),
                 index: face.index,
+                families: face.families.iter().map(|(name, _)| name.clone()).collect(),
+                style: face.style,
+                weight: face.weight.0,
+                stretch: face.stretch,
                 has_latin: ['A', 'a', '0'].iter().all(|&c| font.glyph_id(c).0 != 0),
                 has_chinese: ['中', '文', '的', '人']
                     .iter()
@@ -394,6 +464,59 @@ fn discover() -> FontCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn face(family: &str, path: &str, index: u32) -> FontChoice {
+        let path = PathBuf::from(path);
+        FontChoice {
+            id: selection_id(&path, index),
+            label: family.into(),
+            search: family.to_lowercase(),
+            families: vec![family.into()],
+            path,
+            index,
+            style: fontdb::Style::Normal,
+            weight: 400,
+            stretch: fontdb::Stretch::Normal,
+            has_latin: true,
+            has_chinese: false,
+        }
+    }
+
+    #[test]
+    fn default_ranking_uses_exact_metadata_family_and_regular_upright_normal_face() {
+        let mut tt = face("TT Norms Pro Normal", r"C:\Users\test\Fonts\custom.ttc", 3);
+        assert_eq!(default_english_rank(&tt), Some(0));
+        assert_eq!(tt.index, 3);
+        for family in ["TT Norms Pro", "TTNormsPro", "TT Norms Pro Regular"] {
+            tt.families = vec![family.into()];
+            assert_eq!(default_english_rank(&tt), Some(0));
+        }
+        for family in [
+            "TT Norms Pro Serif",
+            "TT Norms Pro Condensed",
+            "TT Norms",
+            "Arial Narrow",
+        ] {
+            tt.families = vec![family.into()];
+            assert_eq!(default_english_rank(&tt), None, "{family}");
+        }
+        tt.families = vec!["TT Norms Pro".into()];
+        tt.style = fontdb::Style::Italic;
+        assert_eq!(default_english_rank(&tt), None);
+        tt.style = fontdb::Style::Oblique;
+        assert_eq!(default_english_rank(&tt), None);
+        tt.style = fontdb::Style::Normal;
+        tt.weight = 700;
+        assert_eq!(default_english_rank(&tt), None);
+        tt.weight = 400;
+        tt.stretch = fontdb::Stretch::Condensed;
+        assert_eq!(default_english_rank(&tt), None);
+        tt.stretch = fontdb::Stretch::Normal;
+        tt.has_latin = false;
+        assert_eq!(default_english_rank(&tt), None);
+        let arial = face("Arial", r"C:\Windows\Fonts\arial.ttf", 0);
+        assert_eq!(default_english_rank(&arial), Some(1));
+    }
 
     #[test]
     fn system_catalog_is_not_a_whitelist_and_preserves_collection_faces() {
@@ -429,9 +552,11 @@ mod tests {
         let user = dir.path().join("使用者字體");
         std::fs::create_dir_all(system.join("nested")).unwrap();
         std::fs::create_dir_all(&user).unwrap();
-        let source = fonts_dir().join("arial.ttf");
-        std::fs::copy(&source, system.join("nested/custom.TTF")).unwrap();
-        std::fs::copy(&source, user.join("我的字體.ttf")).unwrap();
+        // Use egui's redistributable embedded fixture, never copy installed fonts.
+        let defs = egui::FontDefinitions::default();
+        let source = &defs.font_data["Ubuntu-Light"].font;
+        std::fs::write(system.join("nested/custom.TTF"), source.as_ref()).unwrap();
+        std::fs::write(user.join("我的字體.ttf"), source.as_ref()).unwrap();
         std::fs::write(user.join("not-font.txt"), "ignore").unwrap();
         let paths = collect_roots(&[system.clone(), user.clone(), system]);
         assert_eq!(paths.len(), 2);
@@ -474,7 +599,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("not-installed.ttf");
-        std::fs::copy(fonts_dir().join("arial.ttf"), &path).unwrap();
+        std::fs::write(&path, b"not an installed font").unwrap();
         assert!(resolve_selection(&selection_id(&path, 0)).is_err());
     }
 }

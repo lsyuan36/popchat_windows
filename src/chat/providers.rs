@@ -11,8 +11,8 @@
 //! pair over `%APPDATA%/PopChat/provider_store.json`. ChatGPT OAuth state and
 //! the Codex app-server inspection process live in `chatgpt_auth.rs` /
 //! `codex.rs`; this file exposes [`ChatGptCatalog`] and [`CodexInspection`]
-//! value types plus `apply_*` entry points so those modules can publish
-//! without a dependency cycle.
+//! value types plus `apply_*` entry points for publishing their results. The
+//! subscription catalog derives from the auth module's pure metadata helpers.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -503,9 +503,8 @@ pub async fn probe_ollama_capabilities(
 
 // MARK: - ChatGPT catalog (fixed; backend has no /models endpoint)
 
-/// Fixed catalog mirrored from `ChatGPTAuth` ( ChatGPTAuth.swift ):
-/// default model, catalog, and the hand-maintained reasoning-effort table.
-/// Constructed here so `ProviderStore` needs no dependency on the auth module.
+/// Fixed subscription catalog derived from `chatgpt_auth`'s single source of
+/// truth: default model, catalog, and hand-maintained reasoning-effort table.
 #[derive(Debug, Clone)]
 pub struct ChatGptCatalog {
     pub default_model: String,
@@ -515,33 +514,30 @@ pub struct ChatGptCatalog {
 }
 
 pub fn chatgpt_catalog() -> ChatGptCatalog {
-    let models = vec![
-        "gpt-5.5".to_string(),
-        "gpt-5.4".to_string(),
-        "gpt-5.4-mini".to_string(),
-        "gpt-5.3-codex-spark".to_string(),
-    ];
+    use super::chatgpt_auth::{
+        default_reasoning_effort, supported_reasoning_efforts, DEFAULT_MODEL, MODEL_CATALOG,
+    };
+
+    let models: Vec<String> = MODEL_CATALOG
+        .iter()
+        .map(|model| (*model).to_owned())
+        .collect();
     let mut supported_efforts = HashMap::new();
     let mut default_efforts = HashMap::new();
     for model in &models {
         supported_efforts.insert(
             model.clone(),
-            vec![
-                "low".to_string(),
-                "medium".to_string(),
-                "high".to_string(),
-                "xhigh".to_string(),
-            ],
+            supported_reasoning_efforts(model)
+                .iter()
+                .map(|effort| (*effort).to_owned())
+                .collect(),
         );
-        let fallback = if model == "gpt-5.3-codex-spark" {
-            "high"
-        } else {
-            "medium"
-        };
-        default_efforts.insert(model.clone(), fallback.to_string());
+        if let Some(effort) = default_reasoning_effort(model) {
+            default_efforts.insert(model.clone(), effort.to_owned());
+        }
     }
     ChatGptCatalog {
-        default_model: "gpt-5.5".to_string(),
+        default_model: DEFAULT_MODEL.to_owned(),
         models,
         supported_efforts,
         default_efforts,
@@ -614,6 +610,8 @@ struct PersistedProviderState {
     #[serde(default)]
     selected_models: HashMap<Uuid, String>,
     #[serde(default)]
+    settings_models: HashMap<Uuid, String>,
+    #[serde(default)]
     known_model_efforts: HashMap<Uuid, HashMap<String, Vec<String>>>,
     #[serde(default)]
     default_model_efforts: HashMap<Uuid, HashMap<String, String>>,
@@ -636,12 +634,19 @@ pub enum LazyFetchPlan {
 }
 
 pub struct ProviderStore {
+    storage_path: std::path::PathBuf,
+    /// A failed load permanently disables writes for this instance, so later
+    /// background saves cannot replace unreadable data with fallback presets.
+    load_error: Option<String>,
     pub providers: Vec<Provider>,
     pub selected_id: Uuid,
     /// Last-fetched `/models` list per provider — persisted so the switcher
     /// works offline.
     pub known_models: HashMap<Uuid, Vec<String>>,
     pub selected_models: HashMap<Uuid, String>,
+    /// Explicitly saved Settings editor choices, separate from live selection.
+    /// Legacy stores have no entries: the editor falls back to remembered_model.
+    pub settings_models: HashMap<Uuid, String>,
     pub known_model_efforts: HashMap<Uuid, HashMap<String, Vec<String>>>,
     pub default_model_efforts: HashMap<Uuid, HashMap<String, String>>,
     pub selected_model_efforts: HashMap<Uuid, HashMap<String, String>>,
@@ -664,10 +669,42 @@ impl ProviderStore {
     pub const CHATGPT_PROVIDER_NAME: &'static str = "OpenAI subscription (unofficial)";
 
     pub fn load(secrets: &SecretStore) -> Self {
-        let state: PersistedProviderState = std::fs::read(store_file_path())
-            .ok()
-            .and_then(|data| serde_json::from_slice(&data).ok())
-            .unwrap_or_default();
+        Self::load_at(store_file_path(), |id| secrets.get(&id.to_string()))
+    }
+
+    fn load_at(
+        storage_path: std::path::PathBuf,
+        mut lookup_key: impl FnMut(Uuid) -> Option<String>,
+    ) -> Self {
+        let loaded = match std::fs::read(&storage_path) {
+            Ok(data) => (|| {
+                // Serde structs can also accept JSON arrays. Require the actual
+                // on-disk object schema, including a catalog, before migration.
+                let value: serde_json::Value = serde_json::from_slice(&data).ok()?;
+                let providers = value.as_object()?.get("providers")?.as_array()?;
+                if !providers.iter().all(serde_json::Value::is_object) {
+                    return None;
+                }
+                serde_json::from_value::<PersistedProviderState>(value).ok()
+            })()
+            .ok_or("Provider storage could not be decoded; existing data was preserved and saving is disabled until restart."),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(PersistedProviderState::default())
+            }
+            Err(_) => Err("Provider storage could not be read; existing data was preserved and saving is disabled until restart."),
+        };
+        let (state, load_error) = match loaded {
+            Ok(state) => (state, None),
+            Err(error) => (PersistedProviderState::default(), Some(error.to_owned())),
+        };
+        // Never access credentials for fallback identities after a failed load.
+        let mut key_for = |id| {
+            if load_error.is_none() {
+                lookup_key(id).unwrap_or_default()
+            } else {
+                String::new()
+            }
+        };
         let mut migrated = state.providers.unwrap_or_else(Self::presets);
         let selected_id = state.selected_id;
 
@@ -678,10 +715,7 @@ impl ProviderStore {
             {
                 return true;
             }
-            let configured = !secrets
-                .get(&provider.id.to_string())
-                .unwrap_or_default()
-                .is_empty()
+            let configured = !key_for(provider.id).is_empty()
                 || !state
                     .known_models
                     .get(&provider.id)
@@ -727,11 +761,16 @@ impl ProviderStore {
             provider.name = Self::CHATGPT_PROVIDER_NAME.to_string();
         }
 
+        // A stale selection must not hide an otherwise intact catalog.
+        let selected_id = selected_id.filter(|id| migrated.iter().any(|p| p.id == *id));
         let mut store = ProviderStore {
+            storage_path,
+            load_error: load_error.clone(),
             selected_id: selected_id.unwrap_or_else(|| migrated[0].id),
             providers: migrated,
             known_models: state.known_models,
             selected_models: state.selected_models,
+            settings_models: state.settings_models,
             known_model_efforts: state.known_model_efforts,
             default_model_efforts: state.default_model_efforts,
             selected_model_efforts: state.selected_model_efforts,
@@ -744,14 +783,14 @@ impl ProviderStore {
             auto_fetched: HashSet::new(),
             codex_generation: 0,
         };
-        // Fresh install (no stored selection): prefer whatever IS configured
-        // over the positional fallback.
+        // Missing/stale selection: prefer whatever IS configured over the
+        // positional fallback.
         if selected_id.is_none() {
             let configured = store
                 .providers
                 .iter()
                 .find(|p| {
-                    let key = secrets.get(&p.id.to_string()).unwrap_or_default();
+                    let key = key_for(p.id);
                     Self::is_configured_static(
                         p,
                         &key,
@@ -767,8 +806,16 @@ impl ProviderStore {
             }
         }
         store.apply_chatgpt_catalog(&chatgpt_catalog());
-        store.save();
+        if store.load_error.is_none() {
+            store.save();
+        }
         store
+    }
+
+    /// Privacy-safe startup warning. No source JSON, credentials or path is
+    /// included. A failed-load instance refuses all persistence until reloaded.
+    pub fn load_error(&self) -> Option<&str> {
+        self.load_error.as_deref()
     }
 
     pub fn save(&self) {
@@ -778,11 +825,15 @@ impl ProviderStore {
     }
 
     pub fn try_save(&self) -> anyhow::Result<()> {
+        if let Some(error) = self.load_error() {
+            anyhow::bail!("{error}");
+        }
         let state = PersistedProviderState {
             providers: Some(self.providers.clone()),
             selected_id: Some(self.selected_id),
             known_models: self.known_models.clone(),
             selected_models: self.selected_models.clone(),
+            settings_models: self.settings_models.clone(),
             known_model_efforts: self.known_model_efforts.clone(),
             default_model_efforts: self.default_model_efforts.clone(),
             selected_model_efforts: self.selected_model_efforts.clone(),
@@ -790,12 +841,12 @@ impl ProviderStore {
             capability_exceptions: self.capability_exceptions.clone(),
             pdf_pass_through: self.pdf_pass_through.clone(),
         };
-        let path = store_file_path();
+        let path = &self.storage_path;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let data = serde_json::to_vec_pretty(&state)?;
-        crate::paths::atomic_write(&path, &data)?;
+        crate::paths::atomic_write(path, &data)?;
         Ok(())
     }
 
@@ -1134,17 +1185,26 @@ impl ProviderStore {
         self.save();
     }
 
-    /// Seeds the fixed ChatGPT catalog onto the ChatGPT provider
-    /// specifically — not `selected_provider`.
+    /// Seeds the fixed ChatGPT catalog onto the ChatGPT provider specifically,
+    /// not `selected_provider`. Retired cached choices fall back to its current
+    /// default; custom/API providers and the live provider identity stay intact.
     pub fn apply_chatgpt_catalog(&mut self, catalog: &ChatGptCatalog) {
         let Some(provider) = self
             .providers
-            .iter()
+            .iter_mut()
             .find(|p| p.kind == ProviderKind::ChatGPT)
         else {
             return;
         };
         let id = provider.id;
+        provider.default_model = catalog.default_model.clone();
+        for selections in [&mut self.selected_models, &mut self.settings_models] {
+            if let Some(model) = selections.get_mut(&id) {
+                if super::chatgpt_auth::RETIRED_SUBSCRIPTION_MODELS.contains(&model.as_str()) {
+                    *model = catalog.default_model.clone();
+                }
+            }
+        }
         self.known_models.insert(id, catalog.models.clone());
         self.known_model_efforts
             .insert(id, catalog.supported_efforts.clone());
@@ -1341,6 +1401,7 @@ impl ProviderStore {
         secrets.delete(&id.to_string())?;
         self.known_models.remove(&id);
         self.selected_models.remove(&id);
+        self.settings_models.remove(&id);
         self.known_model_efforts.remove(&id);
         self.default_model_efforts.remove(&id);
         self.selected_model_efforts.remove(&id);
@@ -1466,6 +1527,366 @@ mod tests {
         format!(
             r#"{{"id":"123e4567-e89b-12d3-a456-426614174000","name":"X","baseURL":"https://x.example/v1","isPreset":false,"defaultModel":"m"{kind_field}}}"#
         )
+    }
+
+    #[test]
+    fn subscription_catalog_matches_auth_source_and_has_valid_defaults() {
+        use super::super::chatgpt_auth;
+
+        let catalog = chatgpt_catalog();
+        assert!(!catalog.models.is_empty());
+        assert_eq!(catalog.default_model, chatgpt_auth::DEFAULT_MODEL);
+        assert_eq!(catalog.models, chatgpt_auth::MODEL_CATALOG);
+        assert!(catalog.models.contains(&catalog.default_model));
+        for model in &catalog.models {
+            let efforts = &catalog.supported_efforts[model];
+            assert!(!efforts.is_empty());
+            assert_eq!(efforts, chatgpt_auth::supported_reasoning_efforts(model));
+            let default = &catalog.default_efforts[model];
+            assert!(efforts.contains(default));
+            assert_eq!(
+                Some(default.as_str()),
+                chatgpt_auth::default_reasoning_effort(model)
+            );
+        }
+    }
+
+    #[test]
+    fn subscription_catalog_repairs_only_subscription_choices_and_preserves_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("provider_store.json");
+        let mut store = ProviderStore::load_at(path.clone(), |_| None);
+        let subscription = store
+            .providers
+            .iter_mut()
+            .find(|provider| provider.kind == ProviderKind::ChatGPT)
+            .unwrap();
+        let subscription_id = subscription.id;
+        subscription.default_model = "gpt-5.5".into();
+        let mut custom: Provider = serde_json::from_str(&provider_json(None)).unwrap();
+        custom.default_model = "gpt-5.5".into();
+        let custom_id = custom.id;
+        store.providers.push(custom.clone());
+        let api = store
+            .providers
+            .iter()
+            .find(|provider| provider.name == "OpenAI")
+            .unwrap()
+            .clone();
+        store.selected_id = custom_id;
+        for id in [subscription_id, custom_id, api.id] {
+            store.known_models.insert(id, vec!["gpt-5.5".into()]);
+            store.selected_models.insert(id, "gpt-5.5".into());
+            store.settings_models.insert(id, "gpt-5.4".into());
+        }
+        let catalog = chatgpt_catalog();
+        store.apply_chatgpt_catalog(&catalog);
+
+        assert_eq!(store.selected_id, custom_id);
+        assert_eq!(store.selected_provider(), Some(&custom));
+        assert_eq!(
+            store
+                .providers
+                .iter()
+                .find(|provider| provider.id == subscription_id)
+                .unwrap()
+                .default_model,
+            catalog.default_model
+        );
+        assert_eq!(store.known_models[&subscription_id], catalog.models);
+        assert_eq!(
+            store.selected_models[&subscription_id],
+            catalog.default_model
+        );
+        assert_eq!(
+            store.settings_models[&subscription_id],
+            catalog.default_model
+        );
+        for id in [custom_id, api.id] {
+            assert_eq!(store.known_models[&id], ["gpt-5.5"]);
+            assert_eq!(store.selected_models[&id], "gpt-5.5");
+            assert_eq!(store.settings_models[&id], "gpt-5.4");
+        }
+        assert_eq!(
+            store
+                .providers
+                .iter()
+                .find(|provider| provider.id == api.id),
+            Some(&api)
+        );
+
+        // Existing supported choices survive both refresh and restart.
+        let supported_choice = catalog.models.last().unwrap().clone();
+        store
+            .selected_models
+            .insert(subscription_id, supported_choice.clone());
+        store
+            .settings_models
+            .insert(subscription_id, supported_choice.clone());
+        store.try_save().unwrap();
+        let reloaded = ProviderStore::load_at(path, |_| {
+            panic!("catalog repair must not look up credentials")
+        });
+        assert_eq!(reloaded.selected_id, custom_id);
+        assert_eq!(reloaded.selected_provider(), Some(&custom));
+        assert_eq!(reloaded.selected_models[&subscription_id], supported_choice);
+        assert_eq!(reloaded.settings_models[&subscription_id], supported_choice);
+    }
+
+    #[test]
+    fn subscription_snapshot_never_erases_a_newer_manually_entered_model() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("provider_store.json");
+        let mut store = ProviderStore::load_at(path.clone(), |_| None);
+        let id = store
+            .providers
+            .iter()
+            .find(|p| p.kind == ProviderKind::ChatGPT)
+            .unwrap()
+            .id;
+        store
+            .selected_models
+            .insert(id, "future-account-model".into());
+        store
+            .settings_models
+            .insert(id, "future-editor-model".into());
+        store.try_save().unwrap();
+        let reloaded = ProviderStore::load_at(path, |_| None);
+        assert_eq!(reloaded.selected_models[&id], "future-account-model");
+        assert_eq!(reloaded.settings_models[&id], "future-editor-model");
+    }
+
+    #[test]
+    fn persistence_missing_file_initializes_a_writable_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("nested/provider_store.json");
+        let store = ProviderStore::load_at(path.clone(), |_| None);
+
+        assert!(store.load_error().is_none());
+        assert!(!store.providers.is_empty());
+        assert!(store.selected_provider().is_some());
+        assert!(store.settings_models.is_empty());
+        store.try_save().unwrap();
+        let state: PersistedProviderState =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(state.providers.unwrap(), store.providers);
+        assert_eq!(state.selected_id, Some(store.selected_id));
+    }
+
+    #[test]
+    fn persistence_custom_identity_and_all_maps_round_trip_without_changing_live_model() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("provider_store.json");
+        let mut store = ProviderStore::load_at(path.clone(), |_| None);
+        let provider: Provider = serde_json::from_str(&provider_json(None)).unwrap();
+        let id = provider.id;
+        store.providers.push(provider.clone());
+        store.selected_id = id;
+        store
+            .known_models
+            .insert(id, vec!["live-model".into(), "editor-model".into()]);
+        store.selected_models.insert(id, "live-model".into());
+        store.settings_models.insert(id, "editor-model".into());
+        store.known_model_efforts.insert(
+            id,
+            HashMap::from([("live-model".into(), vec!["low".into(), "high".into()])]),
+        );
+        store
+            .default_model_efforts
+            .insert(id, HashMap::from([("live-model".into(), "low".into())]));
+        store
+            .selected_model_efforts
+            .insert(id, HashMap::from([("live-model".into(), "high".into())]));
+        store.model_capabilities.insert(
+            id,
+            HashMap::from([(
+                "live-model".into(),
+                ModelCapabilities {
+                    images: Some(true),
+                    files: Some(false),
+                },
+            )]),
+        );
+        store.capability_exceptions.insert(
+            id,
+            HashMap::from([(
+                "live-model".into(),
+                CapabilityException {
+                    images: Some(false),
+                    files: None,
+                    source: ExceptionSource::Manual,
+                },
+            )]),
+        );
+        store.pdf_pass_through.insert(id, true);
+        store.try_save().unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+
+        let reloaded = ProviderStore::load_at(path.clone(), |_| {
+            panic!("a valid existing selection does not need credential lookup")
+        });
+        assert!(reloaded.load_error().is_none());
+        assert_eq!(reloaded.selected_provider(), Some(&provider));
+        assert_eq!(reloaded.current_model(), "live-model");
+        assert_eq!(reloaded.settings_models[&id], "editor-model");
+        assert_eq!(reloaded.selected_provider().unwrap().default_model, "m");
+        assert_eq!(reloaded.current_reasoning_effort().as_deref(), Some("high"));
+        let resaved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(resaved, saved);
+    }
+
+    #[test]
+    fn persistence_legacy_store_without_settings_models_uses_remembered_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("provider_store.json");
+        let provider: serde_json::Value = serde_json::from_str(&provider_json(None)).unwrap();
+        let id: Uuid = serde_json::from_value(provider["id"].clone()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "providers": [provider],
+                "selected_id": id,
+                "selected_models": {id.to_string(): "remembered-model"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let store = ProviderStore::load_at(path, |_| None);
+        assert!(store.load_error().is_none());
+        assert!(store.settings_models.is_empty());
+        assert_eq!(store.remembered_model(id), "remembered-model");
+    }
+
+    #[test]
+    fn persistence_malformed_or_wrong_schema_is_retained_and_blocks_every_save() {
+        let provider: serde_json::Value = serde_json::from_str(&provider_json(None)).unwrap();
+        let mut invalid_id = provider.clone();
+        invalid_id["id"] = "private-fixture-invalid-uuid".into();
+        let mut missing_property = provider.clone();
+        missing_property
+            .as_object_mut()
+            .unwrap()
+            .remove("defaultModel");
+        let mut invalid_documents = vec![
+            b"private-fixture-malformed-json".to_vec(),
+            b"[]".to_vec(),
+            b"[[]]".to_vec(),
+            b"null".to_vec(),
+            b"{}".to_vec(),
+            br#"{"providers":null}"#.to_vec(),
+            br#"{"providers":{}}"#.to_vec(),
+            br#"{"providers":[[]]}"#.to_vec(),
+        ];
+        invalid_documents.extend(
+            [
+                serde_json::json!({"providers": [invalid_id]}),
+                serde_json::json!({"providers": [missing_property]}),
+                serde_json::json!({"providers": [provider.clone()], "selected_id": "invalid"}),
+                serde_json::json!({"providers": [provider], "known_models": {"invalid": []}}),
+            ]
+            .iter()
+            .map(|value| serde_json::to_vec(value).unwrap()),
+        );
+
+        for original in invalid_documents {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("provider_store.json");
+            std::fs::write(&path, &original).unwrap();
+            let mut store = ProviderStore::load_at(path.clone(), |_| {
+                panic!("failed loads must never look up credentials")
+            });
+            let error = store.load_error().expect("invalid input must be reported");
+            assert!(!error.contains("private-fixture"));
+            assert!(!error.contains(directory.path().to_str().unwrap()));
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert!(store.try_save().is_err());
+            // Exercise the unchecked save path used by catalog/background work.
+            store.add_custom();
+            store.save();
+            assert!(store.try_save().is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+
+            // External repair does not silently unlock this fallback instance.
+            std::fs::write(&path, br#"{"providers":[]}"#).unwrap();
+            assert!(store.try_save().is_err());
+            assert_eq!(std::fs::read(path).unwrap(), br#"{"providers":[]}"#);
+        }
+    }
+
+    #[test]
+    fn persistence_read_failure_retains_original_and_blocks_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("provider_store.json");
+        // A directory cannot be read as a file, independently of user ACLs.
+        std::fs::create_dir(&path).unwrap();
+        let sentinel = path.join("keep");
+        std::fs::write(&sentinel, b"private-fixture-original").unwrap();
+        let mut store = ProviderStore::load_at(path.clone(), |_| {
+            panic!("read failures must never look up credentials")
+        });
+        assert!(store.load_error().unwrap().contains("could not be read"));
+        assert!(store.try_save().is_err());
+        store.add_custom();
+        assert!(store.try_save().is_err());
+        assert!(path.is_dir());
+        assert_eq!(
+            std::fs::read(sentinel).unwrap(),
+            b"private-fixture-original"
+        );
+    }
+
+    #[test]
+    fn persistence_stale_selection_is_repaired_without_losing_custom_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("provider_store.json");
+        let provider: Provider = serde_json::from_str(&provider_json(None)).unwrap();
+        let id = provider.id;
+        let stale_id = Uuid::new_v4();
+        let state = PersistedProviderState {
+            providers: Some(vec![provider.clone()]),
+            selected_id: Some(stale_id),
+            selected_models: HashMap::from([(id, "configured-model".into())]),
+            ..Default::default()
+        };
+        std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+
+        let store = ProviderStore::load_at(path.clone(), |_| None);
+        assert!(store.load_error().is_none());
+        assert_eq!(store.selected_id, id);
+        assert_eq!(store.selected_provider(), Some(&provider));
+        assert_eq!(store.current_model(), "configured-model");
+        let reloaded = ProviderStore::load_at(path, |_| None);
+        assert_eq!(reloaded.selected_id, id);
+        assert_eq!(reloaded.selected_provider(), Some(&provider));
+    }
+
+    #[test]
+    fn persistence_storage_paths_remain_bound_to_their_instances() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_path = directory.path().join("first/provider_store.json");
+        let second_path = directory.path().join("second/provider_store.json");
+        let mut first = ProviderStore::load_at(first_path.clone(), |_| None);
+        let mut second = ProviderStore::load_at(second_path.clone(), |_| None);
+        let first_id = first.add_custom();
+        let second_id = second.add_custom();
+        first.settings_models.insert(first_id, "first-model".into());
+        second
+            .settings_models
+            .insert(second_id, "second-model".into());
+        second.try_save().unwrap();
+        let second_bytes = std::fs::read(&second_path).unwrap();
+        first.try_save().unwrap();
+
+        assert_eq!(std::fs::read(&second_path).unwrap(), second_bytes);
+        let first_reloaded = ProviderStore::load_at(first_path, |_| None);
+        let second_reloaded = ProviderStore::load_at(second_path, |_| None);
+        assert_eq!(first_reloaded.settings_models[&first_id], "first-model");
+        assert!(!first_reloaded.settings_models.contains_key(&second_id));
+        assert_eq!(second_reloaded.settings_models[&second_id], "second-model");
+        assert!(!second_reloaded.settings_models.contains_key(&first_id));
     }
 
     #[test]

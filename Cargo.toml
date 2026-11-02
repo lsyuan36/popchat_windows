@@ -1,13 +1,24 @@
 [package]
 name = "popchat_windows"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "PopChat Windows port — all-Rust floating chat panel for OpenAI-compatible models"
 license = "MIT"
+authors = ["Evis Lai"]
+repository = "https://github.com/lsyuan36/popchat_windows"
+homepage = "https://github.com/lsyuan36/popchat_windows"
+readme = "README.md"
+
+[package.metadata.popchat]
+build-channel = "LOCAL BUILD"
 
 [[bin]]
 name = "popchat_windows"
 path = "src/main.rs"
+
+[[bin]]
+name = "popchat_updater"
+path = "src/bin/popchat_updater.rs"
 
 [dependencies]
 # UI

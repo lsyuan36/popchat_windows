@@ -1,0 +1,33 @@
+Embedded-font attribution for epaint_default_fonts 0.32.3
+
+These notices apply to fonts embedded by the default_fonts feature, not just
+to the Rust source code. No standalone font binary is copied into the release
+license directory. Copyright/version strings below were read from the name
+tables of the exact font files in the crates.io package.
+
+NotoEmoji-Regular.ttf (Noto Emoji, Version 1.05 uh)
+Copyright 2013 Google Inc. All Rights Reserved.
+Licensed under the SIL Open Font License 1.1; full text: OFL.txt.
+Upstream: https://github.com/googlefonts/noto-emoji
+
+Ubuntu-Light.ttf (Ubuntu Light, version 0.83)
+Copyright 2011 Canonical Ltd.  Licensed under the Ubuntu Font Licence 1.0
+Full license text: UFL.txt.
+Upstream: https://design.ubuntu.com/font
+
+Hack-Regular.ttf (Hack, version 3.003)
+Copyright (c) 2018 Source Foundry Authors / Copyright (c) 2003 by Bitstream,
+Inc. All Rights Reserved.
+The DejaVu contributions were committed to the public domain.
+Full MIT and Bitstream Vera license/copyright notices: Hack-Regular.txt.
+Reserved Font Names: "Bitstream" and "Vera".
+Upstream: https://github.com/source-foundry/Hack
+
+emoji-icon-font.ttf (emoji, version 1.1)
+MIT license; the supplied copyright and full license are preserved in
+emoji-icon-font-mit-license.txt.
+Upstream: https://github.com/jslegers/emoji-icon-font
+
+Exact font package source:
+https://crates.io/api/v1/crates/epaint_default_fonts/0.32.3/download
+https://github.com/emilk/egui/tree/af96e0373c18477b77236e2bfc89735af007b1c2/crates/epaint_default_fonts/fonts

@@ -78,4 +78,44 @@ mod tests {
         tracker.requested(Vec2::new(604.0, 500.0), now);
         assert!(tracker.observe(Vec2::new(640.0, 490.0), 1, 1.0, false, true, now));
     }
+
+    #[test]
+    fn animated_native_size_limits_never_become_saved_user_geometry() {
+        let mut tracker = ViewportSizing::default();
+        let mut animation = crate::ui::transition::WindowHeightTransition::default();
+        let start = Instant::now();
+        let mut current = Vec2::new(724.0, 272.0);
+        tracker.observe(current, 0, 1.25, false, false, start);
+        animation.update(0, current.y, Some(current.y), 0.0, true);
+        for step in 0..=15 {
+            let elapsed = step as f64 * 0.016;
+            let now = start + Duration::from_secs_f64(elapsed);
+            assert!(!tracker.observe(current, 1, 1.25, false, false, now));
+            let frame = animation.update(1, 644.0, Some(current.y), elapsed, true);
+            // Native min/max size changes also need this declaration even when
+            // an explicit InnerSize command would be below its 2pt threshold.
+            let next = Vec2::new(current.x, frame.height);
+            tracker.requested(next, now);
+            current = Vec2::new(next.x, (next.y * 1.25).round() / 1.25);
+        }
+        assert!(!tracker.observe(
+            current,
+            1,
+            1.25,
+            false,
+            false,
+            start + Duration::from_millis(300)
+        ));
+        assert!(
+            tracker.observe(
+                current + Vec2::new(40.0, 0.0),
+                1,
+                1.25,
+                false,
+                true,
+                start + Duration::from_millis(350)
+            ),
+            "an actual later edge resize must still be saved"
+        );
+    }
 }

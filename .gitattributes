@@ -1,0 +1,13 @@
+# Consistent source files on Windows and Unix.
+* text=auto eol=lf
+
+# Preserve vendored upstream bytes and their recorded SHA-256 inventories.
+# These include mixed upstream line endings as well as the embedded font.
+/assets/** -text -whitespace
+
+*.exe binary
+*.ttf binary
+*.otf binary
+*.png binary
+*.jpg binary
+*.ico binary

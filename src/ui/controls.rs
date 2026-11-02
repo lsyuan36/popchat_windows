@@ -22,6 +22,36 @@ pub enum MessageControl {
     Edit,
 }
 
+/// Follow the message side without reversing the existing visual/action order.
+/// User bubbles and their toolbar share the transcript's right edge; assistant
+/// and error toolbars stay on the left. The inner group keeps a tight width.
+pub fn message_actions_row(
+    ui: &mut egui::Ui,
+    right_aligned: bool,
+    copied: bool,
+    can_fork: bool,
+    rerunnable: bool,
+) -> MessageControl {
+    let count = if rerunnable { 4.0 } else { 2.0 };
+    let width = count * 28.0 + (count - 1.0) * ui.spacing().item_spacing.x;
+    ui.with_layout(
+        egui::Layout::top_down(if right_aligned {
+            egui::Align::Max
+        } else {
+            egui::Align::Min
+        }),
+        |ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(width, 28.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| message_actions_inline(ui, copied, can_fork, rerunnable),
+            )
+            .inner
+        },
+    )
+    .inner
+}
+
 /// Icon-only message actions; callers retain all clipboard/conversation effects.
 pub fn message_actions_inline(
     ui: &mut egui::Ui,
@@ -42,7 +72,16 @@ pub fn message_actions_inline(
     }
     if ui
         .add_enabled_ui(can_fork, |ui| {
-            icons::button(ui, Icon::Fork, false, "從這裡建立分支，不更動原聊天")
+            icons::button(
+                ui,
+                Icon::Fork,
+                false,
+                if can_fork {
+                    "從這裡建立分支，不更動原聊天"
+                } else {
+                    "建立分支（回覆生成中，暫時無法使用）"
+                },
+            )
         })
         .inner
         .clicked()
@@ -128,6 +167,204 @@ pub fn toggle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn aligned_message_frame(
+        ctx: &egui::Context,
+        width: f32,
+        right: bool,
+        rerunnable: bool,
+        can_fork: bool,
+        events: Vec<egui::Event>,
+    ) -> (egui::Rect, egui::Rect, Vec<egui::Pos2>, MessageControl) {
+        let mut bounds = egui::Rect::NOTHING;
+        let mut bubble = egui::Rect::NOTHING;
+        let mut action = MessageControl::None;
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 460.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    super::super::chat_layout::transcript_contents(ui, |ui| {
+                        bounds = ui.available_rect_before_wrap();
+                        let pal = super::super::theme::current_palette(ctx);
+                        let width = ui.available_width();
+                        ui.with_layout(super::super::theme::bubble_layout(right), |ui| {
+                            ui.set_max_width(width * 0.85);
+                            bubble = super::super::theme::bubble_frame(right, pal, pal.dark)
+                                .show(ui, |ui| {
+                                    ui.add(egui::Label::new("A short message with text").wrap());
+                                })
+                                .response
+                                .rect;
+                        });
+                        action = message_actions_row(ui, right, true, can_fork, rerunnable);
+                    });
+                });
+            },
+        );
+        let centers = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Circle(circle) if (circle.radius - 14.0).abs() < 0.1 => {
+                    Some(circle.center)
+                }
+                _ => None,
+            })
+            .collect();
+        (bounds, bubble, centers, action)
+    }
+
+    #[test]
+    fn message_toolbar_follows_bubble_side_without_reversing_button_order() {
+        for width in [320.0, 520.0, 752.0] {
+            for right in [false, true] {
+                for rerunnable in [false, true] {
+                    for appearance in ["light", "dark"] {
+                        let ctx = egui::Context::default();
+                        super::super::theme::apply(
+                            &ctx,
+                            appearance,
+                            super::super::theme::DEFAULT_ACCENT_HEX,
+                        );
+                        let (bounds, bubble, centers, action) =
+                            aligned_message_frame(&ctx, width, right, rerunnable, true, vec![]);
+                        assert_eq!(action, MessageControl::None);
+                        assert_eq!(centers.len(), if rerunnable { 4 } else { 2 });
+                        assert!(centers.windows(2).all(
+                            |pair| pair[1].x > pair[0].x && (pair[0].y - pair[1].y).abs() < 0.1
+                        ));
+                        assert!(centers.iter().all(|center| bounds.contains_rect(
+                            egui::Rect::from_center_size(*center, egui::vec2(28.0, 28.0))
+                        )));
+                        let toolbar_top = centers[0].y - 14.0;
+                        assert!(toolbar_top >= bubble.bottom()
+                                && toolbar_top - bubble.bottom() <= 6.5,
+                                "message and toolbar must stay close: right={right} bubble={bubble:?} centers={centers:?}");
+                        if right {
+                            assert!(
+                                (centers.last().unwrap().x + 14.0 - bubble.right()).abs() < 0.6,
+                                "width={width} bubble={bubble:?} centers={centers:?}"
+                            );
+                            assert!((bubble.right() - bounds.right()).abs() < 0.6);
+                        } else {
+                            assert!((centers[0].x - 14.0 - bounds.left()).abs() < 0.6);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn aligned_message_toolbar_keeps_callbacks_and_streaming_disable() {
+        for right in [false, true] {
+            for (target, can_fork, rerunnable, expected) in [
+                (0, true, false, MessageControl::Copy),
+                (1, true, false, MessageControl::Fork),
+                (1, false, false, MessageControl::None),
+                (2, true, true, MessageControl::Retry),
+                (3, true, true, MessageControl::Edit),
+            ] {
+                let ctx = egui::Context::default();
+                let (_, _, centers, _) =
+                    aligned_message_frame(&ctx, 520.0, right, rerunnable, can_fork, vec![]);
+                let pos = centers[target];
+                aligned_message_frame(&ctx, 520.0, right, rerunnable, can_fork, vec![]);
+                for pressed in [true, false] {
+                    let (_, _, _, action) = aligned_message_frame(
+                        &ctx,
+                        520.0,
+                        right,
+                        rerunnable,
+                        can_fork,
+                        vec![
+                            egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                    );
+                    if !pressed {
+                        assert_eq!(action, expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn real_assistant_markdown_keeps_toolbar_near_the_last_text_line() {
+        for text in [
+            "Compact reply marker",
+            "First paragraph.\n\nCompact reply marker",
+            "- First point\n- Compact reply marker",
+            "> Compact reply marker",
+            "| Heading | Other |\n| --- | --- |\n| Compact reply marker | cell |",
+        ] {
+            let ctx = egui::Context::default();
+            super::super::theme::apply(&ctx, "light", super::super::theme::DEFAULT_ACCENT_HEX);
+            let mut math = super::super::panel::MathTextures::new();
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(520.0, 460.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        super::super::chat_layout::transcript_contents(ui, |ui| {
+                            math.show_assistant_message(ui, text);
+                            message_actions_row(ui, false, false, true, false);
+                        });
+                    });
+                },
+            );
+            let bottom = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text)
+                        if text.galley.text().contains("Compact reply marker") =>
+                    {
+                        Some(text.pos.y + text.galley.rect.bottom())
+                    }
+                    _ => None,
+                })
+                .max_by(f32::total_cmp)
+                .expect("actual final prose line must paint");
+            let top = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Circle(circle) if (circle.radius - 14.0).abs() < 0.1 => {
+                        Some(circle.center.y - 14.0)
+                    }
+                    _ => None,
+                })
+                .max_by(f32::total_cmp)
+                .expect("message toolbar below the table copy control must paint");
+            // Tables retain their existing cell line-height/padding, unlike
+            // ordinary prose. Neither path gets extra reply-end whitespace.
+            let max_gap = if text.starts_with('|') { 16.0 } else { 9.0 };
+            assert!(
+                top >= bottom && top - bottom <= max_gap,
+                "assistant text-to-toolbar gap too large: {}pt for {text:?}",
+                top - bottom
+            );
+        }
+    }
 
     #[test]
     fn actual_chat_navigation_has_no_find_button() {

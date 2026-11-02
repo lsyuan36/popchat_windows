@@ -1097,23 +1097,43 @@ impl MathTextures {
     pub fn show_assistant_message(&mut self, ui: &mut egui::Ui, text: &str) {
         let dark = ui.visuals().dark_mode;
         let pal = super::theme::current_palette(ui.ctx());
-        super::theme::bubble_frame(false, pal, dark).show(ui, |ui| {
-            for segment in split_math_segments(text) {
+        let mut frame = super::theme::bubble_frame(false, pal, dark);
+        // This reply frame is transparent: keep its top inset but do not stack
+        // bottom padding/margin on top of the normal gap before action buttons.
+        frame.inner_margin.bottom = 0;
+        frame.outer_margin.bottom = 0;
+        frame.show(ui, |ui| {
+            let segments = split_math_segments(text);
+            let last = segments.len().saturating_sub(1);
+            for (index, segment) in segments.into_iter().enumerate() {
                 match segment {
-                    MessageSegment::Prose(prose) => super::markdown::show_prose(ui, &prose, self),
+                    MessageSegment::Prose(prose) => {
+                        if index == last {
+                            super::markdown::show_prose_compact_end(ui, &prose, self);
+                        } else {
+                            super::markdown::show_prose(ui, &prose, self);
+                        }
+                    }
                     MessageSegment::DisplayMath(latex) => {
                         let tint = ui.visuals().text_color();
-                        self.show_display_math(ui, &latex, tint);
+                        self.show_display_math(ui, &latex, tint, index != last);
                     }
                     MessageSegment::Code { language, content } => {
                         self.show_code_block(ui, language.as_deref(), &content, dark);
                     }
-                    MessageSegment::Quote(quote) => super::markdown::show_quote(ui, &quote, self),
+                    MessageSegment::Quote(quote) => {
+                        super::markdown::show_quote(ui, &quote, self, index != last)
+                    }
                     MessageSegment::Table { header, rows } => {
-                        super::markdown::show_table(ui, &header, &rows);
+                        super::markdown::show_table(ui, &header, &rows, index != last);
                     }
                     MessageSegment::Pasteable { title, content } => {
-                        super::markdown::show_pasteable(ui, title.as_deref(), &content);
+                        super::markdown::show_pasteable(
+                            ui,
+                            title.as_deref(),
+                            &content,
+                            index != last,
+                        );
                     }
                 }
             }
@@ -1179,7 +1199,8 @@ impl MathTextures {
     /// 行內公式：縮小嵌入同行（對應原版行內 `fontSize` 較展示小一級）；
     /// 失敗退回 `$latex$` 等寬原文。
     fn show_inline_math(&mut self, ui: &mut egui::Ui, latex: &str, tint: egui::Color32) {
-        let Some(handle) = self.texture_for(ui.ctx(), latex, INLINE_MATH_FONT_SIZE, false) else {
+        let font_size = super::typography::scaled(ui, INLINE_MATH_FONT_SIZE);
+        let Some(handle) = self.texture_for(ui.ctx(), latex, font_size, false) else {
             ui.monospace(format!("${latex}$"));
             return;
         };
@@ -1188,7 +1209,7 @@ impl MathTextures {
             ui.monospace(format!("${latex}$"));
             return;
         }
-        let height = (INLINE_MATH_FONT_SIZE * 1.35).ceil();
+        let height = (font_size * 1.35).ceil();
         let width = (height * size.x / size.y).min(ui.available_width().max(16.0));
         ui.add(
             egui::Image::from_texture(&handle)
@@ -1199,9 +1220,16 @@ impl MathTextures {
 
     /// 展示公式：置中（對應原版 `MathBlockView` 的全寬置中 + 上下 padding）；
     /// 失敗退回 `$$latex$$` 等寬原文。
-    fn show_display_math(&mut self, ui: &mut egui::Ui, latex: &str, tint: egui::Color32) {
+    fn show_display_math(
+        &mut self,
+        ui: &mut egui::Ui,
+        latex: &str,
+        tint: egui::Color32,
+        trailing_gap: bool,
+    ) {
         ui.add_space(4.0);
-        let handle = self.texture_for(ui.ctx(), latex, DISPLAY_MATH_FONT_SIZE, true);
+        let font_size = super::typography::scaled(ui, DISPLAY_MATH_FONT_SIZE);
+        let handle = self.texture_for(ui.ctx(), latex, font_size, true);
         let size = handle.as_ref().map(|h| h.size_vec2());
         match (handle, size) {
             (Some(handle), Some(size)) if size.x > 0.0 && size.y > 0.0 => {
@@ -1224,13 +1252,109 @@ impl MathTextures {
                 });
             }
         }
-        ui.add_space(4.0);
+        if trailing_gap {
+            ui.add_space(4.0);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_math_uses_scaled_raster_cache_keys_and_reflows_following_text() {
+        for appearance in ["light", "dark"] {
+            for width in [320.0, 520.0] {
+                let ctx = egui::Context::default();
+                super::super::theme::apply(
+                    &ctx,
+                    appearance,
+                    super::super::theme::DEFAULT_ACCENT_HEX,
+                );
+                let mut math = MathTextures::new();
+                let mut previous_display_height = 0.0;
+                for size in [12, 14, 15, 20, 24] {
+                    let output = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(width, 1000.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                super::super::typography::apply(ui, size);
+                                math.show_assistant_message(
+                                    ui,
+                                    "Before $x^2$ after\n\n$$x^2$$\n\nFollowing",
+                                );
+                            });
+                        },
+                    );
+                    let ratio = super::super::typography::scale(size);
+                    let inline = super::super::math::math_cache_key(
+                        "x^2",
+                        INLINE_MATH_FONT_SIZE * ratio,
+                        false,
+                    );
+                    let display = super::super::math::math_cache_key(
+                        "x^2",
+                        DISPLAY_MATH_FONT_SIZE * ratio,
+                        true,
+                    );
+                    let inline_id = math
+                        .textures
+                        .get(&inline)
+                        .expect("inline raster at selected font size")
+                        .id();
+                    let display_id = math
+                        .textures
+                        .get(&display)
+                        .expect("display raster at selected font size")
+                        .id();
+                    let image = |id| {
+                        output
+                            .shapes
+                            .iter()
+                            .find_map(|shape| match &shape.shape {
+                                egui::Shape::Rect(rect) if rect.fill_texture_id() == id => {
+                                    Some(rect.rect)
+                                }
+                                _ => None,
+                            })
+                            .expect("production formula texture painted")
+                    };
+                    assert_eq!(
+                        image(inline_id).height(),
+                        (INLINE_MATH_FONT_SIZE * ratio * 1.35).ceil()
+                    );
+                    let display_rect = image(display_id);
+                    assert!(display_rect.height() >= previous_display_height);
+                    previous_display_height = display_rect.height();
+                    assert!(display_rect.right() <= width);
+                    let following = output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| match &shape.shape {
+                            egui::Shape::Text(text) if text.galley.text() == "Following" => {
+                                Some(text.pos.y)
+                            }
+                            _ => None,
+                        })
+                        .unwrap();
+                    assert!(following >= display_rect.bottom());
+                }
+                assert_eq!(
+                    math.textures.len(),
+                    10,
+                    "different sizes must not alias cached rasters"
+                );
+                assert!(math.textures.len() <= super::super::math::MAX_CACHED_FORMULAS);
+            }
+        }
+    }
 
     // Golden fixtures transcribed against MarkdownText.swift lines 30–151,
     // rather than CommonMark/GFM (which differs on these permissive cases).

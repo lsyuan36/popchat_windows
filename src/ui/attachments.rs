@@ -77,10 +77,7 @@ impl AttachmentDraft {
                     ui.group(|ui| {
                         ui.horizontal(|ui| {
                             ui.label(&attachment.filename);
-                            if ui
-                                .small_button("×")
-                                .on_hover_text("Remove attachment")
-                                .clicked()
+                            if super::icons::hover_help(ui.small_button("×"), "移除附件").clicked()
                             {
                                 remove = Some(index);
                             }

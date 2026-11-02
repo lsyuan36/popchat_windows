@@ -1,0 +1,19 @@
+hexf-parse 0.2.1
+
+The published Cargo.toml declares:
+  authors = ["Kang Seonghoon <public+rust@mearie.org>"]
+  license = "CC0-1.0"
+  repository = "https://github.com/lifthrasiir/hexf"
+
+The published crate and pinned upstream commit contain no standalone license
+file or additional copyright notice. The accompanying CC0-1.0.txt reproduces
+the standard license text identified by the published declaration; it is not
+presented as a license file supplied in the crate. No copyright year or
+copyright-holder statement has been invented.
+
+Exact source:
+https://crates.io/api/v1/crates/hexf-parse/0.2.1/download
+https://github.com/lifthrasiir/hexf/tree/4225763d744183d720f575ae96d04161b4d08ea0/parse
+
+License-text source:
+https://raw.githubusercontent.com/spdx/license-list-data/main/text/CC0-1.0.txt

@@ -5,7 +5,7 @@
 清冊的函式對照來自靜態來源審查；parent 的最新測試、隔離原生操作與截圖另記於文末。
 下表描述實作及測試覆蓋邊界，不能單憑 caller 存在推定真實帳號／完整原生驗收。
 
-**目前邊界：** 唯一 UI 為使用者活躍的 **PID 26008**（canonical x64 release，頂部同列／訊息 icon／scroll inset／無底部提示列，未釘選），已查看最後 production build 截圖。使用者現在選 Dark、90% 背景、CursorScreenCenter、英文 TT Norms Pro Normal／中文使用者目錄的 Swei Gothic CJK TC DemiLight；不能用舊 checkpoint 恢復成 Light/default 字體。使用者允許直接重啟；仍須 WM_CLOSE／等待退出／確認零實例後替換，不送出聊天或自行 Save API。
+**目前邊界（2026-11-02，已更新安裝）：** 唯一 app 為 **PID 324**，**v0.2.0 — LOCAL BUILD**，作者 **Evis Lai**，`%LOCALAPPDATA%\Programs\PopChat\popchat_windows.exe`，正式預設 `%APPDATA%\PopChat\PopChat\config`，**`isolated=false`**；圖示 hover／TT Norms Pro→Arial 英文預設／程式內確認下載安裝更新已接線，保留先前字級、錄製、轉場與表格 Copy。正常關閉 PID 20820／確認零實例才更新，app/helper SHA 與 manifest 核對；兩個 custom providers、偏好／指令／歷史 hashes 保留，沒有 credential importer。手動中英字體與快捷鍵不遷移；不 Save API／Send／改真正剪貼簿／啟用開機啟動。最後 raw 視窗非前景／off-screen，沒有強行喚回。單一 chat UI 約束持續適用，updater helper 不建立聊天 UI。
 
 ## Swift → Rust → 應用入口
 
@@ -53,7 +53,7 @@
 - provider→model→effort 三欄 inert preview／鍵盤 Enter commit／setup CTA／Settings readiness 點仍未等價；Settings 是 embedded surface，不是保留的獨立浮動視窗，blur 語意也不同。
 - glass／panel tint／Reduce Transparency／專用 bubble preview、composer globe、header wheel forwarding、tray update item、history cascade／flash／relative labels、原版 context menu、附件總 payload warning、Settings capability/source-label UI 等仍有明確缺口。
 - Unicode lowercasing 不保證 Foundation locale／case folding 全等；completion 拒絕所有 whitespace、原版只檢查 literal space 的邊界仍在。Find count／glyph／table 對齊、Codex partial-line watchdog／共享 refresh await 契約、跨版本資料 migration 與 silent conversation save failure 仍需比較。
-- 完整清冊保留所有 PARTIAL／CORE_ONLY／MISSING 明細，本摘要不刪除其他非本輪範圍的缺口。熱鍵現為可設定、預設 Alt+Down，Settings 文字 draft／Apply 是 native recorder 的平台替代；不再沿用已被使用者覆蓋的「固定 Alt+Down」限制。六項新需求已有實際 caller，仍不可把舊原生截圖當成六項驗收。
+- 完整清冊保留所有 PARTIAL／CORE_ONLY／MISSING 明細，本摘要不刪除其他非本輪範圍的缺口。熱鍵現為可設定、預設 Alt+Down，Settings 改為 egui 按鍵錄製／明確 Apply；不是 macOS native recorder，不再沿用早期「固定 Alt+Down」或「只能文字輸入」限制。各項新需求已有實際 caller，仍不可把舊原生截圖當成本輪驗收。
 
 ## 清冊核對
 
@@ -63,6 +63,102 @@ Markdown fixture 中的 `main.swift:1016 func fib` 不計入，真正的 `Messag
 清冊覆蓋不等於行為全部驗收，不提供完成百分比。
 
 ## 最終整合驗證
+
+### v0.2.0 — LOCAL BUILD：專案文件／公開發行／程式內更新
+
+- Cargo/UI/release metadata 升為 **0.2.0 / LOCAL BUILD / Evis Lai**。新 `README.md`、`NOTICE.md`、`LICENSE`、`CHANGELOG.md` 明確標記原專案 **https://github.com/lec77/PopChat** 與 **2026 Le Chen** 的 MIT 版權，不冒充原版官方發行。發行位置為 `https://github.com/lsyuan36/popchat_windows/releases/tag/v0.2.0`；GitHub 公開／發佈是獨立的遠端操作，不能從本機測試推定完成。
+- `update::{UpdateChecker,UpdateDownload}` 固定讀本 repo 的 `/releases/latest`，嚴格 stable `vMAJOR.MINOR.PATCH`、同 repo page/asset URL、非 draft/prerelease、唯一 `PopChat-Windows-x64.zip`、必要 GitHub asset SHA-256；HTTP metadata／下載大小／重導主機／檔案數／解壓總量／每檔有界。拒絕 traversal、ADS、links/reparse、case collisions、腳本／非預期檔案與非 AMD64 GUI PE。
+- 真實 caller：Settings poll/download → worker → `PreparedUpdate` → 明確「安裝並重新啟動」→ `SettingsAction::InstallUpdate` → `main::update_confirmation_dialog`（警告未送出／API 草稿及串流停止）→ `begin_install` worker → `InstallSession::poll`。只有 helper 验證完成回 READY 才 `visibility.close`；native helper 固定 parent PID/path handle、等 process 退出、再查無同路徑其他 app，才執行有 backup／rollback 的限定檔案交易、保存 manifest 未知欄位並啟動唯一新 UI。臨時 helper 使用舊的已安裝 helper，stage/session/App drop 不刪除交接檔案；啟動後 1.5s 內即退出會視為失敗走 rollback。不是自動靜默取代，不讀寫 profile/credential/shortcut/startup。
+- Source installer 加入 helper GUI PE guard、hash/backup、author/channel metadata 及 notices；`package-release.ps1` 為顯式 allowlist，正常要求 clean commit，輸出 ZIP／SHA256SUMS／source-commit manifest 至 ignored target。850 份 dependency notice 檔案（453 項軟體/資產 inventory）、egui 字體／STIX OFL／LPPL／MPL source availability 均隨包附帶。這是 best-effort 授權清冊，不是法律認證；TT Norms Pro／Arial 不散佈。Binary 未簽章，SHA-256 不是 publisher signature。
+- fmt/check/all-target tests 無 warning 通過：**536 library、26 binary、15 importer example passed；3 ignored**（helper bin 沒有 UI tests）。明確確認 modal 的真實 click／Enter 不默認同意／Esc 返回、hash/path/ZIP/PE／wait/transaction/rollback/manifest mock tests 等通過。另以真正 package 的 **877 檔案、31,239,049 bytes** ZIP 執行 `release_zip_matches_updater_contract` ignored gate，實際 hash／解壓／PE／授權目錄驗證成功，不啟動 helper或替換任何安裝檔。發布前的 clean-commit package 需再次通過同 gate。
+- 公開前 read-only 來源／歷史審查未發現高信心真實 credential/private conversation/proprietary-font blocker；942 text-file 紅字式 token scan 無高信心命中。補強 secrets/OAuth/backup/temp ignores；保留既有 Git 歷史（有本機 developer paths，未擅自 rewrite）。這不是完美秘密掃描保證。
+- Local `-UpdateOnly -ExpectedPid 20820` handoff 至唯一 **PID 324**，installed app SHA-256 **`8129C92196F5A01BF5177925E19A9BA0E79697BAF9D5E383EE0B991BF22A3FF1`**，helper **`DC280DCD928686E07CAAFBCF4521EE57A606E8A510CB1265E8C52E4D1C7A8DF0`**，與 manifest/version/channel/author/source 核對；boot log 為正式 profile／`isolated=false`，PID pointer 更新。raw metadata 非前景／off-screen，沒有原生操作 Download／Install、未試送聊天／Save API。**第一版公開 release 尚無下一個真實版本可作線上升級驗收**；實際 native helper handoff／mixed-DPI／真實 IME/provider 矩陣保留邊界，不以 mock 或 ZIP gate 冒充完整驗收。
+
+### 圖示 hover 提示／英文預設 TT Norms Pro → Arial
+
+- `icons::button → hover_help` 改為單一 context timer 的 180ms hover 提示，不要求 pointer 完全靜止；禁用按鈕也能顯示功能／原因。使用 egui Tooltip popup 層，不沿用頁面 body clip／opacity／聊天字級，會在 native viewport 內選位。popup 初次量測可能暫時蓋住 owner，因此保留自身已開 tooltip 的 clipped owner hover，避免 sizing/fitting 造成提示閃退；按下／拖曳／捲動／離開／選單開啟時隱藏。
+- 14 個官方 FA 控制項共用此路徑；搜尋上下筆／關閉搜尋／錯誤關閉／歷史刪除／附件移除／thinking disclosure 同時接線。Pin／Settings 依狀態顯示取消釘選／返回聊天，Send／Fork disabled 顯示未輸入／附件載入／生成中原因，保留既有 callback／disabled gating。7 個 icon focused tests 已通過：所有 icons × light/dark × enabled/disabled、pointer jitter、實際提示 text、四角 viewport／原 28pt clip、點擊僅一次及 hover 無 clipboard/OpenUrl；後續增加 settled idle repaint 測試，最後結果另補。
+- 空英文偏好改為「已安裝 TT Norms Pro upright regular → 已安裝 Arial regular → egui 最後備援」。只讀系統／使用者 font registry 和 candidate directories，以 font family/style/weight/stretch/cmap 真正 metadata 排除 Serif／condensed／bold／italic，TTC face index 保留；不下載、不拷貝至資產或安裝目錄、不內嵌授權英文 font bytes。process-immutable cache 避免每幀掃描／重建，安裝新預設字體後需重新啟動。手動選字仍優先，CJK-only Swei 與 monospace 獨立。
+- 預設 picker 標籤及實際 fallback 狀態已更新；35 個 font focused tests 通過（priority／missing/unreadable／metadata 排除／collection face／cmap／cache／manual choice）。此機實際辨識 `C:\Windows\Fonts\TT Norms Pro Regular.ttf` face0；不是將它打包。額外 settled-tooltip idle repaint 測試通過；合併納入上述 v0.2.0 release build／安裝，不把 off-screen 原生視窗當作 hover screenshot 驗收。
+
+### 內建中文字體／字級／按鍵錄入／聊天快捷鍵清單
+
+- 中文空值預設改為內建獅尾圓體 TC Regular 2.143；官方 `max32002/swei-gothic` commit `c363a1d845aa782a71b7a068b5db0aff3f83ee86`，原始 16,193,916-byte TTF SHA-256 `0cb199c63ec23fda70905decf82e1a7f3657092a653323063e9e5f50adfc3f7f`。`include_bytes!` 加入 exe，不需系統安裝或 runtime 下載；原檔／OFL／copyright／SOURCE 保存於 `assets/fonts/swei-gothic`。只在記憶體套用既有 script cmap 隔離，英文選擇與等寬字體獨立，手動選字不遷移。19 個 fonts focused tests 通過。
+- 字級以獨立 `chat_font_size` 一般偏好保存，預設 15pt、範圍 12–24pt；不改 global zoom。外觀頁有滑桿、數字、重設和中英預覽。預計套用訊息／Markdown／code／table／math／reasoning／composer，仍保留 UI chrome 原尺寸；一般偏好 autosave 不提交 API／未 Apply 熱鍵草稿。最後 renderer／integration tests 與部署結果另補。
+- 上述 renderer 已接線；局部 inherited style marker 讓巢狀 apply 不累加，保留預設 15/13/12pt 各元素比例；math 真正改 raster/cache key，table 先量新字級再排最高格列高，thinking 的固定 3/12 行同時調整 line height。composer 身分／family／cursor／undo／IME 路徑不改。外觀設定缺欄預設／超界 clamp／實際 slider 鍵盤調整及預覽／不偷存 API 的測試、12/15/24pt user bubble 寬度與 toolbar target 回歸通過；27 個 Settings focused tests 通過。
+- 熱鍵頁改 `hotkey_recorder::show → hotkey_draft`，只產生待套用值，原 `ChangeHotkey → register-first → commit_hotkey_binding` 成功後才保存。主 `update` 第一動作為 `intercept`，早於 local-binding consumer、app/composer shortcuts 與 paste；接受／取消幀吞掉 key/text/IME/paste，held key repeats 到 release 都不會觸發新聊天等動作，普通輸入隨後恢復。錄製中 Apply disabled，Esc／Tab／失焦／換分頁／關閉設定／hide 取消；不改原草稿。共用 AtomicBool 由 widget 點擊時立即發布，hotkey watcher 與 visibility-driver 收到 queued toggle 時雙重檢查，直到接受鍵 release 幀仍抑制 OS toggle，沒有為錄製取消／重新註冊 OS binding。23 個 hotkey/recorder focused tests 通過，未用使用者真實熱鍵做改綁測試。
+- `shortcut_list::show` 接聊天快捷鍵區：對話／尋找／輸入與附件／視窗與設定分組，圓角 cream/dark cards、動作與補充文字、LTR keycap chips；窄版上下排列、替代組合分列，不是可誤觸的動作按鈕。320/520pt 真正 renderer 的 bounds／palette 測試通過。
+- **最終 source/deploy：** fmt/check/all-target tests 無 warning 通過（**507 library、24 binary、15 importer example；2 ignored**），x64 optimized release 成功。`-UpdateOnly -ExpectedPid 10740 -Apply -SkipBuild` 正常 handoff 至唯一 **PID 20820**，installed SHA-256 **`E78E0CC5576E4AB8414ECADF4E5EC869241C1EE33B53472559C4F6BA812CF32E`** 與 manifest 核對；boot log 證實 installed exe／正式 profile／`isolated=false`，PID pointer 已同步。settings/provider/commands/history hashes 保留、沒有 credential importer。installer 在關閉前檢查 font OFL/copyright，安裝後三份 OFL／COPYRIGHT／SOURCE 與 source hashes 全相同。
+- 更新後 raw metadata 為 off-screen（-32000,-32000）、724×644、非前景，沒有取得新頁原生 screenshot，也沒有強行開啟設定子頁／錄入熱鍵／Apply／改字級／送出聊天。四項 feature 的 headless renderer／實際 slider／capture/interception／draft/cursor/IME／registry mock 證據與原生驗收分開；**真實鍵盤錄製／OS-reserved 組合／mixed-DPI／原生字級觀感仍待使用者驗收**。
+
+### 頁面切換動畫
+
+- `ui::transition::{PageTransition,show}` 已接 `main::show_card` 的 Chat／History／Settings／expanded editor／loading incoming body；`SettingsUi::show` 的子分頁 body 同樣接線。180ms cubic ease-out、opacity 0.2→1、水平 ±6pt→0；首次顯示不淡入，固定 header，舊頁不保留／不重畫，不截圖快取，不觸發兩份 callback。
+- 穩定 child/widget IDs，真正 translated layout／hit rect／IME 座標一起移動，原 viewport clipping／局部 opacity；父層只 advance 有界去位移 occupied rect，零高度 viewport 也不擴大卡片。`WindowHeightTransition` 只在 mode 改變時平滑高度，同 mode 的 composer 增高／user resize 直接套用；monitor／native resize／停用動畫時 snap。native size limits 變動也宣告 programmatic request，連續動畫 resize 不保存為使用者 geometry。
+- Windows `SPI_GETCLIENTAREAANIMATION` 只讀且每 context 約 5s 快取；`style.animation_time == 0` 停用。此政策僅接本輪 navigation／height，未改 reasoning pulse 等其他動畫。原生讀取系統政策成功，**Enabled=True**，沒有修改系統設定。
+- fmt/check/all-target tests 無 warning 通過：**483 library、23 binary、15 importer example；2 ignored**，x64 release 成功。18 個 transition tests 涵蓋 trajectory／rapid reversal／repeated pass／disabled／height snap／translated click／palette／clipping／零高度／TextEdit cursor 與 IME preedit→commit continuity／idle repaint；另加連續 programmatic resize 不寫 geometry、真正 edge resize 仍辨識的 production helper 回歸。
+- `-UpdateOnly -ExpectedPid 33572 -Apply -SkipBuild` 正常 handoff 至唯一 **PID 10740**；installed SHA-256 **`4B461572B2B36BC759C34434D5E16CF3796949F3769ADE8C375703EF842CC596`** 與 manifest 核對。boot log 證實正式 profile／`isolated=false`，settings/provider/commands/history hashes 保留，未讀寫遷移憑證，diagnostic PID pointer 已同步。
+- `page-animation-installed.png` 已親自讀取：native Chat endpoint／composer／header 正常，724×344，當時 foreground。稍後預備切頁時 raw metadata 為 off-screen／非前景，guard 在送任何按鍵前中止；未強行喚回／切頁／Save／Send／Copy。**不宣稱完成原生動畫逐幀觀感或真實注音驗收**；互動／座標／IME 證據為真正 egui renderer/callback 測試。
+
+### 表格欄寬／列高／換行
+
+- 使用者提供 PDF 類型／說明比較表跑版截圖；原 renderer 的 Grid cell 經 selection scope／allocate-ui 會 shrink-to-content，且 Grid 固定 LEFT_CENTER，不能保證各列同欄寬或短格靠上。
+- `markdown::show_table` 改為整表共用 content-weighted 欄寬（說明欄較寬、每欄最少 80pt、欄距 12pt），每列先用相同 final width 排好 rich galley，再以該列最高格的實際高度＋8pt 垂直內距配置整列。所有 cell 固定矩形、靠上繪製且有局部 clip，文字量不再影響下一欄起點；header/zebra/full-row divider，短列空格與多出欄位均保留。
+- 一般兩欄表在 viewport 內換行；多欄超過最小可讀寬度才在 bounded horizontal ScrollArea 內捲動，不撐大外層卡片。預先排好的同一 galley 交給原 selection/link hit-test renderer，保留單格選取／真正 Copy output／12pt inline styles／link commands，不靠繪圖覆蓋或隱藏遺失文字。
+- 30 個 Markdown focused tests 通過，包括實際 PDF 中文比較／長 unbroken token、320/404/520/752pt、light/dark、首幀與後續幀的同欄起點／top alignment／最高格列高／下一段不重疊，以及 wide/ragged table 不擴張 panel。既有跨 cell selection isolation／Copy／link command regressions 同時通過。完整測試／build／安裝結果另補。
+- 表格版面 source 的 fmt/check/all-target tests 無 warning 通過：**461 library、23 binary、15 importer example；2 ignored**，x64 release 成功。update-only 正常關閉 PID 33356／確認零 app 後安裝並啟動 **PID 24260**，正式 profile／`isolated=false` 與 boot log 核對；installed hash **`0C4296B5E21EE3076827F2B4501EDE9F51F0B09197EF04283182B79A0856DF1D`** 與 manifest 相符，profile/commands/history hash 保留，沒有 credential importer。未假稱取得目前對話的原生表格 screenshot。
+- 使用者再要求整表 Copy：在表格右上加入官方 FA Copy/Check，控制列與 header 無額外垂直 gap、置於 horizontal scroller 外。只在實際點擊時產生整張 canonical Markdown（header/separator/全部 rows；ragged 空格補齊、pipe/newline 編碼、保留 inline syntax），不包含旁邊 prose。1.5s Check feedback 每張表獨立且綁定內容 signature，內容更新即不顯示舊成功狀態；不新增每版本狀態槽或直接呼叫 OS clipboard。測試只檢查 egui CopyText output，未更動使用者真正剪貼簿；此 Copy source 的最後測試／部署另補。
+- **整表 Copy 最終 source/deploy：** 33 Markdown focused tests 通過；fmt/check/all-target tests 無 warning 通過（**464 library、23 binary、15 importer example；2 ignored**），x64 release 成功。新增 canonical Markdown/ragged escaping、真實 table icon click 的 CopyText payload／無 OpenUrl、Check→Copy timeout、內容變更 reset、相同表格獨立 feedback tests。message toolbar 間距測試改辨識表格控制列下方的真正訊息 toolbar，不能誤把上方 Copy circle 當作 footer。
+- Update-only 正常關閉 PID 24260／確認零 app 後啟動唯一 **PID 33572**；settings/provider/commands/history hash 保留，沒有 credential importer。installed SHA-256 **`F99F32CE54826F7ACD1B510E89CC464CDD8F36E8FAFF680F878F537E29BB15E2`** 與 manifest 核對，boot log 證實 installed exe／正式 profile／`isolated=false`。沒有原生點 Copy（避免覆寫使用者真正剪貼簿）、沒有為 fixture 送出聊天或 Save API；原生目前對話表格 screenshot 不假稱已取得。
+
+### 回覆方上下留白（本輪）
+
+- 使用者澄清 assistant 的間距仍過大；`main::show_list` 移除 assistant 額外 22pt 尾端留白及 toolbar 後額外 8pt，Error 原有 notice spacing 保留，使用者靠右／緊湊間距不變。
+- 加入真正 `MathTextures::show_assistant_message → markdown` 的末行／toolbar 幾何測試，抓出即使移除 22pt，最後 prose 仍有 **28pt** text-to-hit-target gap：Markdown 最後段落 spacer 和透明 reply frame 的底部 padding/margin 相加。改為僅最後 segment/flow 不留 paragraph/list/quote/table/pasteable/display-math 的尾端 spacer；不動內文段落間距、表格 cell line-height 或 code/card 內距。透明 assistant frame 保留上方 inset，底部 3pt padding／4pt margin 不再疊加。
+- 測試涵蓋單段、多段、列表、引用、表格的實際 renderer 末行距離；另對相同 heading/paragraph/list 內容比較 normal/compact 所有 text galley 座標，要求內文完全不變、僅總尾端高度縮短。第一次保留間距測試錯讀 CentralPanel 強制填滿的高度，已改讀 content scope 的實際 response rect；不放寬內文座標相等條件。最終測試／安裝結果另補。
+- **最終 source/deploy：** fmt/check/all-target tests 無 warning 通過：**459 library、23 binary、15 importer example passed；2 ignored**；x64 optimized release 成功。實際 prose/list/quote 末行到 toolbar hit area ≤9pt，table ≤16pt（保留 cell line-height），雙方 row group 到外框 gap ≤6.5pt；先前 28pt/plaintext 和 20.5pt/table 的失敗已由末端 spacer／透明 frame bottom padding 移除解決，不是用負游標位移或擠壓內文。
+- `-UpdateOnly -ExpectedPid 10604` 正常關閉／確認零 app 後更新，未讀寫 importer credentials；settings/provider/commands/history hash 保留。installed SHA-256 **`7D05E82AD5F0A9607E40A0AA78054AA0F5A9B5EDB23831E7D63793112353A687`** 與 manifest 一致，安裝前 PE GUI guard 通過。唯一 **PID 33356**、installed path／正式 profile／`isolated=false` 與 boot log 核對；沒有為驗證送出聊天或強制載入使用者歷史。原生目前對話 screenshot 不假稱已讀取，幾何證據使用真正 MathTextures/Markdown/toolbar render path。
+
+### 使用者訊息工具列靠右／移除啟動 Console
+
+- 使用者隨後以實際截圖確認按鈕已靠右，但要求縮小上下留白：移除 user bubble 後額外 **16pt** spacer，以及 user toolbar 後額外 **8pt** spacer，只保留 theme **6pt** item gap；不改氣泡文字內距、28pt button hit targets 或助手／Error 的間距。相同 bubble/toolbar 幾何測試加上 user gap ≤6.5pt 且不重疊的限制；使用者確認目前沒有草稿並同意直接重啟更新。最新 compact build／部署結果另補。
+- **最終緊湊間距 source/deploy：** fmt/check/all-target tests 無 warning 通過（**457 library、23 binary、15 importer example；2 ignored**），x64 release 成功。`-UpdateOnly -ExpectedPid 4040` 正常關閉／確認零 app 後安裝並啟動唯一 **PID 10604**；settings/provider/commands/history 的更新前 hash 全保留，未跑 credential importer。installed SHA-256 **`EAE668E2C003D46C5E12E5246503288C52FA2B7D85BE432C6BED4CF3AFD0BD8D`** 與 manifest 比對相符；PE Subsystem **2** 再次實讀通過，boot log 確證正式 profile／`isolated=false`。沒有為原生畫面再送訊息、Save API、改草稿或強制載入使用者歷史；縮短間距的證據為真正 caller 的 spacer 移除＋實際 bubble/toolbar 幾何測試。
+- `main::show_list → controls::message_actions_row` 依真實 `ChatRole::User` 使用右側 top-down alignment，內層固定寬度 LTR button group；Copy/Fork/Retry/Edit 保持順序／28pt targets／tooltip／disabled／action routing。助手與 Error 仍靠左；streaming invisible caller 和原本 rerunnable 條件不變，不觸碰訊息資料或 API。
+- 新增 production helper 幾何／點擊測試：320/520/752pt、light/dark、2/4 buttons，使用相同 bubble frame/layout 與 transcript inset，檢查 user toolbar 與 bubble 的右緣一致、assistant 左緣、順序／bounds，以及 callback／streaming Fork disabled。9 個 controls focused tests 通過。完整 fmt/check/all-target tests 無 warning：**457 library、23 binary、15 importer example passed；2 library ignored**；x64 release 成功。
+- 舊安裝 exe 的 PE Subsystem 實讀為 **3 (Console)**，主程式原本缺少 GUI subsystem attribute。`main.rs` 加入 `cfg_attr(all(windows, not(test)), windows_subsystem = "windows")`；測試 harness 保留 console output，正式 app 不再為桌面啟動配置獨立 Console。Codex 正式 spawn 本來已有 `CREATE_NO_WINDOW (0x08000000)`，原樣保留，沒有為此啟動真實 Codex／帳號測試。
+- Installer 新增 **`-UpdateOnly`**：拒絕 SourceProfile，不使用 importer／遷移 key，只替換識別的安裝 exe／捷徑／manifest；hash 檢查包含 provider_store/settings/commands/history。並在關閉任何舊 app 前驗證新 exe 的 PE Subsystem 必須為 **2 (Windows GUI)**，避免下次又安裝 Console build。PowerShell parser 和 update-only plan 通過。
+- 更新前 PID 11472 已由使用者側退出；guard 先偵測 sole PID 改變，沒有關閉其他程序，隨後確認零實例才以 `-UpdateOnly -ExpectedPid 0 -Apply -SkipBuild` 更新。新 installed SHA-256 **`590CB1DF1834F60453A655D00F7ED61877E0276526FBF82A91B78CBA5E2DE611`**，唯一 **PID 4040**，boot log 證實 installed exe／正式 profile／`isolated=false`。未再次讀寫 migration credentials；啟動前受保護檔案 hash 全保留。
+- 親自讀取 `gui-user-toolbar-settings.png`，確認新版 GUI/正式資料目錄/原有 Custom/遮罩 key 顯示；PID 4040 無子程序（包括 cmd/conhost）。視窗非前景，沒有強行切頁／載入歷史來取得 user-toolbar 原生截圖，也未測真實 Codex child launch。因此 toolbar alignment 證據是正式 helper/caller + headless 幾何／點擊，不假稱已原生比對目前對話。GUI subsystem/installed hash/boot 經實讀；無 Send／Save／Key reveal。
+
+### 使用者安裝／只匯入兩個自訂服務
+
+- 使用者在安裝前明確選擇「移到正式資料目錄」→「只移入兩個自訂服務」，**不是**以舊 profile 全面取代正式偏好／歷史，也不是複製 OAuth／搜尋憑證。
+- 新增 `scripts/install.ps1`（預設 plan-only，`-Apply` 才修改）、`scripts/uninstall.ps1` 及 `INSTALL.md`。建置與 UI-free Rust importer 使用 button-review staging，不覆寫執行中的 exe；正式安裝於 `%LOCALAPPDATA%\Programs\PopChat`。使用者層級安裝，附 Font Awesome license/assets；建立桌面／Start menu 指向安裝 exe 的無額外參數捷徑、HKCU Installed apps 註冊與 install manifest。不啟用登入啟動，僅已有且匹配舊 exe 的 Run entry 才可改指向新路徑。
+- `examples/import_custom_providers.rs` 只處理非 preset rows 與其 UUID 所屬的九類 model/capability maps；保留目的 root unknown fields、原 provider rows、live selection 及所有其他 maps。不同同 UUID／map 值為衝突而非覆蓋；schema/duplicate/count 異常拒絕。預設 dry-run 不讀寫憑證；`--apply` 只用 Windows Credential Manager 逐 UUID 從原 profile namespace 複製到正式預設 namespace，不搬 OAuth/search、不輸出或明文匯出值、不刪來源 key、不覆寫不同目的 key。
+- Apply 前 parent 持有獨占 installer file handle、正常 WM_CLOSE／等待舊 PID 5048 退出／確認零 app；helper 偵測來源／目的 metadata 變動、同目錄 create-new+sync 備份、fresh-read 驗證 key，再 atomic commit JSON。模擬失敗測試覆蓋只回復新建目的 keys、不刪來源／不同值；跨 filesystem/keyring crash 不是完整交易，原檔與備份仍保留。
+- 最後 source fmt／`cargo check --locked --all-targets`／`cargo test --locked --all-targets --quiet` 通過，無 warning：**455 library、23 binary、15 importer example tests passed；2 library ignored**。x64 optimized app 與 importer 均建置成功；installer/uninstaller parser 與 plan-only 檢查通過。
+- 實際 installer dry-run 回報 `import=2, added=2`，未讀憑證；零 UI 後 apply 回報 **2 imported／2 added／2 keys copied／0 missing**。目的 metadata 備份：`provider_store.before-custom-import-3edda9a6-66ca-42d9-8310-cea4d03e6d4d.json`。來源 settings/provider JSON hash 未變，正式 settings/prompt-history/shortcuts/conversations 的 existence+file hashes 未變。沒有 Save API／Send／登入／顯示金鑰／試呼叫 provider。
+- 安裝版 SHA-256：`4AC338E38A29240DE93F83016C2FB1E8491E20CBD9114A705FD60817279A5A21`。installed manifest/hash、兩個 shortcut targets、`PopChat Windows` 0.1.0 Installed apps 註冊均核對。唯一 PID **11472**、exe 路徑與 boot log 的正式 profile／`isolated=false` 一致；兩個 custom ID/name/baseURL/defaultModel 唯讀比對仍原樣。親自讀取 `installed-default-profile.png`：正式資料目錄、米黃 Auto、原 Custom 與遮罩 key 可見；沒有點欄位或按鈕。這證明安裝／資料路徑／本機 credential 讀取，不是真實 provider 或原生注音完整驗收。
+- Source profile／credential 與舊 dev exe 都保留以利復原；正常日後開啟請用桌面／開始功能表或安裝 exe（無 profile override）。相同正式 profile 的 direct exe 啟動不再依賴舊 temp namespace。未執行卸載；卸載程式只移除識別的 app/shortcuts/registry，保留 profile、credential、license 及執行檔備份。
+
+### 2026-11-02：微軟注音／官方圖示／服務資料目錄與新模型
+
+以下為安裝前的整合／暫時切回舊 profile 歷史；其中等待永久資料處理決定的限制，已由上一節使用者明確選擇的 custom-only 正式匯入取代。
+
+- `Composer::show/show_expanded → ime_blocks_return/ime_text_edit`：組字／Commit frame 將 multiline `TextEdit::return_key(None)`，不只阻止 Send；確認 Enter 按住到 key-up 前的 repeat 也不會插換行。兩種 editor 同一 TextEdit ID／cursor／undo；IME preedit 的 selection 僅局部透明、原字色＋可裁切底線，一般選取反白不變。
+- 18 個 composer focused tests 通過，涵蓋候選 Enter／修飾鍵／同幀事件前後順序／repeat、放開後正常 Enter／expanded Ctrl+Enter、Shift+Enter／貼上換行、cancel／focus-loss latch、bottom-panel discard、light/dark preedit／一般 selection。首次失敗僅新測試錯把已定義的 Send trim 當作保留尾端換行；修正 expectation，沒有改送出契約。
+- `icons::button` 的 14 個控制項改用 **Font Awesome Free 6.7.2 Solid** 官方 SVG（固定 upstream commit `af620534bfc3c2d4cbefcfeec29603bbe7809e64`），資產／LICENSE／NOTICE／mapping 在 `assets/font-awesome/`。使用既有 resvg，28pt targets／16pt mask，32／64／128px 有界 per-context cache（至多 42 entries），palette tint 不新增 cache。品牌 mark 非控制圖示，仍獨立。4 個圖示測試驗證 hashes/license、非空白 white masks、cache 上界與 font-free targets。
+- 上述 IME／icons source 的 fmt/check/all-target tests 通過，無 warning：**444 library passed、2 ignored、23 binary passed**；button-review release 成功並 hash-checked 安裝 canonical exe。`fontawesome-ime-handoff.png` 已親自查看：正式圖示／米黃／字體／90% 背景正常。**後續 provider/model 修正尚不包含在這組測試／此執行檔。**
+- 原生 IME 工具僅預備，未送 `su3/Down/Enter`：準備 expanded empty fixture 時，視窗在下一張截圖已是 Settings；一次座標點擊開了 provider 下拉，沒有選 provider 或 Save，下一次因前景改變被 guard 拒絕，立即停止。沒有 Ctrl+Enter／Send／組字注入，不把合成 egui 測試或 HKL `04040404` 當真實 Microsoft Bopomofo 驗收。
+- 使用者確認「自訂服務儲存成功後重啟就不見」。只讀 JSON validity／counts／timestamps：預設 `%APPDATA%\\PopChat\\PopChat\\config` 為 **5 providers／0 custom**；舊 `popchat-continue-ed0db767337e4372bd54930d21e5aa53` 為 **7 providers／2 custom**。未讀取／輸出憑證，不顯示 endpoint/key。舊目錄並非已證明丟失；兩份 profiles 混用是具體線索，使用者同意先切回舊目錄確認，不代表同意合併或永久預設變更。
+- 發現本機升級 script 將預設 config path 也設為 `POPCHAT_DATA_DIR`，雖 JSON path 相同，`credential_account` 卻會用隔離 namespace。已改 script：預設 profile 清除 override，自訂 profile 才保留 override。沒有搬移／重寫憑證；下一次啟動加 PID/exe/profile metadata，Settings 顯示實際資料目錄以利核對。
+- Provider load 原本把 read/decode errors 當 fresh install 並立即 save，存在原檔覆寫風險；正在加入 read-only recovery guard／可見錯誤。另將已 Save 的 editor model 與 live selected model 分開持久化，避免重開顯示舊／空 model，又不讓 Save 偷換 live routing。測試及原生邊界將另補。
+- 官方模型資料（2026-11-02 讀取）：<https://learn.chatgpt.com/docs/models>；GPT-5.5（10/14）、GPT-5.4/mini（8/31）、Spark（9/14）已退出 ChatGPT-authenticated Codex，與 API key 路由不同。更新訂閱 snapshot 為 `gpt-6.1-sol`、`gpt-6.1-terra`、`gpt-6-astra`、`gpt-6-luna`；reasoning 參照各官方 API model page，只暴露 low/medium/high/xhigh/max。這是離線 catalog 更新，非向使用者帳號查模型／試送訊息，不保證每個 plan/workspace 都有權限。
+- **最終整合 source：** fmt／all-target check／all-target tests 無 warning 通過：**455 library passed、2 ignored、23 binary passed**，x64 button-review release 成功。額外保留 newer/account-specific 手動 model ID，僅已知 retired 訂閱型號 fallback，避免離線清單過期又抹掉新選項；API/custom 的 ID、catalog、default/live model 不受訂閱遷移影響。
+- Provider roundtrip tests 覆蓋 custom UUID／所有 maps／`settings_models` 與 live 選擇分離、legacy 無新欄位、stale UUID；錯誤 JSON／錯 schema／無效 UUID／缺欄位／read failure 均保留原檔並阻止之後 unchecked/background saves。main 在 Save／legacy migration／provider settings actions 前守衛，並在 UI 顯示錯誤；Settings 顯示實際 profile path。
+- 在兩個 profile 各以 `provider_store.before-recovery-20261102T040923515Z.json` 做 hash-verified 同目錄備份（不備份／輸出憑證），才依使用者同意 WM_CLOSE PID 34388／等待退出／確認零實例，hash-verified 安裝新 canonical release，使用舊 profile 並帶 `--settings` 啟動唯一 **PID 5048**。`restored-custom-current-models.png` 已親自查看：Dark、原有 Custom、endpoint 及遮罩金鑰、實際目錄標示可見，未點顯示／Save／登入／Send。
+- 升級後 wrapper 的 `$LASTEXITCODE -ne 0` 對未設值誤報失敗（PowerShell script 本身已回報新 PID）；沒有重跑升級或另啟 UI。再查進程確認唯一 PID 5048、boot log 的 PID/exe/profile 確切相符。唯讀 reload 與備份比較兩個 custom ID/name/baseURL/defaultModel 均保留；舊 profile 訂閱 known_models 已是四個現代型號。只是資料／外觀／路徑驗證，不是真實訂閱帳號全型號送出驗收。
+- **後續限制：** 使用者目前只同意切回舊目錄確認，沒有同意將資料合併、移到正式預設目錄或設永久 profile 指標。直接開 exe 的預設 profile 目前仍是原先預設目錄；確認兩個服務身分後，仍須取得永久固定／遷移方式決定，避免下次從不同啟動方式又看到另一份清單。原生注音輸入仍未完成驗收，不能以本輪 headless tests 替代。
 
 ### 完整已安裝字體／米黃淺色
 

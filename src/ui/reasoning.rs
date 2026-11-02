@@ -199,9 +199,9 @@ impl WaitingView {
                     }
                     if thinking {
                         let help = if self.expanded {
-                            "Show less thinking"
+                            "收合思考內容"
                         } else {
-                            "Show more thinking"
+                            "展開思考內容"
                         };
                         let (rect, response) =
                             ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
@@ -218,7 +218,7 @@ impl WaitingView {
                             if self.expanded { -1.0 } else { 1.0 },
                             secondary,
                         );
-                        if response.on_hover_text(help).clicked() {
+                        if super::icons::hover_help(response, help).clicked() {
                             self.expanded = !self.expanded;
                         }
                     }
@@ -247,7 +247,7 @@ impl WaitingView {
         changed: bool,
         first_text: bool,
     ) -> egui::scroll_area::ScrollAreaOutput<()> {
-        let font = egui::FontId::proportional(THINKING_FONT_SIZE);
+        let font = egui::FontId::proportional(super::typography::scaled(ui, THINKING_FONT_SIZE));
         let line_height = ui.fonts(|f| f.row_height(&font)).ceil();
         let lines = if self.expanded {
             EXPANDED_LINES
@@ -419,11 +419,11 @@ pub fn show_disclosure(ui: &mut egui::Ui, id: egui::Id, text: &str, math: &mut M
             secondary,
         );
         let help = if expanded {
-            "Hide the model's thinking"
+            "收合模型思考內容"
         } else {
-            "Show the model's thinking"
+            "展開模型思考內容"
         };
-        if response.on_hover_text(help).clicked() {
+        if super::icons::hover_help(response, help).clicked() {
             expanded = !expanded;
             ui.ctx().data_mut(|d| d.insert_temp(key, expanded));
         }
@@ -468,6 +468,62 @@ pub fn show_disclosure(ui: &mut egui::Ui, id: egui::Id, text: &str, math: &mut M
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_sizes_scale_thinking_glyphs_and_three_or_twelve_line_viewports_together() {
+        for appearance in ["light", "dark"] {
+            for width in [320.0, 520.0] {
+                for size in [12, 14, 15, 20, 24] {
+                    let ctx = context();
+                    super::super::theme::apply(
+                        &ctx,
+                        appearance,
+                        super::super::theme::DEFAULT_ACCENT_HEX,
+                    );
+                    let mut waiting = WaitingView::default();
+                    let text = "Thinking text with wrapping and multiple rows. ".repeat(30);
+                    for expanded in [false, true] {
+                        waiting.expanded = expanded;
+                        let mut expected_height = 0.0;
+                        let mut raw = input(0.0, vec![]);
+                        raw.screen_rect = Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 1600.0),
+                        ));
+                        let output = ctx.run(raw, |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                super::super::typography::apply(ui, size);
+                                let font = egui::FontId::proportional(
+                                    super::super::typography::scaled(ui, THINKING_FONT_SIZE),
+                                );
+                                expected_height = ui.fonts(|fonts| fonts.row_height(&font)).ceil()
+                                    * if expanded { 12.0 } else { 3.0 }
+                                    + 4.0;
+                                waiting.show(ui, "Connecting", Some(&text));
+                            });
+                        });
+                        assert_eq!(waiting.previous_viewport_height, expected_height);
+                        let shapes = texts(&output);
+                        let body = shapes
+                            .iter()
+                            .find(|shape| shape.galley.text() == text)
+                            .unwrap();
+                        assert!(
+                            (body.galley.job.sections[0].format.font_id.size
+                                - THINKING_FONT_SIZE * super::super::typography::scale(size))
+                            .abs()
+                                < 0.001
+                        );
+                        let header = shapes
+                            .iter()
+                            .find(|shape| shape.galley.text() == "Thinking")
+                            .unwrap();
+                        assert_eq!(header.galley.job.sections[0].format.font_id.size, 13.0);
+                    }
+                }
+            }
+        }
+    }
 
     fn input(time: f64, events: Vec<egui::Event>) -> egui::RawInput {
         egui::RawInput {

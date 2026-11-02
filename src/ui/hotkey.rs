@@ -41,6 +41,30 @@ pub fn normalize_binding(binding: &str) -> Result<String> {
     Ok(parse_binding(binding)?.label)
 }
 
+/// Convert a recorded egui key using the parser's exact allowlist and validation.
+/// `command` is deliberately ignored: on Windows it aliases Ctrl, not Win.
+/// The caller can augment `mac_cmd` with the native Windows-key state.
+pub fn binding_from_key(key: egui::Key, mods: egui::Modifiers) -> Result<String> {
+    let name = main_keys()
+        .iter()
+        .find(|(_, _, local)| *local == key)
+        .map(|(name, _, _)| *name)
+        .context("此按鍵不支援作為全域快捷鍵")?;
+    let mut parts = Vec::new();
+    for (down, label) in [
+        (mods.ctrl, "Ctrl"),
+        (mods.alt, "Alt"),
+        (mods.shift, "Shift"),
+        (mods.mac_cmd, "Win"),
+    ] {
+        if down {
+            parts.push(label);
+        }
+    }
+    parts.push(name);
+    normalize_binding(&parts.join("+"))
+}
+
 fn parse_binding(binding: &str) -> Result<Binding> {
     let mut tokens = binding.split('+').map(str::trim).peekable();
     let mut mods = Modifiers::empty();
@@ -251,6 +275,7 @@ pub struct HotkeyManager {
     /// 必須留存：drop 會取消註冊。
     _manager: GlobalHotKeyManager,
     current_id: Arc<AtomicU32>,
+    suppressed: Arc<AtomicBool>,
     registration: Registration,
     rx: Receiver<HotkeyEvent>,
     stop: Arc<AtomicBool>,
@@ -273,15 +298,18 @@ impl HotkeyManager {
         let (tx_ui, rx_ui) = mpsc::channel::<HotkeyEvent>();
         let (tx_drv, rx_drv) = mpsc::channel::<HotkeyEvent>();
         let current = current_id.clone();
+        let suppressed = Arc::new(AtomicBool::new(false));
+        let watcher_suppressed = suppressed.clone();
         let stop = Arc::new(AtomicBool::new(false));
         let watcher_stop = stop.clone();
         let watcher = std::thread::Builder::new()
             .name("popchat-hotkey".to_owned())
-            .spawn(move || watch_loop(current, watcher_stop, tx_ui, tx_drv))
+            .spawn(move || watch_loop(current, watcher_stop, watcher_suppressed, tx_ui, tx_drv))
             .context("啟動熱鍵監聽執行緒失敗")?;
         let mut this = Self {
             _manager: manager,
             current_id,
+            suppressed,
             registration: Registration::new(configured),
             rx: rx_ui,
             stop,
@@ -322,6 +350,14 @@ impl HotkeyManager {
         self.registration.last_error.as_deref()
     }
 
+    /// Share with the recorder AND visibility-driver. The recorder sets this
+    /// immediately when armed, before the next OS hotkey can be forwarded.
+    /// The driver must also check it when consuming already queued toggles.
+    /// Suppression never unregisters a binding or changes registration state.
+    pub fn suppression_flag(&self) -> Arc<AtomicBool> {
+        self.suppressed.clone()
+    }
+
     /// 在 UI 本地快捷鍵處理之前呼叫，避免同一個 press 又觸發面板內動作。
     /// 只移除目前生效組合的主鍵 press；不修改 release、modifier 或其他輸入。
     pub fn consume_local_binding(&self, ctx: &egui::Context) {
@@ -354,7 +390,7 @@ fn consume_binding_events(events: &mut Vec<egui::Event>, binding: &Binding, win_
 // cannot distinguish Ctrl+P from Win+Ctrl+P. Read the UI thread's key state;
 // never consume a Win binding using a guessed/aliased egui command modifier.
 #[cfg(windows)]
-fn windows_key_down() -> bool {
+pub(super) fn windows_key_down() -> bool {
     #[link(name = "user32")]
     extern "system" {
         fn GetKeyState(virtual_key: i32) -> i16;
@@ -364,7 +400,7 @@ fn windows_key_down() -> bool {
 }
 
 #[cfg(not(windows))]
-fn windows_key_down() -> bool {
+pub(super) fn windows_key_down() -> bool {
     false
 }
 
@@ -383,6 +419,7 @@ impl Drop for HotkeyManager {
 fn watch_loop(
     current: Arc<AtomicU32>,
     stop: Arc<AtomicBool>,
+    suppressed: Arc<AtomicBool>,
     tx_ui: Sender<HotkeyEvent>,
     tx_drv: Sender<HotkeyEvent>,
 ) {
@@ -392,7 +429,7 @@ fn watch_loop(
             continue;
         };
         let id = current.load(Ordering::SeqCst);
-        if is_active_press(id, event.id(), event.state()) {
+        if should_forward(id, event.id(), event.state(), &suppressed) {
             let ui_gone = tx_ui.send(HotkeyEvent::Toggle).is_err();
             let drv_gone = tx_drv.send(HotkeyEvent::Toggle).is_err();
             if ui_gone && drv_gone {
@@ -400,6 +437,15 @@ fn watch_loop(
             }
         }
     }
+}
+
+fn should_forward(
+    current_id: u32,
+    event_id: u32,
+    state: HotKeyState,
+    suppressed: &AtomicBool,
+) -> bool {
+    !suppressed.load(Ordering::SeqCst) && is_active_press(current_id, event_id, state)
 }
 
 fn is_active_press(current_id: u32, event_id: u32, state: HotKeyState) -> bool {
@@ -525,6 +571,52 @@ mod tests {
                 format!("F{n}")
             );
         }
+    }
+
+    #[test]
+    fn recorder_conversion_uses_same_allowlist_and_canonical_modifiers() {
+        for (name, _, key) in main_keys() {
+            assert_eq!(
+                binding_from_key(*key, egui::Modifiers::CTRL).unwrap(),
+                format!("Ctrl+{name}")
+            );
+        }
+        let all = egui::Modifiers {
+            ctrl: true,
+            alt: true,
+            shift: true,
+            mac_cmd: true,
+            command: true,
+        };
+        assert_eq!(
+            binding_from_key(egui::Key::ArrowDown, all).unwrap(),
+            "Ctrl+Alt+Shift+Win+Down"
+        );
+        assert!(binding_from_key(egui::Key::A, egui::Modifiers::NONE).is_err());
+        assert!(binding_from_key(egui::Key::Space, egui::Modifiers::ALT).is_err());
+        assert!(binding_from_key(egui::Key::F25, egui::Modifiers::CTRL).is_err());
+        assert!(binding_from_key(
+            egui::Key::P,
+            egui::Modifiers {
+                command: true,
+                ..Default::default()
+            }
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn recording_suppresses_active_driver_events_without_touching_registration() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let watcher_flag = flag.clone();
+        assert!(should_forward(42, 42, HotKeyState::Pressed, &watcher_flag));
+        flag.store(true, Ordering::SeqCst);
+        for _ in 0..5 {
+            assert!(!should_forward(42, 42, HotKeyState::Pressed, &watcher_flag));
+        }
+        flag.store(false, Ordering::SeqCst);
+        assert!(should_forward(42, 42, HotKeyState::Pressed, &watcher_flag));
+        assert!(!should_forward(42, 41, HotKeyState::Pressed, &watcher_flag));
     }
 
     #[test]
