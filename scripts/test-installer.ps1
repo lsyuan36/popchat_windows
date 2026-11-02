@@ -20,8 +20,30 @@ Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
 using System.Text;
 public static class PopChatInstallerTestPath {
+    [ComImport, Guid("000214F9-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IShellLinkW {
+        void GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder path, int count, IntPtr findData, uint flags);
+        void GetIDList(out IntPtr list);
+        void SetIDList(IntPtr list);
+        void GetDescription([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder text, int count);
+        void SetDescription([MarshalAs(UnmanagedType.LPWStr)] string text);
+        void GetWorkingDirectory([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder path, int count);
+    }
+    public static string[] ReadShortcut(string path) {
+        object obj = Activator.CreateInstance(Type.GetTypeFromCLSID(new Guid("00021401-0000-0000-C000-000000000046")));
+        try {
+            ((IPersistFile)obj).Load(path, 0);
+            var link = (IShellLinkW)obj;
+            var target = new StringBuilder(32768);
+            var working = new StringBuilder(32768);
+            link.GetPath(target, target.Capacity, IntPtr.Zero, 0);
+            link.GetWorkingDirectory(working, working.Capacity);
+            return new string[] { target.ToString(), working.ToString() };
+        } finally { Marshal.FinalReleaseComObject(obj); }
+    }
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     static extern uint GetLongPathName(string path, StringBuilder buffer, uint length);
     public static string Normalize(string path) {
@@ -80,8 +102,12 @@ for ($pass = 0; $pass -lt 2; $pass++) {
             shortcut=$shortcut; target=$link.TargetPath; working=$link.WorkingDirectory
             expected_target=(Join-Path $dir 'popchat_windows.exe'); expected_working=$dir
         } | ConvertTo-Json -Compress))
-        $target = [PopChatInstallerTestPath]::Normalize($link.TargetPath)
-        $working = [PopChatInstallerTestPath]::Normalize($link.WorkingDirectory)
+        # Read the actual Unicode ShellLink, without WSH's legacy ANSI path
+        # conversion. This is the same native interface Windows Explorer uses.
+        $wide = [PopChatInstallerTestPath]::ReadShortcut($shortcut)
+        Write-Output ("NSIS_SHORTCUT_UNICODE " + (@{ target=$wide[0]; working=$wide[1] } | ConvertTo-Json -Compress))
+        $target = [PopChatInstallerTestPath]::Normalize($wide[0])
+        $working = [PopChatInstallerTestPath]::Normalize($wide[1])
         $expectedTarget = [PopChatInstallerTestPath]::Normalize((Join-Path $dir 'popchat_windows.exe'))
         $expectedWorking = [PopChatInstallerTestPath]::Normalize($dir)
         if ($target -ne $expectedTarget -or $working -ne $expectedWorking) {
