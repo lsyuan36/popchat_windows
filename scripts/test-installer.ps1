@@ -76,6 +76,10 @@ for ($pass = 0; $pass -lt 2; $pass++) {
     if ($registration.InstallLocation -ne $dir -or $registration.Publisher -ne 'Evis Lai') { throw 'Installed apps registration mismatch.' }
     foreach ($shortcut in $shortcuts) {
         $link = $shell.CreateShortcut($shortcut)
+        Write-Output ("NSIS_SHORTCUT_RAW " + (@{
+            shortcut=$shortcut; target=$link.TargetPath; working=$link.WorkingDirectory
+            expected_target=(Join-Path $dir 'popchat_windows.exe'); expected_working=$dir
+        } | ConvertTo-Json -Compress))
         $target = [PopChatInstallerTestPath]::Normalize($link.TargetPath)
         $working = [PopChatInstallerTestPath]::Normalize($link.WorkingDirectory)
         $expectedTarget = [PopChatInstallerTestPath]::Normalize((Join-Path $dir 'popchat_windows.exe'))
