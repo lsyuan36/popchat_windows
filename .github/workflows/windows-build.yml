@@ -1,4 +1,4 @@
-name: Build Windows EXE
+name: Build Windows NSIS Installer
 
 on:
   workflow_dispatch:
@@ -22,7 +22,7 @@ concurrency:
 
 jobs:
   windows-x64:
-    name: Windows x64 · LOCAL BUILD
+    name: Windows x64 NSIS · LOCAL BUILD
     runs-on: windows-2022
     timeout-minutes: 60
     defaults:
@@ -108,12 +108,38 @@ jobs:
           cargo test --locked --release --target x86_64-pc-windows-msvc --target-dir target/button-review --lib updater::tests::release_zip_matches_updater_contract -- --ignored --exact --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Upload EXEs with required notices
+      - name: Download pinned NSIS compiler
+        id: nsis
+        run: |
+          & .\scripts\get-nsis.ps1 -Destination (Join-Path $env:RUNNER_TEMP 'nsis-3.11')
+
+      - name: Compile NSIS Setup.exe
+        id: installer
+        env:
+          PACKAGE_DIR: ${{ steps.package.outputs.package_dir }}
+          NSIS_COMPILER: ${{ steps.nsis.outputs.compiler }}
+        run: |
+          & .\scripts\package-installer.ps1 -PackageDirectory $env:PACKAGE_DIR -MakeNsis $env:NSIS_COMPILER
+
+      - name: Test NSIS install, reinstall and uninstall
+        env:
+          PACKAGE_DIR: ${{ steps.package.outputs.package_dir }}
+          INSTALLER_DIR: ${{ steps.installer.outputs.installer_dir }}
+        run: |
+          $setup = @(Get-ChildItem -LiteralPath $env:INSTALLER_DIR -Filter '*-Setup.exe' -File)
+          if ($setup.Count -ne 1) { throw 'Expected one production NSIS installer.' }
+          & .\scripts\test-installer.ps1 -Installer $setup[0].FullName -PackageDirectory $env:PACKAGE_DIR
+
+      - name: Upload NSIS installer
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: PopChat-Windows-x64-EXE
-          path: ${{ steps.package.outputs.package_dir }}/staging/
+          name: PopChat-Windows-x64-NSIS
+          path: |
+            ${{ steps.installer.outputs.installer_dir }}/*-Setup.exe
+            ${{ steps.installer.outputs.installer_dir }}/SHA256SUMS-Setup.txt
+            ${{ steps.installer.outputs.installer_dir }}/installer-manifest.json
           if-no-files-found: error
+          compression-level: 0
           retention-days: 14
 
       - name: Upload complete release package
@@ -137,8 +163,10 @@ jobs:
           ## PopChat $env:BUILD_VERSION — LOCAL BUILD
           Author: **Evis Lai**
 
-          - **PopChat-Windows-x64-EXE**: main EXE, updater EXE and required notices.
-          - **PopChat-Windows-x64-Release**: portable ZIP, SHA256SUMS and release manifest.
+          - **PopChat-Windows-x64-NSIS**: NSIS Setup.exe, SHA-256 and installer manifest (recommended).
+          - Setup installs per-user, creates shortcuts and an uninstaller; user data is preserved.
+          - Fresh install, Unicode path, reinstall and uninstall tested without launching the chat UI.
+          - **PopChat-Windows-x64-Release**: ZIP retained for the existing in-app updater.
           - Source commit: $env:BUILD_COMMIT
           - Windows x64, unsigned. No installed TT Norms Pro or Arial files are bundled.
           "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8

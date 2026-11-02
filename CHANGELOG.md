@@ -10,6 +10,8 @@ Windows Rust 移植／維護：**Evis Lai**。
 - 支援程式內下載更新，驗證 GitHub 資產 SHA-256，經使用者確認後以獨立
   Rust 更新助手等待目前程式退出、安裝並重新啟動；保留偏好、服務與歷史。
 - 發行檔為 Windows x64 ZIP，包含聊天程式、更新助手及第三方授權聲明。
+- 補充 NSIS Setup.exe 安裝包：目前使用者安裝、捷徑、Installed apps 卸載項目，
+  保留設定／歷史／憑證。Actions 直接編譯 NSIS，ZIP 仍保留給程式內更新。
 - 內建獅尾圓體中文預設；英文預設優先使用已安裝的 TT Norms Pro，再使用 Arial。
   **不散佈 TT Norms Pro 或 Arial。**
 - 新增 12–24 pt 聊天文字大小、快捷鍵錄製、分組鍵帽式快捷鍵清單。
@@ -19,7 +21,10 @@ Windows Rust 移植／維護：**Evis Lai**。
 
 ## 下載
 
-下載 **`PopChat-Windows-x64.zip`**，完整解壓縮後執行 `popchat_windows.exe`。
+建議下載 **`PopChat-0.2.0-Windows-x64-Setup.exe`**，先結束系統匣的 PopChat 再安裝。
+不需管理員權限，不會自動啟動程式或啟用開機啟動；卸載保留使用者資料與備份。
+
+也可下載 **`PopChat-Windows-x64.zip`**，完整解壓縮後執行 `popchat_windows.exe`。
 `popchat_updater.exe` 必須保留在同一資料夾；不需系統管理員權限。
 `SHA256SUMS.txt` 與 `release-manifest.json` 提供檔案雜湊和來源 commit。
 

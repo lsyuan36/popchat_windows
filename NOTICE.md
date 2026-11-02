@@ -27,6 +27,10 @@ not imply endorsement by its author.
   remain with their respective rights holders.
 - Rust dependencies and other embedded fonts have their own licenses; see
   `THIRD_PARTY_NOTICES.md` and `licenses/dependencies` in the release archive.
+- The Windows Setup/uninstaller uses unmodified **NSIS 3.11** components.
+  Its upstream copyright and license terms (including the LZMA linking
+  exception) are installed at `licenses/nsis/COPYING`. NSIS source is available
+  at https://sourceforge.net/projects/nsis/files/NSIS%203/3.11/ .
 
 The application's MIT license does not replace third-party licenses.
 LOCAL BUILD binaries are not code-signed. A SHA-256 digest verifies file

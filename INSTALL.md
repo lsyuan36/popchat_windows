@@ -49,7 +49,31 @@ executables before closing the current app, and records their hashes in the
 installation manifest. Release documentation and third-party notices are copied
 with the binaries. It does not run the in-app updater during development updates.
 
-## Public ZIP and in-app updates
+## NSIS Setup and in-app updates
+
+The recommended download is `PopChat-VERSION-Windows-x64-Setup.exe`, a real
+Unicode NSIS installer built by `.github/workflows/windows-build.yml`.
+It installs per-user to `%LOCALAPPDATA%\Programs\PopChat` (or the selected
+writable directory), creates desktop/Start menu shortcuts and a Windows
+Installed apps entry. No elevation, startup enablement, profile import or
+automatic application launch occurs. Close PopChat using its tray menu first;
+Setup refuses to overwrite a running target and never kills it.
+
+Uninstall removes only the packaged file list and its own registration;
+settings/history/credentials, unknown files and update backups are kept.
+NSIS emits a BOM-free UTF-8 manifest compatible with the existing Rust updater,
+including installation paths containing Chinese characters. Reinstall keeps
+the previous executables/manifest in a `.popchat-before-nsis-*` backup folder.
+Setup is not a transactional updater: on extraction failure, keep the backup
+and retry after fixing the file lock or disk-space problem.
+
+Local compiler/download: `scripts/get-nsis.ps1` pins the official NSIS 3.11 ZIP
+and SHA-256. Run `scripts/package-installer.ps1 -PackageDirectory <release-dir>`
+with NSIS on PATH, or pass `-MakeNsis <compiler-path>`. The staging files must
+match the validated release ZIP. For isolated local validation, compile with
+`-TestInstaller` and pass that switch to `scripts/test-installer.ps1`; test-only
+registration and shortcut names cannot overwrite the live installation.
+The CI runner tests the actual production Setup without launching a chat UI.
 
 New users can download `PopChat-Windows-x64.zip` from this repository's Releases,
 extract all files to a writable directory, and run `popchat_windows.exe`.

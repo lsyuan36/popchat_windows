@@ -12,11 +12,16 @@
 ## 下載與啟動
 
 從 **[本專案 Releases](https://github.com/lsyuan36/popchat_windows/releases/latest)**
-下載 `PopChat-Windows-x64.zip`。
+下載 **`PopChat-0.2.0-Windows-x64-Setup.exe`**（NSIS 安裝程式）。
 
-1. 將整個 ZIP 解壓縮到有寫入權限的資料夾。
-2. 保留 `popchat_windows.exe`、`popchat_updater.exe` 和授權文件在同一個資料夾。
-3. 執行 `popchat_windows.exe`，在設定中加入服務、端點與模型。
+1. 先從系統匣結束正在執行的 PopChat，再執行 Setup。
+2. 預設安裝至 `%LOCALAPPDATA%\Programs\PopChat`，只影響目前使用者。
+3. 透過桌面／開始功能表捷徑啟動，在設定中加入服務、端點與模型。
+
+安裝程式建立 Windows「已安裝的應用程式」卸載項目，不自動啟動程式或啟用開機啟動。
+卸載保留設定、服務、憑證、聊天歷史、更新備份與非安裝包的檔案。
+另保留 `PopChat-Windows-x64.zip` 供便攜使用及程式內更新；使用 ZIP 時須完整解壓，
+並將主程式、更新助手和授權文件放在一起。
 
 請勿直接在 ZIP 內執行，也不需要以系統管理員身分執行。
 目前提供 **Windows x64** LOCAL BUILD；執行檔尚未進行程式碼簽章，
@@ -96,22 +101,30 @@ cargo build --locked --release --bins --target x86_64-pc-windows-msvc --target-d
 ```
 
 開發工作樹的使用者層級安裝／自訂服務匯入流程見 [INSTALL.md](INSTALL.md)。
-新使用者不需要執行該匯入流程；使用發行 ZIP 即可。
+新使用者不需要執行該匯入流程；使用 NSIS Setup 即可。
 
-## GitHub Actions 直接打包 EXE
+## GitHub Actions 打包 NSIS 安裝程式
 
-到 **[Actions → Build Windows EXE](https://github.com/lsyuan36/popchat_windows/actions/workflows/windows-build.yml)**
+到 **[Actions → Build Windows NSIS Installer](https://github.com/lsyuan36/popchat_windows/actions/workflows/windows-build.yml)**
 按 **Run workflow**。`build_ref` 留空會建置目前分支，也可指定 tag／commit。
 推送 `main`、`v*` tag 或建立 PR 時也會自動執行。
 
 成功後，在該次工作流程頁面的 **Artifacts** 下載：
 
-- **PopChat-Windows-x64-EXE**：`popchat_windows.exe`、`popchat_updater.exe` 與必要授權文件。
-- **PopChat-Windows-x64-Release**：完整發行 ZIP、`SHA256SUMS.txt` 和來源 manifest。
+- **PopChat-Windows-x64-NSIS**：**`PopChat-版本-Windows-x64-Setup.exe`**、SHA-256 和 installer manifest。
+- **PopChat-Windows-x64-Release**：程式內更新所需的 ZIP、SHA-256 和來源 manifest。
 
 使用 GitHub 的 Windows 2022／MSVC runner 和 Rust stable，不需要自行安裝字體、
-提供 API 金鑰或在 runner 開啟桌面 UI。流程驗證更新安全測試與真正的 ZIP，
+提供 API 金鑰或在 runner 開啟桌面 UI。流程下載並核對固定 NSIS 3.11 compiler SHA-256，
+編譯真正的 NSIS Setup，並測試中文路徑安裝、重裝、捷徑、卸載與保留未知檔案／備份。
+另驗證更新安全測試與真正的 ZIP，
 不會自動發佈 Release 或修改使用者資料。Artifacts 保留 14 天；長期下載請使用 Releases。
+
+本機打包：先執行 `scripts/package-release.ps1`，再用 NSIS 3 compiler 執行：
+
+```powershell
+.\scripts\package-installer.ps1 -PackageDirectory target/releases/v0.2.0/<產生的目錄> -MakeNsis 'C:\Program Files (x86)\NSIS\makensis.exe'
+```
 
 ## 已知限制
 
