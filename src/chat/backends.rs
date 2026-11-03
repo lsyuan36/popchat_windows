@@ -47,6 +47,23 @@ impl Default for DelegatedBackend {
 }
 
 impl ChatBackend for DelegatedBackend {
+    fn start_with_mcp(
+        &self,
+        history: Vec<WireMessage>,
+        config: ProviderConfig,
+        web_access: Option<WebAccess>,
+        mcp: Option<super::mcp::McpTurn>,
+    ) -> mpsc::UnboundedReceiver<ChatStreamEvent> {
+        match config.kind {
+            ProviderKind::ChatGPT => self
+                .responses
+                .start_with_mcp(history, config, web_access, mcp),
+            ProviderKind::OpenAICompatible => {
+                client::run_with_mcp(history, config, web_access, mcp)
+            }
+            ProviderKind::CodexAppServer => self.start(history, config, web_access),
+        }
+    }
     fn start(
         &self,
         history: Vec<WireMessage>,

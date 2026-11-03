@@ -2,7 +2,7 @@
 
 輕量的 Windows 浮動 AI 聊天面板，以 **Rust + egui/eframe** 實作。
 
-**Windows 移植／維護：Evis Lai** · 目前版本：**0.2.1**
+**Windows 移植／維護：Evis Lai** · 目前版本：**0.2.2**
 
 > 本專案移植自 **Le Chen / lec77** 的 macOS 專案
 > **[lec77/PopChat](https://github.com/lec77/PopChat)**。
@@ -11,10 +11,10 @@
 
 ## 下載與啟動
 
-從 **[GitHub Releases](https://github.com/lsyuan36/popchat_windows/releases/tag/v0.2.1)**
-下載 **`PopChat-0.2.1-Windows-x64-Setup.exe`**（NSIS 安裝程式）。
-本次 **0.2.1 修訂重發包**加入 Auto Compact；若先前已安裝 0.2.1，
-請重新下載 Setup 安裝，因版本相同不會自動提示更新。請以新版 manifest／SHA-256 識別修訂包。
+從 **[GitHub Releases](https://github.com/lsyuan36/popchat_windows/releases/tag/v0.2.2)**
+下載 **`PopChat-0.2.2-Windows-x64-Setup.exe`**（NSIS 安裝程式）。
+**0.2.2** 加入 MCP 與繁體中文內建提示詞，並完整保留 Auto Compact。
+已安裝 0.2.1 的使用者可用程式內更新，或先結束 PopChat 再執行新版 Setup 升級。
 0.2.0 Setup 的首次安裝路徑問題已於 0.2.1 修正，請優先使用新版。
 
 1. 先從系統匣結束正在執行的 PopChat，再執行 Setup。
@@ -86,11 +86,21 @@ ChatGPT／Codex 整合的可用性取決於帳號、方案、外部工具及服�
 按「使用預設」可移除此模型的覆寫。
 
 「儲存此模型上限」只保存該項偏好，不會提交端點／金鑰／模型選擇草稿。
-這不是單次回答的 `max_tokens`。**0.2.1 修訂重發包**接入前景 Auto Compact：
+這不是單次回答的 `max_tokens`。**0.2.2 沿用 0.2.1 修訂版的前景 Auto Compact**：
 保留完整歷史，以摘要 checkpoint 搭配近期原文送出，並提供 usage 記錄、取消與有界超限恢復。
 摘要會額外使用目前模型的額度。圖片／原始 PDF 不會被摘要丟棄；若無法安全縮減則停止送出。
 Codex app-server 沿用其原生上下文管理。實作邊界與隔離驗證見 [AUTO_COMPACT.md](https://github.com/lsyuan36/popchat_windows/blob/main/AUTO_COMPACT.md)。
-原先的 0.2.1 安裝包只有預算設定；既有安裝需重新下載更新，不會因原始碼改動自行變更。
+原先的 0.2.1 初始包只有預算設定；0.2.2 已包含完整接線，既有安裝不會因原始碼改動自行變更。
+
+## MCP 與中文 system prompt
+
+0.2.2 支援 MCP stdio／Streamable HTTP、服務管理與每次工具執行確認。
+可以使用 `/mcp add {JSON}` 從對話開啟新增草稿；亦可在設定中允許模型以自然語言
+提出草稿。**草稿不會自動保存、啟用或連線**，憑證只在設定密碼欄輸入。
+聊天、摘要與各 backend 的內建指令改為繁體中文，自訂 prompt 不會被覆寫。
+使用方式、安全邊界及首版限制見 [MCP.md](https://github.com/lsyuan36/popchat_windows/blob/main/MCP.md)。
+0.2.1 安裝包不含 MCP；需升級至 0.2.2。Codex app-server 仍不啟用 MCP，
+HTTP 首版僅支援手動 Bearer token，不提供自動 OAuth 登入。
 
 ## 資料與隱私
 

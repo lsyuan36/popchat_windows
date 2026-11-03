@@ -295,11 +295,11 @@ struct AppServerSession {
 /// real app-server (and its pipes) alive, so bind the owned process tree to a
 /// kill-on-close Job Object. No shell/taskkill or unrelated process lookup.
 #[cfg(windows)]
-struct ChildJob(isize);
+pub(crate) struct ChildJob(isize);
 
 #[cfg(windows)]
 impl ChildJob {
-    fn new(child: &Child) -> anyhow::Result<Self> {
+    pub(crate) fn new(child: &Child) -> anyhow::Result<Self> {
         #[repr(C)]
         #[derive(Default)]
         struct BasicLimits {
@@ -1293,9 +1293,9 @@ async fn drive_history_inner(
     // Say nothing about network when web search is on: the old blanket
     // "no tool network access" line reads as an instruction not to search.
     let boundary = if config.web_search {
-        "You are serving a normal chat inside PopChat. Do not inspect local files, run shell commands, modify files, call MCP tools, spawn agents, or otherwise act on the user's computer. Answer from the conversation, using web search when the question needs current or external information. PopChat has started this thread with a read-only filesystem and no local tool network access."
+        "你正在 PopChat 中提供一般聊天服務，請優先使用繁體中文回覆，除非使用者指定其他語言。不得檢查本機檔案、執行 shell 指令、修改檔案、呼叫 MCP 工具、啟動其他代理，或以其他方式操作使用者電腦。請依對話回答；問題需要最新或外部資訊時，可以使用網路搜尋。PopChat 已將此執行緒設為唯讀檔案系統，且不允許本機工具連網。"
     } else {
-        "You are serving a normal chat inside PopChat. Do not inspect local files, run shell commands, modify files, call MCP tools, spawn agents, or otherwise act on the user's computer. Answer directly from the conversation. PopChat has started this thread with read-only filesystem and no tool network access."
+        "你正在 PopChat 中提供一般聊天服務，請優先使用繁體中文回覆，除非使用者指定其他語言。不得檢查本機檔案、執行 shell 指令、修改檔案、呼叫 MCP 工具、啟動其他代理，或以其他方式操作使用者電腦。請直接依對話回答。PopChat 已將此執行緒設為唯讀檔案系統，且不允許工具連網。"
     };
     let developer_instructions = [split.system_prompt.as_deref(), Some(boundary)]
         .into_iter()
@@ -1883,7 +1883,9 @@ fn main() {
         assert_eq!(thread["approvalPolicy"], "never");
         let instructions = thread["developerInstructions"].as_str().unwrap();
         assert!(instructions.starts_with("Be brief.\nUse facts.\n\n"));
-        assert!(instructions.contains("using web search when the question needs current"));
+        assert!(instructions.contains("問題需要最新或外部資訊時，可以使用網路搜尋"));
+        assert!(instructions.contains("不得檢查本機檔案"));
+        assert!(instructions.contains("呼叫 MCP 工具"));
         assert_eq!(
             params("thread/inject_items")["items"],
             json!([

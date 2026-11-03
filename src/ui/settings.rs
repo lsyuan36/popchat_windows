@@ -50,7 +50,10 @@ pub struct AppSettings {
     pub custom_accent_hex: String,
     pub search_engine: String,
     pub web_search_enabled: bool,
-    #[serde(default = "default_system_prompt")]
+    #[serde(
+        default = "default_system_prompt",
+        deserialize_with = "deserialize_system_prompt"
+    )]
     pub system_prompt: String,
     #[serde(default, skip_serializing)]
     pub search_engine_key: String,
@@ -97,6 +100,13 @@ fn default_true() -> bool {
 
 fn default_system_prompt() -> String {
     crate::chat::store::ChatStore::DEFAULT_SYSTEM_PROMPT.to_owned()
+}
+
+fn deserialize_system_prompt<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<String, D::Error> {
+    let text = String::deserialize(deserializer)?;
+    Ok(crate::chat::commands::localized_builtin_system_prompt(&text).to_string())
 }
 
 impl Default for AppSettings {
@@ -185,20 +195,23 @@ enum SettingsTab {
     Search,
     Commands,
     Hotkey,
+    Mcp,
 }
 
 impl SettingsTab {
-    const ALL: [(Self, &'static str); 5] = [
+    const ALL: [(Self, &'static str); 6] = [
         (Self::Service, "服務"),
         (Self::Appearance, "外觀"),
         (Self::Search, "搜尋"),
         (Self::Commands, "指令"),
         (Self::Hotkey, "快捷鍵"),
+        (Self::Mcp, "MCP"),
     ];
 }
 
 #[derive(Debug, Clone)]
 pub enum SettingsAction {
+    ManageMcp,
     /// Register with the OS first, then call `commit_hotkey_binding` on success.
     ChangeHotkey(String),
     InstallUpdate(crate::updater::PreparedUpdate),
@@ -821,6 +834,7 @@ impl SettingsUi {
                                     SettingsTab::Search => self.search_section(ui),
                                     SettingsTab::Commands => self.commands_section(ui),
                                     SettingsTab::Hotkey => self.hotkey_section(ui, runtime),
+                                    SettingsTab::Mcp => self.mcp_section(ui),
                                 }
                             });
                     });
@@ -1247,6 +1261,14 @@ impl SettingsUi {
                 model: model.to_owned(),
                 limit,
             });
+        }
+    }
+
+    fn mcp_section(&mut self, ui: &mut egui::Ui) {
+        ui.heading("MCP 工具服務");
+        ui.add(egui::Label::new("支援 stdio 與 Streamable HTTP。服務預設停用；對話可提出草稿，但須由你確認儲存。每次工具呼叫另行確認。憑證只在 MCP 設定輸入，不要貼進聊天。").wrap());
+        if ui.button("管理 MCP 服務／連線測試").clicked() {
+            self.actions.push(SettingsAction::ManageMcp);
         }
     }
 
@@ -2644,6 +2666,7 @@ mod tests {
                                     SettingsTab::Hotkey => {
                                         draft.hotkey_section(ui, runtime.handle())
                                     }
+                                    SettingsTab::Mcp => draft.mcp_section(ui),
                                 },
                             );
                             assert!(
@@ -3092,6 +3115,28 @@ mod tests {
                 .system_prompt,
             default_system_prompt()
         );
+    }
+
+    #[test]
+    fn only_exact_legacy_builtin_system_prompt_is_localized_on_load() {
+        let mut value = serde_json::to_value(AppSettings::default()).unwrap();
+        value["system_prompt"] =
+            serde_json::json!(crate::chat::commands::LEGACY_DEFAULT_SYSTEM_PROMPT_EN);
+        assert_eq!(
+            serde_json::from_value::<AppSettings>(value.clone())
+                .unwrap()
+                .system_prompt,
+            default_system_prompt()
+        );
+        for prompt in ["My custom English system prompt", "", "自訂提示詞"] {
+            value["system_prompt"] = serde_json::json!(prompt);
+            assert_eq!(
+                serde_json::from_value::<AppSettings>(value.clone())
+                    .unwrap()
+                    .system_prompt,
+                prompt
+            );
+        }
     }
 
     #[tokio::test]

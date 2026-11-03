@@ -14,6 +14,7 @@ pub mod icons;
 pub mod layout;
 pub mod markdown;
 pub mod math;
+pub mod mcp;
 pub mod panel;
 pub mod paste;
 pub mod preference_layout;

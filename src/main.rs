@@ -65,6 +65,7 @@ struct ActiveStream {
 }
 
 enum AppEvent {
+    McpApproval(popchat_windows::chat::mcp::ApprovalRequest),
     HistoryIndex(u64, HashMap<Uuid, String>),
     Loaded(u64, Uuid, Option<ResolvedConversation>),
     Attachments(u64, Vec<Attachment>, Vec<String>, bool),
@@ -161,7 +162,21 @@ fn update_confirmation_dialog(ctx: &egui::Context, version: &str, streaming: boo
     }
 }
 
+fn mcp_approval_is_current(
+    request: &popchat_windows::chat::mcp::ApprovalRequest,
+    conversation_id: Uuid,
+    assistant_id: Option<Uuid>,
+    services: &[popchat_windows::chat::mcp::Service],
+) -> bool {
+    !request.respond.is_closed()
+        && request.conversation_id == conversation_id
+        && assistant_id == Some(request.turn_id)
+        && services.iter().any(|s| s == &request.service && s.enabled)
+}
+
 struct PopChatApp {
+    mcp: popchat_windows::ui::mcp::McpUi,
+    mcp_approval: Option<popchat_windows::chat::mcp::ApprovalRequest>,
     chat: ChatStore,
     providers: ProviderStore,
     secrets: SecretStore,
@@ -376,6 +391,8 @@ impl PopChatApp {
 
         Self {
             chat,
+            mcp: popchat_windows::ui::mcp::McpUi::new(),
+            mcp_approval: None,
             providers,
             secrets,
             shortcuts,
@@ -750,6 +767,20 @@ impl PopChatApp {
     fn poll_background(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.events_rx.try_recv() {
             match event {
+                AppEvent::McpApproval(request) => {
+                    let current = mcp_approval_is_current(
+                        &request,
+                        self.chat.conversation_id,
+                        self.active_stream.as_ref().map(|a| a.turn.assistant_id),
+                        &self.mcp.store.servers,
+                    );
+                    if current && self.mcp_approval.is_none() && !request.respond.is_closed() {
+                        self.mcp_approval = Some(request);
+                        ctx.request_repaint();
+                    } else {
+                        let _ = request.respond.send(false);
+                    }
+                }
                 AppEvent::HistoryIndex(generation, corpus)
                     if generation == self.history_generation =>
                 {
@@ -959,6 +990,9 @@ impl PopChatApp {
                 }
             }
             match action {
+                SettingsAction::ManageMcp => {
+                    self.mcp.open = true;
+                }
                 SettingsAction::SignInChatGpt => {
                     if self.auth_task.is_some() || self.auth_signing_out {
                         continue;
@@ -1826,6 +1860,9 @@ impl PopChatApp {
         let mut finished = false;
         if let Some(active) = self.active_stream.as_mut() {
             for ev in events {
+                if let ChatStreamEvent::McpProposal(draft) = &ev {
+                    self.mcp.review(draft.clone());
+                }
                 let terminal = matches!(
                     &ev,
                     ChatStreamEvent::Done(_)
@@ -2626,6 +2663,28 @@ impl PopChatApp {
     }
 
     fn send_payload(&mut self, text: String, attachments: Vec<Attachment>) {
+        match popchat_windows::chat::mcp::parse_chat_add(&text) {
+            Ok(Some(draft)) => {
+                if !attachments.is_empty() {
+                    self.composer.set_draft(text, attachments);
+                    self.ui_error = Some("新增 MCP 不接受附件；草稿已保留，請先移除附件。".into());
+                    return;
+                }
+                self.mcp.review(draft);
+                self.chat.messages.push(ChatMessage::new(
+                    ChatRole::Activity,
+                    "已從對話建立 MCP 待確認草稿；尚未保存、啟用或連線。",
+                ));
+                self.chat.persist();
+                return;
+            }
+            Err(error) => {
+                self.composer.set_draft(text, attachments);
+                self.ui_error = Some(error.to_string());
+                return;
+            }
+            Ok(None) => {}
+        }
         let options = self.send_options();
         let outcome = self.chat.send(
             &text,
@@ -2654,10 +2713,35 @@ impl PopChatApp {
             web_access,
             turn,
         } = turn;
+        let event_tx = self.events_tx.clone();
+        let mcp = if config.kind == ProviderKind::CodexAppServer {
+            None
+        } else {
+            match popchat_windows::chat::mcp::McpTurn::from_store(
+                &self.mcp.store,
+                &self.secrets,
+                self.chat.conversation_id,
+                turn.assistant_id,
+                move |request| {
+                    let _ = event_tx.send(AppEvent::McpApproval(request));
+                },
+            ) {
+                Ok(mcp) => mcp,
+                Err(_) => {
+                    self.chat.messages.push(ChatMessage::new(
+                        ChatRole::Error,
+                        "MCP 憑證無法讀取，未送出聊天；請在 MCP 設定重新輸入或停用服務。",
+                    ));
+                    self.chat.finish_turn(&turn);
+                    return;
+                }
+            }
+        };
         let (tx, rx) = std::sync::mpsc::channel::<ChatStreamEvent>();
         let handle = self.runtime.spawn(async move {
-            let mut stream =
-                popchat_windows::chat::compaction::run(history, config, web_access, context);
+            let mut stream = popchat_windows::chat::compaction::run_with_mcp(
+                history, config, web_access, context, mcp,
+            );
             while let Some(ev) = stream.recv().await {
                 if tx.send(ev).is_err() {
                     break;
@@ -2669,11 +2753,116 @@ impl PopChatApp {
 
     /// Stop 按鈕：abort 背景 task 並以已到達的 partial/reasoning 收尾 persist。
     fn stop_active_stream(&mut self) {
+        if let Some(request) = self.mcp_approval.take() {
+            let _ = request.respond.send(false);
+        }
         if let Some(active) = self.active_stream.take() {
             active.handle.abort();
             self.chat.stop();
             self.chat.finish_turn(&active.turn);
         }
+    }
+
+    fn show_mcp_dialogs(&mut self, ctx: &egui::Context) {
+        if let Some(request) = &self.mcp_approval {
+            let current = mcp_approval_is_current(
+                request,
+                self.chat.conversation_id,
+                self.active_stream.as_ref().map(|a| a.turn.assistant_id),
+                &self.mcp.store.servers,
+            );
+            let decision = if !current || request.respond.is_closed() {
+                Some(false)
+            } else {
+                popchat_windows::ui::mcp::approval_dialog(ctx, request)
+            };
+            if let Some(approved) = decision {
+                if let Some(request) = self.mcp_approval.take() {
+                    let _ = request.respond.send(approved);
+                }
+            }
+        } else if self.update_confirmation.is_none() {
+            if self.mcp.show(ctx, self.runtime.handle(), &mut self.secrets) {
+                self.stop_active_stream();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod mcp_approval_tests {
+    use super::*;
+    use popchat_windows::chat::mcp::{ApprovalRequest, Draft, Service, Transport};
+    #[test]
+    fn production_gate_rejects_stale_turn_changed_service_disabled_and_cancelled_requests() {
+        let service = Service {
+            id: Uuid::new_v4(),
+            draft: Draft {
+                name: "fixture".into(),
+                transport: Transport::Http {
+                    url: "https://fixture.invalid/mcp".into(),
+                },
+                token_env: None,
+            },
+            enabled: true,
+            secret_ref: None,
+        };
+        let (respond, decision) = tokio::sync::oneshot::channel();
+        let request = ApprovalRequest {
+            service: service.clone(),
+            tool: "echo".into(),
+            arguments: serde_json::json!({}),
+            conversation_id: Uuid::new_v4(),
+            turn_id: Uuid::new_v4(),
+            respond,
+        };
+        assert!(mcp_approval_is_current(
+            &request,
+            request.conversation_id,
+            Some(request.turn_id),
+            &[service.clone()]
+        ));
+        assert!(!mcp_approval_is_current(
+            &request,
+            Uuid::new_v4(),
+            Some(request.turn_id),
+            &[service.clone()]
+        ));
+        assert!(!mcp_approval_is_current(
+            &request,
+            request.conversation_id,
+            Some(Uuid::new_v4()),
+            &[service.clone()]
+        ));
+        assert!(!mcp_approval_is_current(
+            &request,
+            request.conversation_id,
+            None,
+            &[service.clone()]
+        ));
+        let mut changed = service.clone();
+        changed.secret_ref = Some(Uuid::new_v4());
+        assert!(!mcp_approval_is_current(
+            &request,
+            request.conversation_id,
+            Some(request.turn_id),
+            &[changed]
+        ));
+        let mut disabled = service.clone();
+        disabled.enabled = false;
+        assert!(!mcp_approval_is_current(
+            &request,
+            request.conversation_id,
+            Some(request.turn_id),
+            &[disabled]
+        ));
+        drop(decision);
+        assert!(!mcp_approval_is_current(
+            &request,
+            request.conversation_id,
+            Some(request.turn_id),
+            &[service]
+        ));
     }
 }
 
@@ -3777,6 +3966,7 @@ impl eframe::App for PopChatApp {
         self.update_window_geometry(ctx);
         self.show_card(ctx);
         self.show_update_confirmation(ctx);
+        self.show_mcp_dialogs(ctx);
         if !self.settings_open || !self.settings_ui.hotkey_recorder_visible() {
             popchat_windows::ui::hotkey_recorder::cancel(ctx);
         }

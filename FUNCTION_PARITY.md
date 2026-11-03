@@ -15,6 +15,13 @@ Static source audit, 2026-10-30. **Not a declaration of behavioral equivalence.*
 
 ## Status vocabulary
 
+0.2.2 MCP / Chinese defaults: `McpTurn` is threaded through the GUI send,
+compaction and both OpenAI-compatible / Responses tool loops. `McpUi` owns
+explicit service review and per-call approval; conversation additions are drafts
+only, never executable instructions. See `MCP.md` for protocol limits and trust
+boundaries. Native Codex MCP remains disabled. Built-in prompts are Traditional
+Chinese; exact old defaults localize without replacing custom prompts.
+
 | Status | Meaning |
 |---|---|
 | WIRED | Concrete counterpart has a production caller; does **not** mean every original edge case or live provider is verified. |

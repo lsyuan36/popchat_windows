@@ -1,3 +1,18 @@
+# v0.2.2
+
+- 新增 MCP Client：stdio 與 Streamable HTTP，含服務管理、工具探索與連線測試。
+- 支援 `/mcp add {JSON}` 與選擇性自然語言提案，僅建立停用的待確認草稿，不自動保存、啟用、連線或安裝。
+- 每次 MCP 工具執行須使用者確認；拒絕、取消、逾時、舊回合或服務設定變更不會執行。
+- OpenAI-compatible／ChatGPT Responses 接入 MCP 工具回合；Codex 維持原有 MCP 禁用邊界。
+- Token 使用 SecretStore 分片／digest，設定 JSON 只有 reference；失敗寫入不替換舊憑證，已知 token 不回傳模型。
+- 聊天、摘要、ChatGPT fallback、Codex 邊界與內建工具說明改繁體中文；舊英文預設精確匹配時轉中文，自訂／空白 prompt 保留。
+- 沿用 Auto Compact、原圖示、安全 NSIS 安裝與完整授權文件；未新增 Cargo 依賴。
+- 本機回歸：583 library、27 app、1 send-pipeline integration、15 importer passed；3 ignored（626 項通過）。
+
+MCP 首版限 tools，HTTP 僅手動 Bearer token；不含 OAuth、舊 HTTP+SSE、resources／prompts／sampling。
+stdio 程式不是沙箱，可能自啟動時操作電腦；只啟用受信任服務。詳見 `MCP.md`。
+Windows 執行檔仍未簽章；來源 commit 與 SHA-256 以 CI manifest 為準。
+
 # v0.2.1
 
 ## 2026-11-03 修訂重發：Auto Compact

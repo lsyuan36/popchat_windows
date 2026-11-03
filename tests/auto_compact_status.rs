@@ -114,7 +114,7 @@ async fn actual_send_prepares_model_budget_and_compacts_without_destroying_trans
     use wiremock::{matchers::method, Mock, Request, ResponseTemplate};
     Mock::given(method("POST")).respond_with(|request:&Request| {
         let body:serde_json::Value=request.body_json().unwrap();
-        let summary=body["messages"][0]["content"].as_str().unwrap_or_default().starts_with("Create a compact continuation checkpoint");
+        let summary=body["messages"][0]["content"].as_str().unwrap_or_default().starts_with("將舊對話整理成");
         let answer=if summary {"Checkpoint: synthetic old facts kept."} else {"MOCK_FINAL_ANSWER"};
         ResponseTemplate::new(200).insert_header("content-type","text/event-stream").set_body_string(format!("data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",serde_json::json!({"choices":[{"delta":{"content":answer}}]}),serde_json::json!({"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":10}})))
     }).mount(&server).await;

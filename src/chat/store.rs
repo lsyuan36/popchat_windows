@@ -609,7 +609,7 @@ pub struct ChatStore {
 impl ChatStore {
     /// Teaches the model the pasteable-block format the renderer
     /// recognizes. An explicitly empty value means "send no system prompt".
-    pub const DEFAULT_SYSTEM_PROMPT: &'static str = "You are a helpful assistant in a small desktop chat panel. Be concise and direct.\n\nWhen a reply includes content the user will copy and reuse verbatim — a prompt, template, code snippet, configuration, or other reusable text — wrap exactly that content in a pasteable block:\n\n<pasteable title=\"Short label\">\nthe exact reusable content\n</pasteable>\n\nPasteable rules:\n- The tags go on their own lines, with a short descriptive title.\n- Inside the tags, put only the content to copy — no commentary.\n- Keep explanations outside the block, in normal prose.\n- Use pasteable blocks only for content meant to be copied; use normal markdown code fences for illustrative code.";
+    pub const DEFAULT_SYSTEM_PROMPT: &'static str = super::commands::DEFAULT_SYSTEM_PROMPT;
 
     /// Typewriter reveal speed (chars/s). The per-tick step floors at
     /// "drain the backlog in 6s" and triples once the stream is done.
@@ -920,6 +920,7 @@ impl ChatStore {
         providers: &mut ProviderStore,
     ) {
         match event {
+            ChatStreamEvent::McpProposal(_) => {}
             ChatStreamEvent::ContextUpdate(state) => {
                 if self.streaming_message_id == Some(turn.assistant_id) {
                     let previous = std::mem::replace(&mut self.context, state);
@@ -2114,6 +2115,10 @@ impl Default for SecretStore {
 }
 
 impl SecretStore {
+    #[cfg(test)]
+    pub(crate) fn isolated_file_for_tests(path: PathBuf) -> Self {
+        Self::with_storage(SecretBackend::File, path, Box::new(NativeCredentials))
+    }
     pub fn new() -> Self {
         Self::with_backend(SecretBackend::default())
     }
@@ -2748,12 +2753,12 @@ impl ShortcutStore {
                         PromptShortcut {
                             id: Uuid::new_v4(),
                             name: "translate".to_string(),
-                            template: "Translate the following into natural, idiomatic English. Reply with the translation only:\n\n{input}".to_string(),
+                            template: super::commands::DEFAULT_TRANSLATE_TEMPLATE.to_string(),
                         },
                         PromptShortcut {
                             id: Uuid::new_v4(),
                             name: "explain".to_string(),
-                            template: "Explain the following clearly and concisely, assuming a technical reader:\n\n{input}".to_string(),
+                            template: super::commands::DEFAULT_EXPLAIN_TEMPLATE.to_string(),
                         },
                     ],
                 };

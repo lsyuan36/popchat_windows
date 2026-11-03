@@ -107,6 +107,19 @@ jobs:
           cargo test --locked --release --target x86_64-pc-windows-msvc --target-dir target/button-review --test auto_compact_status -- --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Test MCP approval, transports and Chinese defaults
+        run: |
+          cargo test --locked --release --target x86_64-pc-windows-msvc --target-dir target/button-review --lib chat::mcp::tests -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --release --target x86_64-pc-windows-msvc --target-dir target/button-review --lib ui::mcp::tests -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --release --target x86_64-pc-windows-msvc --target-dir target/button-review --lib chat::commands::tests -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --release --target x86_64-pc-windows-msvc --target-dir target/button-review --lib only_exact_legacy_builtin_system_prompt_is_localized_on_load -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --release --target x86_64-pc-windows-msvc --target-dir target/button-review --bin popchat_windows mcp_approval_tests -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Build EXEs and release ZIP
         id: package
         run: |

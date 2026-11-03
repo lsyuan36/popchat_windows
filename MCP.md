@@ -1,0 +1,125 @@
+# MCP Client（0.2.2）
+
+0.2.2 加入 MCP Client 與繁體中文內建提示詞。0.2.1 使用者需確認程式內更新或
+重新下載 Setup 升級；新增設定不會自行啟用服務或啟動 MCP 程式。
+
+## 從對話新增
+
+### 不依賴模型的明確指令
+
+在聊天輸入：
+
+```text
+/mcp add {"name":"我的遠端工具","transport":{"type":"http","url":"https://example.com/mcp"}}
+```
+
+或本機程式：
+
+```text
+/mcp add {"name":"我的本機工具","transport":{"type":"stdio","command":"node.exe","args":["D:\\Tools\\my-mcp\\server.js"]},"token_env":"API_KEY"}
+```
+
+這是 PopChat 本機處理的命令，不會交給模型，也不會把原始 JSON 記入送出歷史。
+只開啟待確認的 MCP 草稿，預設**停用**，不保存、不連線、不執行或安裝任何程式。
+JSON 無效時保留編輯草稿，顯示錯誤，不作一般聊天重送。
+
+請在 MCP 視窗檢查名稱、網址／程式與 args，必要時於密碼欄輸入 token，
+再按「確認並儲存 MCP 服務」。勾選「啟用」才授權在下一次聊天送出時連線／啟動。
+同名新增不會覆寫既有服務；既有服務必須由使用者明確選取編輯。
+
+### 自然語言提出草稿
+
+在「設定 → MCP → 管理 MCP 服務」開啟：
+
+> 允許模型提出 MCP 新增草稿（須支援工具呼叫）
+
+然後可說：「請幫我加入名為筆記工具的 MCP，網址是 https://example.com/mcp」。
+模型可呼叫內建 `propose_mcp_service` 建立草稿，**依然必須由使用者確認**。
+此選項預設關閉，避免改變不支援 function calling 的模型行為；`/mcp add` 不受此限制。
+只解析明確使用者命令或此結構化提案工具，不掃描助手文字／網頁／工具輸出自動新增。
+新提案不會覆寫使用者正在編輯的草稿，待檢視佇列最多保留 4 份。
+
+**不要在聊天、URL、程式參數或提案中貼上金鑰。** 對話提案不接受 `enabled`、
+`id`、`headers`、`env` 或 token 值；常見的明文憑證 CLI 參數也會被拒絕。
+
+## 服務管理與工具權限
+
+- 設定提供新增、編輯、刪除與連線測試；測試按鈕明確標示會啟動程式／連線。
+- 只有已啟用服務會在聊天送出時初始化；App 啟動時不自動連線。
+- 連線測試只做 `initialize → notifications/initialized → tools/list`，不做 `tools/call`。
+- 模型工具以服務 UUID＋工具名稱摘要產生別名，避免服務間名稱碰撞或冒充內建工具。
+- **每次** MCP 工具執行先顯示服務、目的地、工具及完整參數，使用者只能「拒絕」
+  或「僅允許這一次」。不因 MCP `readOnlyHint`、工具敘述或模型文字自動授權。
+- 拒絕／逾時不執行工具；服務設定已改變、聊天／回合已切換的舊確認請求也不會執行。
+- 同一回合拒絕過的工具不再重複彈出確認。
+- Stop 會中止等待確認、連線及工具回合。本機服務綁定 Windows kill-on-close Job Object，
+  關閉 session 時結束自己的程序樹，不搜尋／終止其他同名使用者程序。
+- HTTP 會盡力發送取消通知並結束 session；**停止不能保證撤銷遠端已完成的副作用**。
+- 設定變更會停止進行中的聊天工具回合，新設定於下一輪生效。
+
+> **MCP 不是沙箱。** 本機 stdio 程式以你的使用者權限執行，從啟動時就可能讀寫檔案
+> 或連網；工具執行前的確認不限制程式啟動本身。`npx` 等啟動器也可能依你批准的參數
+> 下載套件。只啟用受信任的程式與服務。PopChat 不自行下載或安裝 MCP 套件。
+
+## 協定與實作範圍
+
+- **stdio**：UTF-8 JSON-RPC 換行框架、初始化／版本協商、分頁工具探索及呼叫。
+  command／args 直接傳給程序，不拼接 shell 指令。Windows 的一般 `npx` 會解析成
+  相鄰的 `node.exe + npx-cli.js`；不直接執行 `.cmd`／`.bat`。
+- **Streamable HTTP**：POST 支援 JSON 與 SSE 回覆、多行 SSE data、session ID、
+  negotiated protocol header、初始化通知、取消及最佳努力 DELETE session。
+- 優先協商 `2025-11-25`，另接受 `2025-06-18`／`2025-03-26`；stdio 另接受 `2024-11-05`。
+- HTTP 使用 HTTPS，僅 localhost 可 HTTP；不跟隨 redirects，不接受 URL 帳密／query／fragment。
+  認證首版只支援手動 Bearer token，無自動 OAuth 登入或 token 刷新。
+- 首版範圍為 MCP **tools**；不提供 resources／prompts／sampling／elicitation／roots／tasks。
+  不支援的 server-to-client requests 回覆 method-not-found，不會替服務取用檔案或呼叫模型。
+- 尚未支援舊式 HTTP+SSE 雙端點 transport 或 SSE 斷線續傳；失敗時不重送 `tools/call`。
+  session 過期後本輪停止，後續新聊天送出會建立新 session。
+- 服務數最多 16；單服務工具分頁最多 8 頁，全目錄最多 64 個工具／64 KiB。
+  JSON-RPC 框架／回覆最多 1 MiB，工具參數最多 16 KiB，文字結果最多 32 KiB。
+  網路／RPC 期限 60 秒，使用者確認期限 180 秒，本輪最多 32 次 MCP 工具／提案。
+- MCP 結果只傳文字／structuredContent；二進位內容明確標示省略，已知認證 token 會遮罩。
+  若服務把認證 token 放進工具目錄，整個目錄會被拒絕，不把該 token 傳給模型。
+- OpenAI-compatible 與 ChatGPT Responses 都支援工具回合；需要模型本身支援 function calling。
+  Codex app-server 仍禁止 MCP，不解除它原有的只讀／工具安全邊界。
+- Auto Compact 的摘要回合永不開啟 MCP，避免背景摘要順便連線或提出服務草稿。
+
+## 設定與憑證
+
+`mcp_servers.json` 存在聊天 store 的 profile 目錄，正常為
+`%APPDATA%\PopChat\mcp_servers.json`，隔離模式則使用 `POPCHAT_DATA_DIR`。
+只保存服務設定與隨機 secret reference。token 分片保存在既有 `SecretStore`／Windows
+Credential Manager，驗證片段 SHA-256；設定原子寫入失敗時不替換舊憑證。
+不使用模型服務的 API key 作 MCP 認證，也不把該 key 傳給 MCP 子程序環境。
+讀取損壞的設定時停用 MCP 並禁止覆寫原檔。
+
+## 繁體中文提示詞
+
+聊天預設、摘要、ChatGPT fallback、Codex developer 邊界與內建工具說明已改繁體中文。
+工具／協定欄位、識別碼、`pasteable` 標籤及外部服務提供的原文保留，不任意翻譯。
+只有與舊內建英文 system prompt **完全相同**的設定，在載入時採用新中文預設；
+自訂 system prompt／已儲存指令不會被覆寫。自訂內容若也要換回中文預設，
+可在「設定 → 指令 → 使用預設」切換，僅保存 prompt，不提交未儲存的 API 草稿。
+
+## 驗證
+
+測試使用本機 mock HTTP、隔離設定／file-only 假憑證及自己建立的 stdio fixture，
+不連線真實模型或 MCP、不讀取使用者金鑰、不啟動第二個聊天 UI。
+
+```powershell
+cargo test --locked --lib chat::mcp::tests -- --nocapture
+cargo test --locked --lib ui::mcp::tests -- --nocapture
+cargo test --locked --all-targets
+```
+
+本輪最終 fmt／all-target check／diff check 通過，無 warning；all-target tests：
+**583 library、27 app、1 send-pipeline integration、15 importer passed；3 ignored**，
+合計 **626 項通過**。包含兩個 backend 的 MCP 工具回合、自然語言提案不連線、
+stdio 子程序清理、實際 UI 儲存按鈕／Esc 拒絕、舊回合拒絕、token 分片與遮罩，
+以及中文預設遷移不覆寫自訂 prompt 等測試。
+
+規格依據：
+- https://modelcontextprotocol.io/specification/2025-11-25/basic/transports
+- https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle
+
+這不是所有真實 MCP server／OAuth／第三方工具的相容性宣告；尚需使用者指定服務的個別驗收。

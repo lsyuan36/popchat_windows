@@ -7,6 +7,7 @@ pub mod codex;
 pub mod commands;
 pub mod compaction;
 pub mod context;
+pub mod mcp;
 pub mod providers;
 pub mod responses;
 pub mod store;

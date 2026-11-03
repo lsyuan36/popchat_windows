@@ -7,6 +7,28 @@
 
 **前次已安裝邊界（2026-11-02）：** 唯一 app 為 **PID 324**，**v0.2.0**，作者 **Evis Lai**，`%LOCALAPPDATA%\Programs\PopChat\popchat_windows.exe`，正式預設 `%APPDATA%\PopChat\PopChat\config`，**`isolated=false`**；圖示 hover／TT Norms Pro→Arial 英文預設／程式內確認下載安裝更新已接線，保留先前字級、錄製、轉場與表格 Copy。正常關閉 PID 20820／確認零實例才更新，app/helper SHA 與 manifest 核對；兩個 custom providers、偏好／指令／歷史 hashes 保留，沒有 credential importer。手動中英字體與快捷鍵不遷移；不 Save API／Send／改真正剪貼簿／啟用開機啟動。最後 raw 視窗非前景／off-screen，沒有強行喚回。單一 chat UI 約束持續適用，updater helper 不建立聊天 UI。後續 0.2.1 原始碼更新不代表已替換這份安裝。
 
+## 0.2.2：MCP 與繁體中文內建提示詞
+
+- 新增 `chat::mcp::{McpStore, Session, McpTurn, ToolCatalog}`，支援 stdio 與 Streamable HTTP
+  工具探索／呼叫；`main::start_stream → compaction::run_with_mcp → client::run_with_mcp`
+  與 ChatGPT Responses 路徑均接入，不是只保留獨立 helper。Codex 仍不啟用 MCP。
+- `/mcp add {JSON}` 在記錄 prompt history／送 API 前攔截，只開啟停用的確認草稿；
+  自然語言提案經 opt-in `propose_mcp_service`，同樣不自動保存／連線。設定提供
+  MCP 管理、編輯、啟停、刪除與連線測試；提案不覆寫現有草稿或同名服務。
+- 工具執行採回合／聊天／服務設定快照綁定的一次確認；拒絕、取消、逾時或 stale event
+  不執行。stdio 使用既有 Windows Job Object 結束自己的程序樹；HTTP 失敗不重送工具。
+- 認證採 SecretStore 隨機 reference＋分片／digest，不寫入 mcp_servers.json；設定寫入失敗
+  不替換舊憑證。模型 API key 不作 MCP 認證，不繼承至 MCP 子程序環境。
+- 內建聊天／摘要／ChatGPT fallback／Codex 邊界及工具說明改為繁體中文；聊天預設
+  共用單一常數，僅精確匹配的舊內建英文 prompt 在載入時轉新預設，自訂與空 prompt 保留。
+- MCP 協定、兩個 backend 工具回合、stdio 實際程序清理、UI 真實確認按鈕、自然語言
+  提案不連線、舊回合／變更服務拒絕、憑證分片／遮罩與中文／自訂 prompt 保留均通過。
+  最終 fmt／all-target check／diff check 通過，無 warning；all-target tests：
+  **583 library、27 app、1 send-pipeline integration、15 importer passed，3 ignored**（626 項通過）。
+  Workflow 的 13 個 PowerShell run blocks 語法檢查與變更來源的遮罩式憑證掃描亦通過。
+- 詳見 `MCP.md`。依使用者後續要求升為 0.2.2、提交推送並進行 CI／Release；
+  遠端結果須另行核對，不從本機測試推定完成。本輪不重裝、不啟動聊天 UI，不連線真實 MCP 或模型。
+
 ## 0.2.1 修訂重發：Auto Compact 實際送出接線
 
 - 已確認原缺口：模型預算只保存、沒有進入送出；另以使用者同意的 `qwen3.8-27b-vl`
