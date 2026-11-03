@@ -607,6 +607,8 @@ mod tests {
 
     #[test]
     fn numeric_version_comparison() {
+        assert!(is_newer("0.2.4", "0.2.3"));
+        assert!(!is_newer("0.2.3", "0.2.4"));
         assert!(is_newer("0.2.3", "0.2.2"));
         assert!(!is_newer("0.2.2", "0.2.3"));
         assert!(is_newer("0.2.2", "0.2.1"));

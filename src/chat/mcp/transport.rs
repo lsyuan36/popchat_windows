@@ -201,19 +201,24 @@ pub struct Session {
 
 impl Session {
     pub async fn connect(service: &Service, token: String) -> Result<Self> {
-        service.draft.validate()?;
+        service.validate_connection()?;
         let connection = match &service.draft.transport {
-            Transport::Http { url } => Connection::Http(HttpConnection {
-                client: reqwest::Client::builder()
+            Transport::Http { url } => {
+                let mut client = reqwest::Client::builder()
                     .redirect(reqwest::redirect::Policy::none())
-                    .timeout(TIMEOUT)
-                    .build()?,
-                url: url.clone(),
-                token,
-                session: None,
-                version: VERSION.into(),
-                pending: None,
-            }),
+                    .timeout(TIMEOUT);
+                if service.draft.requires_private_http_approval() {
+                    client = client.no_proxy();
+                }
+                Connection::Http(HttpConnection {
+                    client: client.build()?,
+                    url: url.clone(),
+                    token,
+                    session: None,
+                    version: VERSION.into(),
+                    pending: None,
+                })
+            }
             Transport::Stdio { command, args } => {
                 let (command, args) = resolve_command(command, args)?;
                 let mut process = tokio::process::Command::new(command);

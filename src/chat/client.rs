@@ -377,11 +377,14 @@ pub fn run(
 }
 
 pub fn run_with_mcp(
-    history: Vec<WireMessage>,
+    mut history: Vec<WireMessage>,
     config: ProviderConfig,
     web_access: Option<WebAccess>,
     mcp: Option<super::mcp::McpTurn>,
 ) -> mpsc::UnboundedReceiver<ChatStreamEvent> {
+    if let Some(turn) = &mcp {
+        turn.redact_history(&mut history);
+    }
     let (tx, rx) = mpsc::unbounded_channel();
     if config.kind != ProviderKind::OpenAICompatible {
         if let Some(backend) = delegated_backend() {

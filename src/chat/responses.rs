@@ -133,13 +133,16 @@ impl ResponsesBackend {
 
     async fn run_loop(
         &self,
-        history: Vec<WireMessage>,
+        mut history: Vec<WireMessage>,
         config: ProviderConfig,
         web_access: Option<WebAccess>,
         session_id: String,
         mcp: Option<super::mcp::McpTurn>,
         tx: &mpsc::UnboundedSender<ChatStreamEvent>,
     ) {
+        if let Some(turn) = &mcp {
+            turn.redact_history(&mut history);
+        }
         let system_texts: Vec<&str> = history
             .iter()
             .filter_map(|message| match (&*message.role, &message.content) {

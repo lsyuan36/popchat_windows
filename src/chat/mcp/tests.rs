@@ -24,11 +24,216 @@ fn service(url: &str) -> Service {
         id: Uuid::new_v4(),
         draft: draft(url),
         enabled: true,
+        allow_private_http: false,
         secret_ref: None,
     }
 }
 fn tools() -> Value {
     json!([{"name":"echo","description":"Untrusted test description","inputSchema":{"type":"object","properties":{"text":{"type":"string"},"optional_note":{"type":"string"}},"required":["text"]}}])
+}
+
+#[test]
+fn private_http_requires_a_separate_persisted_destination_approval() {
+    for url in [
+        "http://10.0.0.12:2918/v1/mcp",
+        "http://172.16.0.9/mcp",
+        "http://192.168.1.9/mcp",
+        "http://[fd00::1]/mcp",
+    ] {
+        let mut service = service(url);
+        service.draft.validate().unwrap();
+        assert!(service.draft.requires_private_http_approval());
+        assert!(service.validate_connection().is_err());
+        service.allow_private_http = true;
+        service.validate_connection().unwrap();
+    }
+    for url in [
+        "http://8.8.8.8/mcp",
+        "http://public.example/mcp",
+        "http://169.254.169.254/mcp",
+    ] {
+        assert!(draft(url).validate().is_err());
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mcp.json");
+    let secret_path = dir.path().join("secrets.json");
+    let mut store = McpStore::load_at(path.clone());
+    let mut secrets = SecretStore::isolated_file_for_tests(secret_path.clone());
+    let candidate = draft("http://10.0.0.12/mcp");
+    assert!(store
+        .save(
+            None,
+            candidate.clone(),
+            true,
+            Some("synthetic-private-http-password"),
+            false,
+            &mut secrets
+        )
+        .is_err());
+    assert!(!path.exists());
+    assert!(!secret_path.exists());
+    let id = store
+        .save_with_http_permission(
+            None,
+            candidate,
+            true,
+            Some("synthetic-private-http-password"),
+            false,
+            true,
+            &mut secrets,
+        )
+        .unwrap();
+    assert!(McpStore::load_at(path.clone()).servers[0].allow_private_http);
+    assert!(!std::fs::read_to_string(&path)
+        .unwrap()
+        .contains("synthetic-private-http-password"));
+    let before = std::fs::read(&path).unwrap();
+    assert!(store
+        .save(
+            Some(id),
+            draft("http://10.0.0.13/mcp"),
+            true,
+            None,
+            false,
+            &mut secrets
+        )
+        .is_err());
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn saved_mcp_credentials_are_redacted_from_wire_history_without_rewriting_originals() {
+    let token = "synthetic-previously-pasted-password";
+    let turn = McpTurn::new(
+        vec![(service("https://example.com/mcp"), token.into())],
+        false,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        |_| panic!("redaction cannot execute"),
+    );
+    let original = vec![
+        WireMessage::new(
+            "user",
+            Some(WireContent::Text(format!("old input included {token}"))),
+            None,
+            None,
+        ),
+        WireMessage::new(
+            "user",
+            Some(WireContent::Parts(vec![client::WirePart::text(format!(
+                "part {token}"
+            ))])),
+            None,
+            None,
+        ),
+    ];
+    let mut outgoing = original.clone();
+    turn.redact_history(&mut outgoing);
+    assert!(!serde_json::to_string(&outgoing).unwrap().contains(token));
+    assert!(serde_json::to_string(&original).unwrap().contains(token));
+}
+
+#[tokio::test]
+async fn confirmed_local_setup_initializes_lists_and_calls_capabilities_with_a_local_only_token() {
+    let mcp = MockServer::start().await;
+    let sequence = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = sequence.clone();
+    Mock::given(method("POST")).respond_with(move|req:&Request| {
+        assert_eq!(req.headers.get("authorization").unwrap(),"Bearer synthetic-local-capabilities-password");
+        let body:Value=req.body_json().unwrap();let method=body["method"].as_str().unwrap();seen.lock().unwrap().push(method.into());
+        let result=match method {
+            "initialize"=>json!({"protocolVersion":"2025-11-25","capabilities":{"tools":{}}}),
+            "notifications/initialized"=>return ResponseTemplate::new(202),
+            "tools/list"=>json!({"tools":[{"name":"armor_capabilities","description":"Synthetic capability fixture","inputSchema":{"type":"object","properties":{}}}]}),
+            "tools/call"=>{assert_eq!(body["params"]["name"],"armor_capabilities");json!({"content":[{"type":"text","text":"synthetic capability report"}],"structuredContent":{"ocr_ready":true,"speech_ready":false}})},
+            _=>panic!("unexpected method {method}"),
+        };
+        ResponseTemplate::new(200).set_body_json(json!({"jsonrpc":"2.0","id":body["id"],"result":result}))
+    }).mount(&mcp).await;
+    let setup = parse_chat_setup(&super::onboarding_fixture(
+        &mcp.uri(),
+        "synthetic-local-capabilities-password",
+    ))
+    .unwrap()
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = McpStore::load_at(dir.path().join("mcp.json"));
+    let mut secrets = SecretStore::isolated_file_for_tests(dir.path().join("secrets.json"));
+    let request = setup.request;
+    store
+        .save(
+            None,
+            setup.draft,
+            true,
+            Some(&setup.token),
+            false,
+            &mut secrets,
+        )
+        .unwrap();
+    let model = MockServer::start().await;
+    let rounds = Arc::new(AtomicUsize::new(0));
+    let count = rounds.clone();
+    Mock::given(method("POST")).respond_with(move|req:&Request| {
+        let body:Value=req.body_json().unwrap();assert!(!body.to_string().contains("synthetic-local-capabilities-password"));
+        let event=if count.fetch_add(1,Ordering::SeqCst)==0 {
+            let tool=body["tools"].as_array().unwrap().iter().find(|tool|tool["function"]["description"].as_str().unwrap_or_default().contains("工具 armor_capabilities")).unwrap();
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"capabilities-1","function":{"name":tool["function"]["name"],"arguments":"{}"}}]}}]})
+        } else {
+            let output=body["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap();assert!(output.contains("\"ocr_ready\":true"));assert!(output.contains("\"speech_ready\":false"));
+            json!({"choices":[{"delta":{"content":"工具清單：armor_capabilities。測試結果：OCR 就緒，語音未就緒。"}}]})
+        };
+        ResponseTemplate::new(200).set_body_raw(format!("data: {event}\n\ndata: [DONE]\n\n"),"text/event-stream")
+    }).mount(&model).await;
+    let turn = McpTurn::from_store(&store, &secrets, Uuid::new_v4(), Uuid::new_v4(), |r| {
+        assert_eq!(r.action, ApprovalAction::ToolCall);
+        assert_eq!(r.tool, "armor_capabilities");
+        r.respond.send(true).unwrap();
+    })
+    .unwrap()
+    .unwrap();
+    let config = ProviderConfig {
+        base_url: model.uri(),
+        api_key: String::new(),
+        model: "fixture".into(),
+        reasoning_effort: None,
+        kind: ProviderKind::OpenAICompatible,
+    };
+    let mut rx = client::run_with_mcp(
+        vec![WireMessage::new(
+            "user",
+            Some(WireContent::Text(request)),
+            None,
+            None,
+        )],
+        config,
+        None,
+        Some(turn),
+    );
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut events = vec![];
+        while let Some(e) = rx.recv().await {
+            events.push(e);
+        }
+        events
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        events.last(),
+        Some(&ChatStreamEvent::Done(
+            "工具清單：armor_capabilities。測試結果：OCR 就緒，語音未就緒。".into()
+        ))
+    );
+    assert_eq!(rounds.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        *sequence.lock().unwrap(),
+        vec![
+            "initialize",
+            "notifications/initialized",
+            "tools/list",
+            "tools/call"
+        ]
+    );
 }
 
 #[tokio::test]
@@ -289,7 +494,10 @@ async fn actual_openai_chat_can_check_status_open_settings_and_request_approved_
     let mut rx = client::run_with_mcp(
         vec![WireMessage::new(
             "user",
-            Some(WireContent::Text("幫我查看 MCP 設定並測試已存服務".into())),
+            Some(WireContent::Text(
+                "幫我查看 MCP 設定並測試已存服務；舊訊息曾包含 synthetic-mcp-auth-not-for-model"
+                    .into(),
+            )),
             None,
             None,
         )],
@@ -1009,6 +1217,7 @@ async fn real_stdio_protocol_env_token_and_owned_process_cleanup() {
             token_env: Some("MCP_FIXTURE_TOKEN".into()),
         },
         enabled: true,
+        allow_private_http: false,
         secret_ref: None,
     };
     let mut session = Session::connect(&service, "synthetic-stdio-token".into())

@@ -1900,7 +1900,8 @@ fn case_insensitive_find(text: &str, query: &str) -> Option<(usize, usize)> {
 
 /// The prompts you have actually sent, newest first — what ↑ walks back
 /// through from an empty composer. Deliberately global rather than
-/// per-conversation. Recorded by [`ChatStore::send`], not by the composer.
+/// per-conversation. Both composer and store may record (deduplicated).
+/// Local MCP setup commands/credentials are excluded before persistence.
 #[derive(Debug, Clone, Default)]
 pub struct PromptHistory {
     entries: Vec<String>,
@@ -1955,6 +1956,13 @@ impl PromptHistory {
     pub fn record(&mut self, text: &str) {
         let trimmed = text.trim();
         if trimmed.is_empty() {
+            return;
+        }
+        if trimmed
+            .strip_prefix("/mcp")
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+            || !matches!(super::mcp::parse_chat_setup(trimmed), Ok(None))
+        {
             return;
         }
         self.entries.retain(|e| e != trimmed);

@@ -1,7 +1,54 @@
-# MCP Client（0.2.3）
+# MCP Client（0.2.4）
 
 0.2.2 加入 MCP Client 與繁體中文內建提示詞。0.2.1 使用者需確認程式內更新或
 重新下載 Setup 升級；新增設定不會自行啟用服務或啟動 MCP 程式。
+
+## 0.2.4：完整連線資訊的本機確認流程
+
+本節功能自 **0.2.4** 提供，0.2.3 及更早版本需升級，不會因原始碼修改自行更新本機程式。
+
+可將完整的結構化要求貼入聊天，例如：
+
+```text
+請幫我把下列 MCP 伺服器加進設定，並測試連線。
+- 伺服器名稱:local-tools
+- 傳輸方式:Streamable HTTP
+- 位址:http://10.0.0.12:2918/v1/mcp
+
+依序 initialize、tools/list，再呼叫服務提供的 capabilities 工具。
+```
+
+如果原始資訊另含獨立的「憑證:」欄，本機會在送給模型或記錄輸入歷史**之前**擷取它，
+只預填在設定的遮罩密碼欄；不將原始連線全文記入聊天。非完整／模糊的憑證輸入會阻擋，
+不當作普通聊天轉送。也可不貼憑證，直接在確認畫面的密碼欄輸入，這仍是建議方式。
+此解析僅作用於使用者明確以「請…MCP…新增／加入／加進」開頭的結構化要求，
+不會掃描助手、網頁或工具輸出來自動新增。
+
+流程如下：
+
+1. 本機開啟待確認畫面，顯示名稱、完整目的地、將修改的 `mcp_servers.json` 路徑，
+   並明示憑證只存入本機憑證庫，不寫入該 JSON。尚未保存或連線。
+2. HTTPS／localhost 沿用原規則。數字內網 IP（IPv4 RFC1918／IPv6 ULA）若使用 HTTP，
+   額外顯示明文風險，必須手動勾選同意，才能按「確認新增、啟用並繼續」。
+   公開網路 HTTP 仍拒絕，不能由模型提案帶入授權旗標；內網 HTTP 不使用系統 HTTP 代理。
+3. 使用者確認後，保存服務並啟用，以**遮罩憑證後**的原要求接續聊天。
+   runtime 先初始化並探索工具，模型可依實際工具目錄呼叫 capabilities；每次工具仍需確認。
+   `test_mcp_service` 本身仍不執行工具，不會把測試權限擴大成任意 HTTP／shell。
+4. 原聊天已切換時不自動送出舊要求；同名服務及未儲存草稿不自動覆寫。
+
+內網 HTTP 的同意會綁定已保存目的地；修改 URL 須重新同意。此選項不提供 TLS、加密或
+沙箱保護，Bearer token 及工具資料仍可能遭可信任網路之外的設備攔截，優先使用 HTTPS。
+MCP 狀態提供原始工具名稱、安全的 HTTP 狀態碼／連線診斷，不把服務原始錯誤本文回傳模型。
+已保存的已知憑證會從模型輸入及摘要的文字副本遮罩，**不回寫或刪改完整聊天歷史**。
+舊版曾送出／保存的憑證無法藉此撤回，仍建議輪替。
+
+本輪驗證只用假的憑證、隔離設定與本機 mock，不連線使用者提供的真實服務。
+
+修正後完整回歸：**602 library、29 app、1 send-pipeline integration、15 importer passed；
+3 ignored，合計 647 項通過**，無 warning。包含本機解析／輸入歷史排除、內網 HTTP 的
+獨立同意與目的地變更、真實滑鼠勾選／保存、遮罩後接續請求，以及 mock 的
+`initialize → notifications/initialized → tools/list → tools/call(capabilities)` 完整路徑。
+安裝確認視窗另驗證淺／深色、小視窗、主次按鈕、Esc 取消與生成中提醒。
 
 ## 0.2.3：讓聊天助手管理與測試 MCP
 
@@ -107,7 +154,8 @@ JSON 無效時保留編輯草稿，顯示錯誤，不作一般聊天重送。
 - **Streamable HTTP**：POST 支援 JSON 與 SSE 回覆、多行 SSE data、session ID、
   negotiated protocol header、初始化通知、取消及最佳努力 DELETE session。
 - 優先協商 `2025-11-25`，另接受 `2025-06-18`／`2025-03-26`；stdio 另接受 `2024-11-05`。
-- HTTP 使用 HTTPS，僅 localhost 可 HTTP；不跟隨 redirects，不接受 URL 帳密／query／fragment。
+- HTTP 使用 HTTPS，localhost 可 HTTP；0.2.4 另允許明確同意的數字內網 HTTP。
+  不跟隨 redirects，不接受 URL 帳密／query／fragment。
   認證首版只支援手動 Bearer token，無自動 OAuth 登入或 token 刷新。
 - 首版範圍為 MCP **tools**；不提供 resources／prompts／sampling／elicitation／roots／tasks。
   不支援的 server-to-client requests 回覆 method-not-found，不會替服務取用檔案或呼叫模型。

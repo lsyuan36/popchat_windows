@@ -109,8 +109,9 @@ impl Draft {
                     Some("localhost" | "127.0.0.1" | "[::1]" | "::1")
                 );
                 ensure!(
-                    url.scheme() == "https" || (url.scheme() == "http" && local),
-                    "遠端 MCP 必須使用 HTTPS；只有 localhost 可用 HTTP。"
+                    url.scheme() == "https"
+                        || (url.scheme() == "http" && (local || private_host(&url))),
+                    "公開網路 MCP 必須使用 HTTPS；內網 IP 的 HTTP 必須另外明確授權。"
                 );
                 ensure!(url.host_str().is_some(), "MCP URL 缺少主機。");
                 ensure!(
@@ -167,6 +168,23 @@ impl Draft {
         }
         Ok(())
     }
+
+    pub fn requires_private_http_approval(&self) -> bool {
+        match &self.transport {
+            Transport::Http { url } => reqwest::Url::parse(url)
+                .is_ok_and(|url| url.scheme() == "http" && private_host(&url)),
+            _ => false,
+        }
+    }
+}
+
+fn private_host(url: &reqwest::Url) -> bool {
+    let host = url.host_str().unwrap_or_default().trim_matches(['[', ']']);
+    host.parse::<std::net::Ipv4Addr>()
+        .is_ok_and(|ip| ip.is_private())
+        || host
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok_and(|ip| ip.is_unique_local())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,10 +195,20 @@ pub struct Service {
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
+    pub allow_private_http: bool,
+    #[serde(default)]
     pub secret_ref: Option<Uuid>,
 }
 
 impl Service {
+    pub fn validate_connection(&self) -> Result<()> {
+        self.draft.validate()?;
+        ensure!(
+            !self.draft.requires_private_http_approval() || self.allow_private_http,
+            "尚未同意內網明文 HTTP；請在 MCP 設定確認憑證傳輸風險。"
+        );
+        Ok(())
+    }
     pub fn token(&self, secrets: &SecretStore) -> Result<String> {
         match self.secret_ref {
             Some(id) => read_secret(secrets, id),
@@ -297,6 +325,9 @@ pub struct McpStore {
 }
 
 impl McpStore {
+    pub fn settings_path(&self) -> &std::path::Path {
+        &self.path
+    }
     pub fn load() -> Self {
         Self::load_at(crate::chat::store::app_data_dir().join("mcp_servers.json"))
     }
@@ -361,8 +392,30 @@ impl McpStore {
         clear_token: bool,
         secrets: &mut SecretStore,
     ) -> Result<Uuid> {
+        let allow = id
+            .and_then(|id| self.servers.iter().find(|s| s.id == id))
+            .is_some_and(|s| s.allow_private_http && s.draft.transport == draft.transport);
+        self.save_with_http_permission(id, draft, enabled, new_token, clear_token, allow, secrets)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_with_http_permission(
+        &mut self,
+        id: Option<Uuid>,
+        draft: Draft,
+        enabled: bool,
+        new_token: Option<&str>,
+        clear_token: bool,
+        allow_private_http: bool,
+        secrets: &mut SecretStore,
+    ) -> Result<Uuid> {
         ensure!(self.load_error.is_none(), "MCP 設定無法安全寫入。");
         draft.validate()?;
+        let draft_requires_private_http = draft.requires_private_http_approval();
+        ensure!(
+            !draft.requires_private_http_approval() || allow_private_http,
+            "請先確認內網明文 HTTP 會傳送憑證的風險。"
+        );
         let old = id
             .and_then(|id| self.servers.iter().find(|s| s.id == id))
             .cloned();
@@ -399,6 +452,7 @@ impl McpStore {
             id: id.unwrap_or_else(Uuid::new_v4),
             draft,
             enabled,
+            allow_private_http: allow_private_http && draft_requires_private_http,
             secret_ref: old.as_ref().and_then(|s| s.secret_ref),
         };
         if clear_token {

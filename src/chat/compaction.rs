@@ -343,12 +343,18 @@ pub fn run(
 }
 
 pub fn run_with_mcp(
-    history: Vec<WireMessage>,
+    mut history: Vec<WireMessage>,
     config: ProviderConfig,
     web_access: Option<WebAccess>,
-    request: ContextRequest,
+    mut request: ContextRequest,
     mcp: Option<super::mcp::McpTurn>,
 ) -> mpsc::UnboundedReceiver<ChatStreamEvent> {
+    if let Some(turn) = &mcp {
+        turn.redact_history(&mut history);
+        if let Some(checkpoint) = &mut request.state.checkpoint {
+            turn.redact_text(&mut checkpoint.summary);
+        }
+    }
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         tokio::select! {

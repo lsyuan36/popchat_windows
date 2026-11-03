@@ -137,24 +137,67 @@ fn prepare_message_action(chat: &mut ChatStore, action: MessageAction) -> Prepar
 /// This dialog only returns a decision; it never saves drafts, downloads,
 /// starts a helper or closes a viewport by itself.
 fn update_confirmation_dialog(ctx: &egui::Context, version: &str, streaming: bool) -> Option<bool> {
-    let response = egui::Modal::new(egui::Id::new("install-update-confirmation")).show(ctx, |ui| {
-        ui.set_width((ctx.screen_rect().width() - 64.0).clamp(200.0, 400.0));
-        ui.heading(format!("安裝 PopChat {version}？"));
-        ui.add_space(8.0);
-        ui.add(egui::Label::new("將關閉目前視窗，安裝已驗證的更新並重新啟動。設定、服務、金鑰與歷史會保留。").wrap());
-        ui.add_space(6.0);
-        ui.add(egui::Label::new(egui::RichText::new("尚未送出的訊息與未儲存的 API 編輯不會自動保存；請先返回完成編輯。會立即停止仍在生成中的回覆。")
-            .color(ui.visuals().warn_fg_color)).wrap());
-        if streaming {
-            ui.add(egui::Label::new("目前正在生成回覆。確認安裝後將停止生成。").wrap());
-        }
-        ui.add_space(12.0);
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("返回編輯").clicked() { return Some(false); }
-            if ui.button("安裝並重新啟動").clicked() { return Some(true); }
-            None
-        }).inner
-    });
+    let palette = theme::current_palette(ctx);
+    let secondary = if palette.dark {
+        egui::Color32::from_rgb(0xAA, 0xAD, 0xB7)
+    } else {
+        egui::Color32::from_rgb(0x65, 0x68, 0x73)
+    };
+    let border = if palette.dark {
+        egui::Color32::from_white_alpha(22)
+    } else {
+        egui::Color32::from_black_alpha(18)
+    };
+    let frame = egui::Frame::popup(&ctx.style())
+        .fill(theme::panel_fill(palette.dark))
+        .stroke(egui::Stroke::new(1.0_f32, border))
+        .corner_radius(14)
+        .inner_margin(22);
+    let response = egui::Modal::new(egui::Id::new("install-update-confirmation"))
+        .backdrop_color(egui::Color32::from_black_alpha(180))
+        .frame(frame)
+        .show(ctx, |ui| {
+            ui.set_width((ctx.screen_rect().width()-80.0).clamp(160.0,420.0));
+            ui.spacing_mut().item_spacing=egui::vec2(10.0,8.0);
+            ui.spacing_mut().button_padding=egui::vec2(12.0,8.0);
+            ui.heading(egui::RichText::new(format!("安裝 PopChat {version}？")).size(19.0));
+            ui.label(egui::RichText::new("更新已下載並通過完整性驗證").size(12.0).color(secondary));
+            ui.add_space(6.0);
+            egui::ScrollArea::vertical()
+                .id_salt("update-confirmation-body")
+                .max_height((ctx.screen_rect().height()-190.0).clamp(72.0,260.0))
+                .show(ui,|ui| {
+                    ui.add(egui::Label::new(egui::RichText::new("更新助手驗證完成後，程式才會關閉、安裝更新並重新啟動。").size(13.0)).wrap());
+                    ui.add(egui::Label::new(egui::RichText::new("設定、服務、憑證與聊天歷史都會保留。").size(12.0).color(secondary)).wrap());
+                    ui.add_space(4.0);
+                    egui::Frame::new()
+                        .fill(if palette.dark {egui::Color32::from_white_alpha(7)} else {egui::Color32::from_black_alpha(5)})
+                        .corner_radius(8)
+                        .inner_margin(12)
+                        .show(ui,|ui| {
+                            ui.label(egui::RichText::new("安裝前請確認").size(12.0).strong());
+                            ui.add(egui::Label::new(egui::RichText::new("未送出的訊息與未儲存的 API 編輯不會自動保存。若尚未完成，請先返回編輯。").size(12.0).color(secondary)).wrap());
+                            if streaming {
+                                ui.add_space(2.0);
+                                ui.add(egui::Label::new(egui::RichText::new("目前仍在生成回覆；程式關閉時會停止生成。").size(12.0).color(ui.visuals().warn_fg_color)).wrap());
+                            }
+                        });
+                });
+            ui.add_space(10.0);
+            // Actions stay outside the scrolling body and installation never
+            // receives default keyboard focus or an implicit Enter shortcut.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui| {
+                if ui.add(egui::Button::new(egui::RichText::new("安裝並重新啟動").size(13.0).color(palette.accent_text))
+                    .fill(palette.accent).stroke(egui::Stroke::NONE).corner_radius(7).min_size(egui::vec2(132.0,34.0))).clicked() {
+                    return Some(true);
+                }
+                if ui.add(egui::Button::new(egui::RichText::new("返回編輯").size(13.0))
+                    .fill(egui::Color32::TRANSPARENT).stroke(egui::Stroke::new(1.0_f32,border)).corner_radius(7).min_size(egui::vec2(82.0,34.0))).clicked() {
+                    return Some(false);
+                }
+                None
+            }).inner
+        });
     if response.should_close() {
         Some(false)
     } else {
@@ -2670,6 +2713,28 @@ impl PopChatApp {
     }
 
     fn send_payload(&mut self, text: String, attachments: Vec<Attachment>) {
+        match popchat_windows::chat::mcp::parse_chat_setup(&text) {
+            Ok(Some(setup)) => {
+                if !attachments.is_empty() {
+                    self.composer.set_draft(text, attachments);
+                    self.ui_error =
+                        Some("新增 MCP 不接受附件；連線資訊未送給模型，請先移除附件。".into());
+                } else if let Err(error) = self
+                    .mcp
+                    .review_local_setup(setup, self.chat.conversation_id)
+                {
+                    self.composer.set_draft(text, attachments);
+                    self.ui_error = Some(error.to_string());
+                }
+                return;
+            }
+            Err(error) => {
+                self.composer.set_draft(text, attachments);
+                self.ui_error = Some(error.to_string());
+                return;
+            }
+            Ok(None) => {}
+        }
         match popchat_windows::chat::mcp::parse_chat_add(&text) {
             Ok(Some(draft)) => {
                 if !attachments.is_empty() {
@@ -2692,6 +2757,12 @@ impl PopChatApp {
             }
             Ok(None) => {}
         }
+        self.send_chat_payload(text, attachments);
+    }
+
+    /// Only sanitized, human-confirmed onboarding requests bypass the local
+    /// parser; never feed the password-bearing original back through chat.
+    fn send_chat_payload(&mut self, text: String, attachments: Vec<Attachment>) {
         let options = self.send_options();
         let outcome = self.chat.send(
             &text,
@@ -2792,6 +2863,19 @@ impl PopChatApp {
             if self.mcp.show(ctx, self.runtime.handle(), &mut self.secrets) {
                 self.stop_active_stream();
             }
+            if let Some((conversation_id, request)) = self.mcp.take_confirmed_request() {
+                if self.chat.conversation_id == conversation_id
+                    && !self.loading_conversation
+                    && !self.chat.is_streaming
+                {
+                    self.send_chat_payload(request, vec![]);
+                } else {
+                    self.ui_error = Some(
+                        "MCP 已儲存，但聊天已切換，未自動發送測試要求；請在目前聊天重新提出測試。"
+                            .into(),
+                    );
+                }
+            }
         }
     }
 }
@@ -2812,6 +2896,7 @@ mod mcp_approval_tests {
                 token_env: None,
             },
             enabled: false,
+            allow_private_http: false,
             secret_ref: None,
         };
         let (respond, decision) = tokio::sync::oneshot::channel();
@@ -2884,6 +2969,7 @@ mod mcp_approval_tests {
                 token_env: None,
             },
             enabled: true,
+            allow_private_http: false,
             secret_ref: None,
         };
         let (respond, decision) = tokio::sync::oneshot::channel();
@@ -3383,19 +3469,26 @@ mod action_tests {
         time: f64,
         events: Vec<egui::Event>,
     ) -> (Option<bool>, egui::FullOutput) {
+        update_dialog_frame_at(ctx, time, events, egui::vec2(520.0, 500.0), true)
+    }
+
+    fn update_dialog_frame_at(
+        ctx: &egui::Context,
+        time: f64,
+        events: Vec<egui::Event>,
+        size: egui::Vec2,
+        streaming: bool,
+    ) -> (Option<bool>, egui::FullOutput) {
         let mut decision = None;
         let output = ctx.run(
             egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(520.0, 500.0),
-                )),
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
                 time: Some(time),
                 events,
                 ..Default::default()
             },
             |ctx| {
-                decision = super::update_confirmation_dialog(ctx, "0.3.0", true);
+                decision = super::update_confirmation_dialog(ctx, "0.3.0", streaming);
             },
         );
         assert!(
@@ -3406,6 +3499,87 @@ mod action_tests {
             "confirmation rendering never closes the app by itself"
         );
         (decision, output)
+    }
+
+    #[test]
+    fn update_confirmation_has_clear_actions_conditional_warning_and_fits_small_windows() {
+        use popchat_windows::ui::theme;
+        for dark in [false, true] {
+            for size in [
+                egui::vec2(320.0, 360.0),
+                egui::vec2(520.0, 500.0),
+                egui::vec2(982.0, 652.0),
+            ] {
+                for streaming in [false, true] {
+                    let ctx = egui::Context::default();
+                    let palette = theme::apply(
+                        &ctx,
+                        if dark { "dark" } else { "light" },
+                        theme::DEFAULT_ACCENT_HEX,
+                    );
+                    let mut output = None;
+                    for index in 0..5 {
+                        let (decision, frame) = update_dialog_frame_at(
+                            &ctx,
+                            index as f64 / 4.0,
+                            vec![],
+                            size,
+                            streaming,
+                        );
+                        assert_eq!(decision, None);
+                        output = Some(frame);
+                    }
+                    let output = output.unwrap();
+                    let texts = output
+                        .shapes
+                        .iter()
+                        .filter_map(|shape| match &shape.shape {
+                            egui::Shape::Text(text) => Some((text, shape.clip_rect)),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    assert!(!texts.iter().any(|(text, _)| text
+                        .galley
+                        .job
+                        .text
+                        .contains("立即停止")));
+                    assert_eq!(
+                        texts.iter().any(|(text, _)| text
+                            .galley
+                            .job
+                            .text
+                            .contains("程式關閉時會停止生成")),
+                        streaming
+                    );
+                    let find = |label: &str| {
+                        texts
+                            .iter()
+                            .find(|(text, _)| text.galley.job.text == label)
+                            .unwrap_or_else(|| panic!("missing button {label}"))
+                    };
+                    let (install, install_clip) = find("安裝並重新啟動");
+                    let (cancel, cancel_clip) = find("返回編輯");
+                    let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                    for (text, clip) in [(install, install_clip), (cancel, cancel_clip)] {
+                        let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+                        assert!(
+                            viewport.contains_rect(rect),
+                            "action outside viewport {size:?}: {rect:?}"
+                        );
+                        assert!(
+                            clip.contains_rect(rect),
+                            "clipped action: {rect:?} clip={clip:?}"
+                        );
+                    }
+                    assert!(
+                        install.pos.x > cancel.pos.x,
+                        "primary action should be on the right"
+                    );
+                    assert!(output.shapes.iter().any(|shape|matches!(&shape.shape,egui::Shape::Rect(rect) if rect.fill==palette.accent && rect.rect.height()>=34.0)),"missing accent primary button");
+                    assert!(output.shapes.iter().any(|shape|matches!(&shape.shape,egui::Shape::Rect(rect) if rect.fill==egui::Color32::from_black_alpha(180) && rect.rect.size()==size)),"missing stronger backdrop");
+                }
+            }
+        }
     }
 
     #[test]

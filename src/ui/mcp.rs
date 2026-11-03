@@ -1,6 +1,8 @@
 //! Human-owned review UI. Rendering a proposal never saves/connects anything.
 use crate::chat::{
-    mcp::{ApprovalAction, ApprovalRequest, Draft, McpStore, Service, Session, Transport},
+    mcp::{
+        ApprovalAction, ApprovalRequest, Draft, LocalSetup, McpStore, Service, Session, Transport,
+    },
     store::SecretStore,
 };
 use eframe::egui;
@@ -10,6 +12,10 @@ struct TestJob {
     service: Service,
     rx: std::sync::mpsc::Receiver<Result<Vec<String>, String>>,
     handle: tokio::task::JoinHandle<()>,
+}
+struct LocalReview {
+    conversation_id: Uuid,
+    request: String,
 }
 impl Drop for TestJob {
     fn drop(&mut self) {
@@ -22,6 +28,8 @@ pub struct McpUi {
     save_rect: Option<egui::Rect>,
     #[cfg(test)]
     save_clip_rect: Option<egui::Rect>,
+    #[cfg(test)]
+    private_http_rect: Option<(egui::Rect, egui::Rect)>,
     pub store: McpStore,
     pub open: bool,
     id: Option<Uuid>,
@@ -34,6 +42,9 @@ pub struct McpUi {
     token: String,
     clear_token: bool,
     enabled: bool,
+    allow_private_http: bool,
+    local_review: Option<LocalReview>,
+    confirmed_request: Option<(Uuid, String)>,
     has_draft: bool,
     pending: std::collections::VecDeque<Draft>,
     feedback: Option<String>,
@@ -50,6 +61,8 @@ impl McpUi {
             save_rect: None,
             #[cfg(test)]
             save_clip_rect: None,
+            #[cfg(test)]
+            private_http_rect: None,
             store,
             open: false,
             id: None,
@@ -62,6 +75,9 @@ impl McpUi {
             token: String::new(),
             clear_token: false,
             enabled: false,
+            allow_private_http: false,
+            local_review: None,
+            confirmed_request: None,
             has_draft: false,
             pending: Default::default(),
             feedback: None,
@@ -75,6 +91,10 @@ impl McpUi {
         self.token_env = draft.token_env.unwrap_or_default();
         self.token.clear();
         self.clear_token = false;
+        self.allow_private_http = id
+            .and_then(|id| self.store.servers.iter().find(|s| s.id == id))
+            .is_some_and(|s| s.allow_private_http);
+        self.local_review = None;
         self.enabled = enabled;
         self.has_draft = true;
         match draft.transport {
@@ -105,6 +125,28 @@ impl McpUi {
             self.feedback = Some("由對話提出的草稿，尚未保存、啟用或連線。請逐項檢查。".into());
         }
         self.open = true;
+    }
+    pub fn review_local_setup(
+        &mut self,
+        setup: LocalSetup,
+        conversation_id: Uuid,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.has_draft && !self.open,
+            "MCP 已有尚未處理的草稿；請先完成或放棄目前草稿，再重新送出連線資訊。憑證未送給模型。"
+        );
+        self.fill(None, setup.draft, false);
+        self.token = setup.token;
+        self.local_review = Some(LocalReview {
+            conversation_id,
+            request: setup.request,
+        });
+        self.feedback=Some("已在本機擷取連線資訊，憑證只顯示在密碼欄，尚未儲存或送給模型。請核對目的地；確認後會保存、啟用並接續原要求，每次工具仍須確認。".into());
+        self.open = true;
+        Ok(())
+    }
+    pub fn take_confirmed_request(&mut self) -> Option<(Uuid, String)> {
+        self.confirmed_request.take()
     }
     pub fn open_settings(&mut self, id: Option<Uuid>) {
         if let Some(service) = id
@@ -214,6 +256,9 @@ impl McpUi {
                     });
                 }
                 ui.separator();
+                if self.local_review.is_some(){
+                    ui.add(egui::Label::new(format!("確認後將寫入：{}\n憑證存入本機憑證庫，不寫入這份 JSON。",self.store.settings_path().display())).wrap());
+                }
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("新增／清空草稿").clicked(){self.fill(None,Draft {name:String::new(),transport:Transport::Http {url:String::new()},token_env:None},false);}
                     if !self.pending.is_empty() && ui.button(format!("放棄目前草稿並檢視下一個（{}）",self.pending.len())).clicked(){if let Some(draft)=self.pending.pop_front(){self.fill(None,draft,false);}}
@@ -221,24 +266,41 @@ impl McpUi {
                 ui.label(if self.id.is_some(){"編輯服務"}else{"新增草稿（不會覆寫同名服務）"});
                 ui.label("名稱");self.has_draft|=ui.text_edit_singleline(&mut self.name).changed();
                 ui.horizontal(|ui| {if ui.selectable_value(&mut self.http,true,"Streamable HTTP").clicked(){self.has_draft=true;}if ui.selectable_value(&mut self.http,false,"stdio").clicked(){self.has_draft=true;}});
-                if self.http {ui.label("MCP URL（HTTPS；localhost 可 HTTP；不接受 URL 金鑰）");self.has_draft|=ui.text_edit_singleline(&mut self.url).changed();}
+                if self.http {ui.label("MCP URL（HTTPS；內網 HTTP 須另外確認；不接受 URL 金鑰）");if ui.text_edit_singleline(&mut self.url).changed(){self.has_draft=true;self.allow_private_http=false;}}
                 else {ui.label("程式 command（直接啟動，不經 shell）");self.has_draft|=ui.text_edit_singleline(&mut self.command).changed();ui.label("args（JSON 字串陣列）");self.has_draft|=ui.text_edit_multiline(&mut self.args).changed();ui.label("將 token 傳給此環境變數（選填，例如 API_KEY）");self.has_draft|=ui.text_edit_singleline(&mut self.token_env).changed();}
                 ui.label(if self.http{"Bearer token（選填；留空保留已存憑證）"}else{"憑證 token（僅供上方環境變數；留空保留已存憑證）"});
                 self.has_draft|=ui.add(egui::TextEdit::singleline(&mut self.token).password(true)).changed();
                 if self.id.is_some(){self.has_draft|=ui.checkbox(&mut self.clear_token,"移除原先 token").changed();}
-                self.has_draft|=ui.checkbox(&mut self.enabled,"啟用：允許在下一次送出聊天時連線／啟動此服務").changed();
+                let private_http=self.draft().is_ok_and(|draft|draft.requires_private_http_approval());
+                if private_http {
+                    ui.add(egui::Label::new(egui::RichText::new("此位址使用未加密的內網 HTTP，Bearer token 與工具資料可能被網路上的其他人攔截。只在可信任網路使用；優先改用 HTTPS。").color(ui.visuals().warn_fg_color)).wrap());
+                    let permission=ui.checkbox(&mut self.allow_private_http,"我了解風險，允許向這個內網 HTTP 位址傳送憑證與資料");
+                    #[cfg(test)] {self.private_http_rect=Some((permission.rect,ui.clip_rect()));}
+                    self.has_draft|=permission.changed();
+                }
+                if self.local_review.is_some(){ui.add(egui::Label::new("下方確認按鈕會保存並啟用此服務，接續原本的連線測試要求；憑證不會交給模型。").wrap());}
+                else {self.has_draft|=ui.checkbox(&mut self.enabled,"啟用：允許在下一次送出聊天時連線／啟動此服務").changed();}
                 ui.label("儲存不會立刻啟動；若本輪有進行中的聊天工具，變更後會停止該輪。HTTP 首版只支援手動 Bearer token，不會自動 OAuth 登入。");
                 if let Some(text)=&self.feedback {ui.separator();ui.add(egui::Label::new(text).wrap());}
             });
             // Keep the explicit save action reachable even when the service
             // list, help text or an error makes the editor scroll.
             ui.separator();
-                let save=ui.add_enabled(self.store.load_error.is_none(),egui::Button::new("確認並儲存 MCP 服務"));
+                let allow_save=self.store.load_error.is_none() && self.draft().is_ok_and(|draft|!draft.requires_private_http_approval() || self.allow_private_http);
+                let save=ui.add_enabled(allow_save,egui::Button::new(if self.local_review.is_some(){"確認新增、啟用並繼續"}else{"確認並儲存 MCP 服務"}));
                 #[cfg(test)] {self.save_rect=Some(save.rect);self.save_clip_rect=Some(ui.clip_rect());}
                 if save.clicked() {
-                    let result=self.draft().and_then(|draft|self.store.save(self.id,draft,self.enabled,(!self.token.is_empty()).then_some(self.token.as_str()),self.clear_token,secrets));
+                    let result=self.draft().and_then(|draft|self.store.save_with_http_permission(self.id,draft,self.enabled || self.local_review.is_some(),(!self.token.is_empty()).then_some(self.token.as_str()),self.clear_token,self.allow_private_http,secrets));
                     match result {
-                        Ok(id)=>{changed=true;self.id=Some(id);self.token.clear();self.clear_token=false;self.has_draft=false;self.cancel_test();self.feedback=Some("MCP 服務已儲存；每次工具執行仍須確認。".into());}
+                        Ok(id)=>{
+                            changed=true;self.id=Some(id);self.token.clear();self.clear_token=false;self.has_draft=false;self.cancel_test();
+                            if let Some(mut review)=self.local_review.take(){
+                                review.request.push_str(&format!("\n已確認的 MCP 服務 ID：{id}；請只測試／使用此服務，不要使用先前訊息中的其他目的地。"));
+                                self.confirmed_request=Some((review.conversation_id,review.request));
+                                close=true;
+                            }
+                            self.feedback=Some("MCP 服務已儲存；每次工具執行仍須確認。".into());
+                        }
                         Err(error)=>self.feedback=Some(format!("未能儲存 MCP：{error}")),
                     }
                 }
@@ -281,6 +343,174 @@ pub fn approval_dialog(ctx: &egui::Context, request: &ApprovalRequest) -> Option
 mod tests {
     use super::*;
     #[test]
+    fn local_setup_requires_explicit_http_approval_and_save_before_resuming_without_the_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        let mut manager = McpUi::with_store(McpStore::load_at(path.clone()));
+        let mut secrets = SecretStore::isolated_file_for_tests(dir.path().join("secrets.json"));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let ctx = egui::Context::default();
+        let conversation_id = Uuid::new_v4();
+        let setup = crate::chat::mcp::parse_chat_setup(&crate::chat::mcp::onboarding_fixture(
+            "http://10.0.0.12:2918/v1/mcp",
+            "synthetic-local-setup-password",
+        ))
+        .unwrap()
+        .unwrap();
+        manager.review_local_setup(setup, conversation_id).unwrap();
+        assert!(!manager.enabled);
+        assert!(!manager.allow_private_http);
+        let mut time = 0.0;
+        for _ in 0..5 {
+            assert!(!frame(
+                &ctx,
+                &mut manager,
+                runtime.handle(),
+                &mut secrets,
+                time,
+                vec![]
+            ));
+            time += 0.1;
+        }
+        assert!(!path.exists());
+        assert!(!dir.path().join("secrets.json").exists());
+        assert!(manager.take_confirmed_request().is_none());
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 1400.0),
+                )),
+                time: Some(time),
+                ..Default::default()
+            },
+            |ctx| {
+                assert!(!manager.show(ctx, runtime.handle(), &mut secrets));
+            },
+        );
+        time += 0.1;
+        assert!(!output.shapes.iter().any(|shape|matches!(&shape.shape,egui::Shape::Text(text) if text.galley.job.text.contains("synthetic-local-setup-password"))),"password must be masked in the review screen");
+        let event = |pos, pressed| {
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                },
+            ]
+        };
+        let save = manager.save_rect.unwrap().center();
+        for pressed in [true, false] {
+            assert!(!frame(
+                &ctx,
+                &mut manager,
+                runtime.handle(),
+                &mut secrets,
+                time,
+                event(save, pressed)
+            ));
+            time += 0.1;
+        }
+        assert!(!path.exists());
+        for _ in 0..12 {
+            let (rect, clip) = manager.private_http_rect.unwrap();
+            if clip.contains_rect(rect) {
+                break;
+            }
+            frame(
+                &ctx,
+                &mut manager,
+                runtime.handle(),
+                &mut secrets,
+                time,
+                vec![
+                    egui::Event::PointerMoved(clip.center()),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -160.0),
+                        modifiers: Default::default(),
+                    },
+                ],
+            );
+            time += 0.2;
+        }
+        let (rect, clip) = manager.private_http_rect.unwrap();
+        assert!(
+            clip.contains_rect(rect),
+            "permission checkbox must be reachable by scrolling"
+        );
+        for pressed in [true, false] {
+            assert!(!frame(
+                &ctx,
+                &mut manager,
+                runtime.handle(),
+                &mut secrets,
+                time,
+                event(rect.center(), pressed)
+            ));
+            time += 0.1;
+        }
+        assert!(manager.allow_private_http);
+        assert!(!path.exists());
+        let save = manager.save_rect.unwrap().center();
+        frame(
+            &ctx,
+            &mut manager,
+            runtime.handle(),
+            &mut secrets,
+            time,
+            event(save, true),
+        );
+        time += 0.1;
+        assert!(frame(
+            &ctx,
+            &mut manager,
+            runtime.handle(),
+            &mut secrets,
+            time,
+            event(save, false)
+        ));
+        assert!(!manager.open);
+        let saved = McpStore::load_at(path.clone());
+        assert_eq!(saved.servers.len(), 1);
+        assert!(saved.servers[0].enabled);
+        assert!(saved.servers[0].allow_private_http);
+        assert_eq!(
+            saved.servers[0].token(&secrets).unwrap(),
+            "synthetic-local-setup-password"
+        );
+        assert!(!std::fs::read_to_string(path)
+            .unwrap()
+            .contains("synthetic-local-setup-password"));
+        let (target, request) = manager.take_confirmed_request().unwrap();
+        assert_eq!(target, conversation_id);
+        assert!(!request.contains("synthetic-local-setup-password"));
+        assert!(request.contains("armor_capabilities"));
+        assert!(request.contains(&saved.servers[0].id.to_string()));
+        assert!(manager.take_confirmed_request().is_none());
+        assert!(manager.test.is_none());
+    }
+
+    #[test]
+    fn local_credential_setup_never_overwrites_an_existing_unsaved_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut manager = McpUi::with_store(McpStore::load_at(dir.path().join("mcp.json")));
+        manager.review(draft("My current draft"));
+        manager.token = "synthetic-current-secret".into();
+        let setup = crate::chat::mcp::parse_chat_setup(&crate::chat::mcp::onboarding_fixture(
+            "https://example.com/mcp",
+            "synthetic-new-secret",
+        ))
+        .unwrap()
+        .unwrap();
+        assert!(manager.review_local_setup(setup, Uuid::new_v4()).is_err());
+        assert_eq!(manager.name, "My current draft");
+        assert_eq!(manager.token, "synthetic-current-secret");
+        assert!(manager.take_confirmed_request().is_none());
+    }
+    #[test]
     fn connection_test_modal_requires_an_actual_allow_click_and_escape_denies() {
         for approve in [false, true] {
             let ctx = egui::Context::default();
@@ -291,6 +521,7 @@ mod tests {
                     id: Uuid::new_v4(),
                     draft: draft("Disabled test target"),
                     enabled: false,
+                    allow_private_http: false,
                     secret_ref: None,
                 },
                 tool: "initialize → tools/list".into(),
@@ -381,6 +612,7 @@ mod tests {
             id: Uuid::new_v4(),
             draft: draft("Stored disabled"),
             enabled: false,
+            allow_private_http: false,
             secret_ref: None,
         };
         manager.store.servers.push(service.clone());
@@ -461,6 +693,7 @@ mod tests {
                 id: Uuid::new_v4(),
                 draft: draft(&format!("Stored service {index}")),
                 enabled: false,
+                allow_private_http: false,
                 secret_ref: None,
             });
         }
@@ -628,6 +861,7 @@ mod tests {
                 id: Uuid::new_v4(),
                 draft: draft("Approval fixture"),
                 enabled: true,
+                allow_private_http: false,
                 secret_ref: None,
             },
             tool: "write_something".into(),
