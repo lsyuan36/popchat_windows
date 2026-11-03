@@ -4,7 +4,7 @@ mod runtime;
 mod transport;
 
 pub use config::{parse_chat_add, Draft, McpStore, Service, Transport};
-pub use runtime::{ApprovalRequest, McpTurn, ToolCatalog};
+pub use runtime::{ApprovalAction, ApprovalRequest, McpTurn, ToolCatalog};
 pub use transport::Session;
 
 #[cfg(test)]

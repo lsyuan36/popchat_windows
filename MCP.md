@@ -1,7 +1,44 @@
-# MCP Client（0.2.2）
+# MCP Client（0.2.3）
 
 0.2.2 加入 MCP Client 與繁體中文內建提示詞。0.2.1 使用者需確認程式內更新或
 重新下載 Setup 升級；新增設定不會自行啟用服務或啟動 MCP 程式。
+
+## 0.2.3：讓聊天助手管理與測試 MCP
+
+以下管理工具自 **0.2.3** 提供；0.2.2 使用者需升級，不會因原始碼改動自行更新本機程式。
+
+OpenAI-compatible／ChatGPT Responses 的正常聊天，會提供三個內建工具，即使沒有啟用
+服務或尚未允許模型提出新增草稿，也不會只剩搜尋／讀網頁：
+
+- `mcp_status {}`：查詢本輪服務 ID、名稱、啟停、憑證是否可讀及工具探索狀態。
+  不回傳 token、secret reference、程式參數或網址，不修改設定，也不因查詢去連線。
+- `open_mcp_settings {"service_id":"選填的服務 UUID"}`：開啟 MCP 設定，讓使用者新增、
+  編輯、輸入 Bearer token 或啟用服務。不替使用者保存，也不覆寫尚未儲存的草稿。
+  不指定服務時使用 `{}`。
+- `test_mcp_service {"service_id":"已儲存服務的 UUID"}`：請求連線測試。
+  **先顯示確認，獲准後才啟動／連線**，包括已保存但停用的服務。僅初始化與探索工具，
+  不呼叫 `tools/call`、不保存／啟用，不把新工具動態加入本輪。
+
+例如可說：「請查看 MCP 狀態，幫我開啟設定，再測試我已儲存的服務。」
+若尚未新增，先由助手開啟設定，或使用下方 `/mcp add`。Bearer token 只在密碼欄輸入。
+設定保存會停止舊工具回合；**再次送出訊息**才使用新啟用的服務工具，實際工具仍逐次確認。
+自然語言新增草稿的原 opt-in 選項仍保留，不因這三個管理工具自動開啟。
+「確認並儲存」固定在設定視窗底部，不隨說明文字或長服務清單一起捲動。
+
+單一已啟用服務連線／探索失敗或憑證無法讀取，不再讓整個聊天在模型請求前中止；
+失敗服務不提供工具，助手可用狀態工具診斷並引導重新設定。目錄若含已知 token 則整份拒絕，
+不洩漏給模型；狀態與測試回覆也不包含 token。損壞的設定仍禁止覆寫。
+Responses 工具明確採 `strict:false`，保留外部 MCP schema 的選填欄位。
+
+這需要模型支援 function calling，**不是任意 shell／curl／HTTP 代理**；只允許測試
+使用者已保存的目的地，不接受工具參數中的新 URL 或 token。Codex MCP 禁用邊界不變，
+Auto Compact 摘要回合也不提供這些管理工具。本輪未連線使用者的真實服務或模型。
+
+修正後 fmt／all-target check／diff check 通過，無 warning；完整回歸：
+**594 library、28 app、1 send-pipeline integration、15 importer passed；3 ignored**，
+合計 **638 項通過**。涵蓋無服務時的管理入口、OpenAI／Responses 工具回合、
+停用服務測試的准許／拒絕／取消、舊回合與設定快照 gate、實際確認按鈕／Esc，
+以及小視窗長服務清單的固定儲存按鈕點擊、淺／深色的 3px 更新進度與未知下載總量。
 
 ## 從對話新增
 
@@ -35,7 +72,8 @@ JSON 無效時保留編輯草稿，顯示錯誤，不作一般聊天重送。
 
 然後可說：「請幫我加入名為筆記工具的 MCP，網址是 https://example.com/mcp」。
 模型可呼叫內建 `propose_mcp_service` 建立草稿，**依然必須由使用者確認**。
-此選項預設關閉，避免改變不支援 function calling 的模型行為；`/mcp add` 不受此限制。
+此選項預設關閉；`/mcp add` 不受此限制。0.2.3 的三個管理工具不受此選項限制，
+但管理／提案及 MCP 工具呼叫均需要模型支援 function calling。
 只解析明確使用者命令或此結構化提案工具，不掃描助手文字／網頁／工具輸出自動新增。
 新提案不會覆寫使用者正在編輯的草稿，待檢視佇列最多保留 4 份。
 
@@ -76,6 +114,7 @@ JSON 無效時保留編輯草稿，顯示錯誤，不作一般聊天重送。
 - 尚未支援舊式 HTTP+SSE 雙端點 transport 或 SSE 斷線續傳；失敗時不重送 `tools/call`。
   session 過期後本輪停止，後續新聊天送出會建立新 session。
 - 服務數最多 16；單服務工具分頁最多 8 頁，全目錄最多 64 個工具／64 KiB。
+  0.2.3 保留 3 個管理工具的配額，外部工具與選擇性的新增草稿工具合計最多 61 個。
   JSON-RPC 框架／回覆最多 1 MiB，工具參數最多 16 KiB，文字結果最多 32 KiB。
   網路／RPC 期限 60 秒，使用者確認期限 180 秒，本輪最多 32 次 MCP 工具／提案。
 - MCP 結果只傳文字／structuredContent；二進位內容明確標示省略，已知認證 token 會遮罩。
@@ -112,7 +151,7 @@ cargo test --locked --lib ui::mcp::tests -- --nocapture
 cargo test --locked --all-targets
 ```
 
-本輪最終 fmt／all-target check／diff check 通過，無 warning；all-target tests：
+0.2.2 發佈時 fmt／all-target check／diff check 通過，無 warning；all-target tests：
 **583 library、27 app、1 send-pipeline integration、15 importer passed；3 ignored**，
 合計 **626 項通過**。包含兩個 backend 的 MCP 工具回合、自然語言提案不連線、
 stdio 子程序清理、實際 UI 儲存按鈕／Esc 拒絕、舊回合拒絕、token 分片與遮罩，

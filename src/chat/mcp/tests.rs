@@ -28,7 +28,293 @@ fn service(url: &str) -> Service {
     }
 }
 fn tools() -> Value {
-    json!([{"name":"echo","description":"Untrusted test description","inputSchema":{"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}}])
+    json!([{"name":"echo","description":"Untrusted test description","inputSchema":{"type":"object","properties":{"text":{"type":"string"},"optional_note":{"type":"string"}},"required":["text"]}}])
+}
+
+#[tokio::test]
+async fn management_tools_are_available_without_services_and_do_not_change_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mcp.json");
+    let store = McpStore::load_at(path.clone());
+    let secrets = SecretStore::isolated_file_for_tests(dir.path().join("secrets.json"));
+    let turn = McpTurn::from_store(&store, &secrets, Uuid::new_v4(), Uuid::new_v4(), |_| {
+        panic!("local status/settings must not execute anything")
+    })
+    .unwrap()
+    .unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut catalog = turn.open(&tx).await.unwrap();
+    assert_eq!(catalog.schemas().len(), 3);
+    for name in ["mcp_status", "open_mcp_settings", "test_mcp_service"] {
+        assert!(catalog.contains(name));
+    }
+    assert!(!catalog.contains("propose_mcp_service"));
+    let status: Value =
+        serde_json::from_str(&catalog.execute("mcp_status", "{}", &tx).await).unwrap();
+    assert_eq!(status["services"], json!([]));
+    assert_eq!(status["config_readable"], true);
+    assert_eq!(status["chat_proposals_enabled"], false);
+    assert!(catalog
+        .execute("open_mcp_settings", "{}", &tx)
+        .await
+        .contains("未保存"));
+    assert_eq!(
+        rx.try_recv().unwrap(),
+        ChatStreamEvent::McpOpenSettings(None)
+    );
+    for (name, args) in [
+        ("mcp_status", json!({"token":"must-not-be-accepted"})),
+        ("open_mcp_settings", json!({"url":"https://example.com"})),
+        ("test_mcp_service", json!({"service_id":Uuid::new_v4()})),
+    ] {
+        assert!(catalog
+            .execute(name, &args.to_string(), &tx)
+            .await
+            .starts_with("ERROR:"));
+    }
+    assert!(rx.try_recv().is_err());
+    assert!(!path.exists());
+    assert!(!dir.path().join("secrets.json").exists());
+}
+
+#[tokio::test]
+async fn corrupt_config_still_exposes_read_only_diagnostics_and_never_repairs_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mcp.json");
+    std::fs::write(&path, b"invalid original config").unwrap();
+    let store = McpStore::load_at(path.clone());
+    let secrets = SecretStore::isolated_file_for_tests(dir.path().join("secrets.json"));
+    let turn = McpTurn::from_store(&store, &secrets, Uuid::new_v4(), Uuid::new_v4(), |_| {
+        panic!("corrupt settings must not connect")
+    })
+    .unwrap()
+    .unwrap();
+    let (tx, _) = mpsc::unbounded_channel();
+    let mut catalog = turn.open(&tx).await.unwrap();
+    let status: Value =
+        serde_json::from_str(&catalog.execute("mcp_status", "{}", &tx).await).unwrap();
+    assert_eq!(status["config_readable"], false);
+    assert_eq!(std::fs::read(path).unwrap(), b"invalid original config");
+}
+
+#[tokio::test]
+async fn disabled_service_test_connects_only_after_approval_and_never_enables_or_calls_tools() {
+    for approved in [false, true] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server = server(calls.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        let mut secrets = SecretStore::isolated_file_for_tests(dir.path().join("secrets.json"));
+        let mut store = McpStore::load_at(path.clone());
+        let id = store
+            .save(
+                None,
+                draft(&server.uri()),
+                false,
+                Some("synthetic-test-auth-only"),
+                false,
+                &mut secrets,
+            )
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let (approval_tx, mut approval_rx) = mpsc::unbounded_channel();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let turn =
+            McpTurn::from_store(&store, &secrets, Uuid::new_v4(), Uuid::new_v4(), move |r| {
+                let _ = approval_tx.send(r);
+            })
+            .unwrap()
+            .unwrap();
+        let mut catalog = turn.open(&tx).await.unwrap();
+        let status = catalog.execute("mcp_status", "{}", &tx).await;
+        assert!(!status.contains("synthetic-test-auth-only"));
+        assert!(!status.contains("secret_ref"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 0);
+        let task = tokio::spawn(async move {
+            let result = catalog
+                .execute(
+                    "test_mcp_service",
+                    &json!({"service_id":id}).to_string(),
+                    &tx,
+                )
+                .await;
+            (catalog, tx, result)
+        });
+        let request = approval_rx.recv().await.unwrap();
+        assert_eq!(request.action, ApprovalAction::ConnectionTest);
+        assert!(!request.service.enabled);
+        assert_eq!(server.received_requests().await.unwrap().len(), 0);
+        request.respond.send(approved).unwrap();
+        let (mut catalog, tx, result) = task.await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!store.servers[0].enabled);
+        if approved {
+            let result: Value = serde_json::from_str(&result).unwrap();
+            assert_eq!(result["connected"], true);
+            assert_eq!(result["tool_names"], json!(["echo"]));
+            assert_eq!(result["settings_changed"], false);
+            for req in server.received_requests().await.unwrap() {
+                assert_eq!(
+                    req.headers.get("authorization").unwrap(),
+                    "Bearer synthetic-test-auth-only"
+                );
+            }
+        } else {
+            assert!(result.contains("拒絕"));
+            assert_eq!(server.received_requests().await.unwrap().len(), 0);
+            assert!(catalog
+                .execute(
+                    "test_mcp_service",
+                    &json!({"service_id":id}).to_string(),
+                    &tx
+                )
+                .await
+                .contains("不再詢問"));
+            assert!(approval_rx.try_recv().is_err());
+        }
+        assert_eq!(
+            catalog.schemas().len(),
+            3,
+            "test cannot enable tools in the current turn"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cancelling_connection_test_while_waiting_never_contacts_service() {
+    let server = server(Arc::new(AtomicUsize::new(0))).await;
+    let mut saved = service(&server.uri());
+    saved.enabled = false;
+    let id = saved.id;
+    let (approval_tx, mut approval_rx) = mpsc::unbounded_channel();
+    let (tx, _) = mpsc::unbounded_channel();
+    let turn = McpTurn::new(
+        vec![(saved, String::new())],
+        false,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        move |r| {
+            let _ = approval_tx.send(r);
+        },
+    );
+    let mut catalog = turn.open(&tx).await.unwrap();
+    let task = tokio::spawn(async move {
+        catalog
+            .execute(
+                "test_mcp_service",
+                &json!({"service_id":id}).to_string(),
+                &tx,
+            )
+            .await
+    });
+    let mut request = approval_rx.recv().await.unwrap();
+    task.abort();
+    let _ = task.await;
+    tokio::time::timeout(std::time::Duration::from_secs(2), request.respond.closed())
+        .await
+        .unwrap();
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn failed_discovery_does_not_hide_management_tools_or_leak_server_errors() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("synthetic-private-error"))
+        .mount(&server)
+        .await;
+    let turn = McpTurn::new(
+        vec![(service(&server.uri()), "synthetic-private-token".into())],
+        false,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        |_| panic!("discovery cannot execute"),
+    );
+    let (tx, _) = mpsc::unbounded_channel();
+    let mut catalog = turn.open(&tx).await.unwrap();
+    assert_eq!(catalog.schemas().len(), 3);
+    let status = catalog.execute("mcp_status", "{}", &tx).await;
+    assert!(status.contains("\"discovery_failed\":true"));
+    assert!(!status.contains("synthetic-private"));
+}
+
+#[tokio::test]
+async fn actual_openai_chat_can_check_status_open_settings_and_request_approved_test() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mcp = server(calls.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = McpStore::load_at(dir.path().join("mcp.json"));
+    let mut secrets = SecretStore::isolated_file_for_tests(dir.path().join("secrets.json"));
+    let id = store
+        .save(
+            None,
+            draft(&mcp.uri()),
+            false,
+            Some("synthetic-mcp-auth-not-for-model"),
+            false,
+            &mut secrets,
+        )
+        .unwrap();
+    let model = MockServer::start().await;
+    let rounds = Arc::new(AtomicUsize::new(0));
+    let count = rounds.clone();
+    Mock::given(method("POST")).respond_with(move|req:&Request| {
+        let body:Value=req.body_json().unwrap();assert!(!body.to_string().contains("synthetic-mcp-auth-not-for-model"));
+        let schemas=body["tools"].as_array().unwrap();for name in ["mcp_status","open_mcp_settings","test_mcp_service"] {assert!(schemas.iter().any(|t|t["function"]["name"]==name));}
+        let round=count.fetch_add(1,Ordering::SeqCst);
+        let (name,args)=match round {
+            0=>("mcp_status",json!({})),
+            1=>{let result:Value=serde_json::from_str(body["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap()).unwrap();assert_eq!(result["services"][0]["enabled"],false);("open_mcp_settings",json!({"service_id":id}))},
+            2=>("test_mcp_service",json!({"service_id":id})),
+            3=>{let output=body["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap();assert!(output.contains("\"connected\":true"));("",json!({}))},
+            _=>panic!("unexpected model retry")
+        };
+        let event=if round==3 {json!({"choices":[{"delta":{"content":"已經你確認完成連線測試，服務仍停用。"}}]})} else {json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":format!("manage-{round}"),"function":{"name":name,"arguments":args.to_string()}}]}}]})};
+        ResponseTemplate::new(200).set_body_raw(format!("data: {event}\n\ndata: [DONE]\n\n"),"text/event-stream")
+    }).mount(&model).await;
+    let turn = McpTurn::from_store(&store, &secrets, Uuid::new_v4(), Uuid::new_v4(), |r| {
+        assert_eq!(r.action, ApprovalAction::ConnectionTest);
+        r.respond.send(true).unwrap();
+    })
+    .unwrap()
+    .unwrap();
+    let config = ProviderConfig {
+        base_url: model.uri(),
+        api_key: String::new(),
+        model: "fixture".into(),
+        reasoning_effort: None,
+        kind: ProviderKind::OpenAICompatible,
+    };
+    let mut rx = client::run_with_mcp(
+        vec![WireMessage::new(
+            "user",
+            Some(WireContent::Text("幫我查看 MCP 設定並測試已存服務".into())),
+            None,
+            None,
+        )],
+        config,
+        None,
+        Some(turn),
+    );
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut events = vec![];
+        while let Some(e) = rx.recv().await {
+            events.push(e);
+        }
+        events
+    })
+    .await
+    .unwrap();
+    assert!(events.contains(&ChatStreamEvent::McpOpenSettings(Some(id))));
+    assert_eq!(
+        events.last(),
+        Some(&ChatStreamEvent::Done(
+            "已經你確認完成連線測試，服務仍停用。".into()
+        ))
+    );
+    assert_eq!(rounds.load(Ordering::SeqCst), 4);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
 async fn server(counter: Arc<AtomicUsize>) -> MockServer {
@@ -240,7 +526,15 @@ async fn server_metadata_cannot_leak_its_auth_token_to_the_model() {
         |_| panic!("discovery must not execute tool"),
     );
     let (tx, _) = mpsc::unbounded_channel();
-    assert!(turn.open(&tx).await.is_err());
+    let mut catalog = turn.open(&tx).await.unwrap();
+    assert_eq!(
+        catalog.schemas().len(),
+        3,
+        "only local management tools, no leaked remote schema"
+    );
+    let status = catalog.execute("mcp_status", "{}", &tx).await;
+    assert!(status.contains("\"discovery_failed\":true"));
+    assert!(!status.contains("synthetic-private-token"));
 }
 
 #[test]
@@ -340,7 +634,15 @@ async fn responses_actual_tool_loop_supports_mcp_without_native_credentials_or_w
     Mock::given(method("POST")).respond_with(move |req:&Request| {
         let body:Value=req.body_json().unwrap();let round=count.fetch_add(1,Ordering::SeqCst);
         let events=if round==0 {
+            assert!(body["tools"].as_array().unwrap().iter().all(|t|t["strict"]==false));
+            for name in ["mcp_status","open_mcp_settings","test_mcp_service"] {assert!(body["tools"].as_array().unwrap().iter().any(|t|t["name"]==name));}
+            vec![json!({"type":"response.output_item.done","item":{"type":"function_call","call_id":"mcp-status-call","name":"mcp_status","arguments":"{}"}}),json!({"type":"response.completed"})]
+        } else if round==1 {
+            let last=body["input"].as_array().unwrap().last().unwrap();assert_eq!(last["call_id"],"mcp-status-call");
+            let status:Value=serde_json::from_str(last["output"].as_str().unwrap()).unwrap();assert_eq!(status["services"][0]["enabled"],true);assert_eq!(status["services"][0]["tools_available_this_turn"],true);
             let name=body["tools"][0]["name"].as_str().unwrap();assert_eq!(body["tools"][0]["type"],"function");
+            assert_eq!(body["tools"][0]["parameters"]["required"],json!(["text"]));assert_eq!(body["tools"][0]["parameters"]["properties"]["optional_note"]["type"],"string");
+            assert!(body["tools"].as_array().unwrap().iter().all(|t|t["strict"]==false));
             vec![json!({"type":"response.output_item.done","item":{"type":"function_call","call_id":"mcp-response-call","name":name,"arguments":"{\"text\":\"responses echo\"}"}}),json!({"type":"response.completed"})]
         } else {
             let last=body["input"].as_array().unwrap().last().unwrap();assert_eq!(last["type"],"function_call_output");assert_eq!(last["call_id"],"mcp-response-call");assert!(last["output"].as_str().unwrap().contains("responses echo"));
@@ -394,7 +696,7 @@ async fn responses_actual_tool_loop_supports_mcp_without_native_credentials_or_w
         Some(&ChatStreamEvent::Done("Responses MCP answer".into()))
     );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert_eq!(rounds.load(Ordering::SeqCst), 2);
+    assert_eq!(rounds.load(Ordering::SeqCst), 3);
 }
 
 #[tokio::test]

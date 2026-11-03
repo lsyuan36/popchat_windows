@@ -52,6 +52,7 @@ impl ProviderConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChatStreamEvent {
     McpProposal(super::mcp::Draft),
+    McpOpenSettings(Option<uuid::Uuid>),
     /// Transport supplied a terminal sentinel/event (EOF alone is not enough
     /// to commit a compaction checkpoint).
     CompletionConfirmed,

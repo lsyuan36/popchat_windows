@@ -2,7 +2,7 @@
 
 輕量的 Windows 浮動 AI 聊天面板，以 **Rust + egui/eframe** 實作。
 
-**Windows 移植／維護：Evis Lai** · 目前版本：**0.2.2**
+**Windows 移植／維護：Evis Lai** · 目前版本：**0.2.3**
 
 > 本專案移植自 **Le Chen / lec77** 的 macOS 專案
 > **[lec77/PopChat](https://github.com/lec77/PopChat)**。
@@ -11,10 +11,11 @@
 
 ## 下載與啟動
 
-從 **[GitHub Releases](https://github.com/lsyuan36/popchat_windows/releases/tag/v0.2.2)**
-下載 **`PopChat-0.2.2-Windows-x64-Setup.exe`**（NSIS 安裝程式）。
-**0.2.2** 加入 MCP 與繁體中文內建提示詞，並完整保留 Auto Compact。
-已安裝 0.2.1 的使用者可用程式內更新，或先結束 PopChat 再執行新版 Setup 升級。
+從 **[GitHub Releases](https://github.com/lsyuan36/popchat_windows/releases/tag/v0.2.3)**
+下載 **`PopChat-0.2.3-Windows-x64-Setup.exe`**（NSIS 安裝程式）。
+**0.2.3** 補上聊天內 MCP 狀態查詢／設定／連線測試工具，並將更新進度改為細線設計。
+保留繁體中文內建提示詞與 Auto Compact。0.2.1／0.2.2 使用者可用程式內更新，
+或先結束 PopChat 再執行新版 Setup 升級。
 0.2.0 Setup 的首次安裝路徑問題已於 0.2.1 修正，請優先使用新版。
 
 1. 先從系統匣結束正在執行的 PopChat，再執行 Setup。
@@ -73,6 +74,7 @@ ChatGPT／Codex 整合的可用性取決於帳號、方案、外部工具及服�
 
 有新版時先下載並驗證 GitHub 資產 SHA-256，再由使用者確認安裝和重新啟動。
 更新助手等待目前程式完全退出，才替換執行檔；不會同時開兩個聊天 UI。
+0.2.3 的下載進度使用 3px 圓角細線，百分比與下載量分開顯示；未知總長度時不虛構百分比。
 安裝不更換資料目錄、不重匯入服務、不讀寫遷移憑證。
 請在確認重新啟動前完成尚未送出的訊息與未儲存的 API 編輯。
 若自動更新無法使用，仍可從 Releases 下載 ZIP 手動更新。
@@ -101,6 +103,11 @@ Codex app-server 沿用其原生上下文管理。實作邊界與隔離驗證見
 使用方式、安全邊界及首版限制見 [MCP.md](https://github.com/lsyuan36/popchat_windows/blob/main/MCP.md)。
 0.2.1 安裝包不含 MCP；需升級至 0.2.2。Codex app-server 仍不啟用 MCP，
 HTTP 首版僅支援手動 Bearer token，不提供自動 OAuth 登入。
+
+0.2.3 補上 `mcp_status`、`open_mcp_settings` 與 `test_mcp_service`，沒有啟用服務時也能
+查詢狀態、開啟設定，或經人工確認後測試已儲存但停用的服務。不開放任意 shell／curl，
+不將 token 交給模型；保存／啟用仍由使用者完成，新工具於下一次送出起生效。
+需要模型支援 function calling，Codex app-server 邊界不變；詳見 [MCP.md](https://github.com/lsyuan36/popchat_windows/blob/main/MCP.md)。
 
 ## 資料與隱私
 

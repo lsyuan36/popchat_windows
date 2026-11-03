@@ -171,7 +171,11 @@ fn mcp_approval_is_current(
     !request.respond.is_closed()
         && request.conversation_id == conversation_id
         && assistant_id == Some(request.turn_id)
-        && services.iter().any(|s| s == &request.service && s.enabled)
+        && services.iter().any(|s| {
+            s == &request.service
+                && (s.enabled
+                    || request.action == popchat_windows::chat::mcp::ApprovalAction::ConnectionTest)
+        })
 }
 
 struct PopChatApp {
@@ -1863,6 +1867,9 @@ impl PopChatApp {
                 if let ChatStreamEvent::McpProposal(draft) = &ev {
                     self.mcp.review(draft.clone());
                 }
+                if let ChatStreamEvent::McpOpenSettings(id) = &ev {
+                    self.mcp.open_settings(*id);
+                }
                 let terminal = matches!(
                     &ev,
                     ChatStreamEvent::Done(_)
@@ -2794,6 +2801,78 @@ mod mcp_approval_tests {
     use super::*;
     use popchat_windows::chat::mcp::{ApprovalRequest, Draft, Service, Transport};
     #[test]
+    fn connection_test_can_target_disabled_service_but_never_stale_or_changed_snapshot() {
+        let service = Service {
+            id: Uuid::new_v4(),
+            draft: Draft {
+                name: "disabled fixture".into(),
+                transport: Transport::Http {
+                    url: "https://fixture.invalid/mcp".into(),
+                },
+                token_env: None,
+            },
+            enabled: false,
+            secret_ref: None,
+        };
+        let (respond, decision) = tokio::sync::oneshot::channel();
+        let mut request = ApprovalRequest {
+            action: popchat_windows::chat::mcp::ApprovalAction::ConnectionTest,
+            service: service.clone(),
+            tool: "initialize → tools/list".into(),
+            arguments: serde_json::json!({}),
+            conversation_id: Uuid::new_v4(),
+            turn_id: Uuid::new_v4(),
+            respond,
+        };
+        assert!(mcp_approval_is_current(
+            &request,
+            request.conversation_id,
+            Some(request.turn_id),
+            &[service.clone()]
+        ));
+        assert!(!mcp_approval_is_current(
+            &request,
+            Uuid::new_v4(),
+            Some(request.turn_id),
+            &[service.clone()]
+        ));
+        assert!(!mcp_approval_is_current(
+            &request,
+            request.conversation_id,
+            Some(Uuid::new_v4()),
+            &[service.clone()]
+        ));
+        assert!(!mcp_approval_is_current(
+            &request,
+            request.conversation_id,
+            None,
+            &[service.clone()]
+        ));
+        let mut changed = service.clone();
+        changed.secret_ref = Some(Uuid::new_v4());
+        assert!(!mcp_approval_is_current(
+            &request,
+            request.conversation_id,
+            Some(request.turn_id),
+            &[changed]
+        ));
+        request.action = popchat_windows::chat::mcp::ApprovalAction::ToolCall;
+        assert!(!mcp_approval_is_current(
+            &request,
+            request.conversation_id,
+            Some(request.turn_id),
+            &[service.clone()]
+        ));
+        request.action = popchat_windows::chat::mcp::ApprovalAction::ConnectionTest;
+        drop(decision);
+        assert!(!mcp_approval_is_current(
+            &request,
+            request.conversation_id,
+            Some(request.turn_id),
+            &[service]
+        ));
+    }
+    #[test]
     fn production_gate_rejects_stale_turn_changed_service_disabled_and_cancelled_requests() {
         let service = Service {
             id: Uuid::new_v4(),
@@ -2809,6 +2888,7 @@ mod mcp_approval_tests {
         };
         let (respond, decision) = tokio::sync::oneshot::channel();
         let request = ApprovalRequest {
+            action: popchat_windows::chat::mcp::ApprovalAction::ToolCall,
             service: service.clone(),
             tool: "echo".into(),
             arguments: serde_json::json!({}),

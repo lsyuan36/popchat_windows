@@ -920,7 +920,7 @@ impl ChatStore {
         providers: &mut ProviderStore,
     ) {
         match event {
-            ChatStreamEvent::McpProposal(_) => {}
+            ChatStreamEvent::McpProposal(_) | ChatStreamEvent::McpOpenSettings(_) => {}
             ChatStreamEvent::ContextUpdate(state) => {
                 if self.streaming_message_id == Some(turn.assistant_id) {
                     let previous = std::mem::replace(&mut self.context, state);

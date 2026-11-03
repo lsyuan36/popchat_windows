@@ -1805,21 +1805,7 @@ impl SettingsUi {
         match &self.update_download.state {
             crate::update::DownloadState::Idle => {}
             crate::update::DownloadState::Downloading { received, total } => {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("下載並驗證更新中…");
-                });
-                if let Some(total) = total.filter(|total| *total > 0) {
-                    ui.add(
-                        egui::ProgressBar::new((*received as f32 / total as f32).clamp(0.0, 1.0))
-                            .show_percentage(),
-                    );
-                } else {
-                    muted(
-                        ui,
-                        &format!("已下載 {:.1} MiB", *received as f64 / 1_048_576.0),
-                    );
-                }
+                let _ = update_download_progress(ui, *received, *total);
             }
             crate::update::DownloadState::Ready(prepared) => {
                 ui.label(format!("{} 已下載並通過完整性驗證。", prepared.version()));
@@ -2177,6 +2163,52 @@ fn muted(ui: &mut egui::Ui, text: &str) {
     );
 }
 
+/// Download feedback is informational, not a 32pt-tall settings control.
+/// Keep text outside the track so a readable label never makes the bar thick.
+fn update_download_progress(
+    ui: &mut egui::Ui,
+    received: u64,
+    total: Option<u64>,
+) -> Option<egui::Response> {
+    let total = total.filter(|total| *total > 0);
+    let progress = total.map(|total| (received as f64 / total as f64).clamp(0.0, 1.0) as f32);
+    let palette = theme::current_palette(ui.ctx());
+    ui.horizontal(|ui| {
+        if progress.is_none() {
+            ui.add(egui::Spinner::new().size(12.0));
+        }
+        muted(ui, "下載並驗證更新中…");
+        if let Some(progress) = progress {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    egui::RichText::new(format!("{:.0}%", (progress * 100.0).floor()))
+                        .size(11.0)
+                        .monospace()
+                        .color(secondary(palette.dark)),
+                );
+            });
+        }
+    });
+    let response = progress.map(|progress| {
+        ui.add(
+            egui::ProgressBar::new(progress)
+                .desired_width(ui.available_width())
+                .desired_height(3.0)
+                .corner_radius(2)
+                .fill(palette.accent.gamma_multiply(0.85)),
+        )
+    });
+    let mib = received as f64 / 1_048_576.0;
+    muted(
+        ui,
+        &match total {
+            Some(total) => format!("{mib:.1} / {:.1} MiB", total as f64 / 1_048_576.0),
+            None => format!("已下載 {mib:.1} MiB"),
+        },
+    );
+    response
+}
+
 fn field_label(ui: &mut egui::Ui, text: &str) {
     muted(ui, text);
 }
@@ -2301,6 +2333,85 @@ fn search_engine_label(engine: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_progress_is_a_thin_track_despite_settings_control_height() {
+        for dark in [false, true] {
+            for received in [0, 524_288, 1_048_576, u64::MAX] {
+                let ctx = egui::Context::default();
+                theme::apply(
+                    &ctx,
+                    if dark { "Dark" } else { "Light" },
+                    theme::DEFAULT_ACCENT_HEX,
+                );
+                let mut rect = None;
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(360.0, 200.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            settings_style(ui);
+                            assert_eq!(ui.spacing().interact_size.y, 32.0);
+                            rect = update_download_progress(ui, received, Some(1_048_576))
+                                .map(|response| response.rect);
+                        });
+                    },
+                );
+                let rect = rect.unwrap();
+                assert_eq!(rect.height(), 3.0);
+                assert!(rect.width() > 250.0);
+                assert!(rect.right() <= 360.0);
+                let text = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert!(text.contains(&"下載並驗證更新中…"));
+                let expected = if received == 0 {
+                    "0%"
+                } else if received == 524_288 {
+                    "50%"
+                } else {
+                    "100%"
+                };
+                assert!(
+                    text.contains(&expected),
+                    "missing separate percentage: {text:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn update_progress_without_content_length_does_not_invent_a_percentage() {
+        for total in [None, Some(0)] {
+            let ctx = egui::Context::default();
+            let output = ctx.run(Default::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    settings_style(ui);
+                    assert!(update_download_progress(ui, 1_048_576, total).is_none());
+                });
+            });
+            let text = output
+                .shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert!(text.contains(&"已下載 1.0 MiB"));
+            assert!(text.iter().all(|text| !text.contains('%')));
+        }
+    }
 
     fn provider(id: u128, endpoint: &str) -> Provider {
         Provider::new(

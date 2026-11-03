@@ -180,6 +180,9 @@ impl ResponsesBackend {
             for tool in catalog.schemas() {
                 let mut function = tool["function"].clone();
                 function["type"] = json!("function");
+                // MCP input schemas can contain optional fields. Responses
+                // must not implicitly normalize them into strict/required.
+                function["strict"] = json!(false);
                 tools.push(function);
             }
         }

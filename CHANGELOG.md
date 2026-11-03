@@ -1,3 +1,13 @@
+# v0.2.3
+
+- 程式內更新下載進度改為 3px 圓角細線，百分比與下載量移到色條外，避免沿用設定控制項的 32px 高度；未知總長度時不虛構百分比。
+- 正常聊天即提供 `mcp_status`／`open_mcp_settings`／`test_mcp_service`，不再因沒有啟用 MCP 或沒開啟模型草稿而完全缺少管理入口；需模型支援 function calling，Codex 邊界不變。
+- 已儲存的停用服務也可由助手請求連線測試，但須獨立人工確認；只握手／探索，不啟用、不執行工具、不接受任意 URL／token。
+- 連線／探索或憑證失敗的服務不阻斷整輪聊天，保留本機診斷工具；不洩漏服務錯誤內容或 token。
+- Responses 明確使用非嚴格 function schema，避免改變 MCP 選填欄位。
+- MCP 設定的儲存按鈕移到捲動區外的固定底部，避免說明文字／多個服務把確認按鈕裁切。
+- 本機完整回歸：594 library、28 app、1 send-pipeline integration、15 importer passed；3 ignored（638 項通過）。
+
 # v0.2.2
 
 - 新增 MCP Client：stdio 與 Streamable HTTP，含服務管理、工具探索與連線測試。
