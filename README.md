@@ -11,10 +11,10 @@
 
 ## 下載與啟動
 
-**0.2.1** 安裝包可從 **[GitHub Actions](https://github.com/lsyuan36/popchat_windows/actions/workflows/windows-build.yml)**
-成功的工作流程下載 `PopChat-Windows-x64-NSIS` Artifact，解壓取得
-**`PopChat-0.2.1-Windows-x64-Setup.exe`**（NSIS 安裝程式）。
-已發佈的歷史版本另見 [Releases](https://github.com/lsyuan36/popchat_windows/releases)。
+從 **[GitHub Releases](https://github.com/lsyuan36/popchat_windows/releases/tag/v0.2.1)**
+下載 **`PopChat-0.2.1-Windows-x64-Setup.exe`**（NSIS 安裝程式）。
+本次 **0.2.1 修訂重發包**加入 Auto Compact；若先前已安裝 0.2.1，
+請重新下載 Setup 安裝，因版本相同不會自動提示更新。請以新版 manifest／SHA-256 識別修訂包。
 0.2.0 Setup 的首次安裝路徑問題已於 0.2.1 修正，請優先使用新版。
 
 1. 先從系統匣結束正在執行的 PopChat，再執行 Setup。
@@ -86,8 +86,11 @@ ChatGPT／Codex 整合的可用性取決於帳號、方案、外部工具及服�
 按「使用預設」可移除此模型的覆寫。
 
 「儲存此模型上限」只保存該項偏好，不會提交端點／金鑰／模型選擇草稿。
-這不是單次回答的 `max_tokens`。**0.2.1 目前只完成預算設定，auto compact
-摘要、用量追蹤及超限恢復流程尚未啟用。**
+這不是單次回答的 `max_tokens`。**0.2.1 修訂重發包**接入前景 Auto Compact：
+保留完整歷史，以摘要 checkpoint 搭配近期原文送出，並提供 usage 記錄、取消與有界超限恢復。
+摘要會額外使用目前模型的額度。圖片／原始 PDF 不會被摘要丟棄；若無法安全縮減則停止送出。
+Codex app-server 沿用其原生上下文管理。實作邊界與隔離驗證見 [AUTO_COMPACT.md](https://github.com/lsyuan36/popchat_windows/blob/main/AUTO_COMPACT.md)。
+原先的 0.2.1 安裝包只有預算設定；既有安裝需重新下載更新，不會因原始碼改動自行變更。
 
 ## 資料與隱私
 

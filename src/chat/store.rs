@@ -398,6 +398,7 @@ pub struct ActiveTurn {
 
 #[derive(Debug)]
 pub struct OutgoingTurn {
+    pub context: super::compaction::ContextRequest,
     pub history: Vec<WireMessage>,
     pub config: ProviderConfig,
     pub web_access: Option<WebAccess>,
@@ -574,6 +575,7 @@ impl RevealDrain {
 }
 
 pub struct ChatStore {
+    pub context: super::compaction::ContextState,
     pub messages: Vec<ChatMessage>,
     pub is_streaming: bool,
     /// Latest transient lifecycle note, rendered inside the waiting row
@@ -623,6 +625,7 @@ impl ChatStore {
     /// Resume the most recent conversation across restarts.
     pub fn new() -> Self {
         let mut store = ChatStore {
+            context: Default::default(),
             messages: Vec::new(),
             is_streaming: false,
             pending_status: None,
@@ -661,6 +664,7 @@ impl ChatStore {
         self.restored_into_empty_panel = self.messages.is_empty();
         self.restore_tick += 1;
         self.conversation_id = conversation.id;
+        self.context = conversation.context;
         self.messages = messages;
         if missing_parent {
             self.fork_parent_id = None;
@@ -887,6 +891,11 @@ impl ChatStore {
         self.streaming_message_id = Some(assistant_id);
 
         SendOutcome::Ready(OutgoingTurn {
+            context: super::compaction::ContextRequest {
+                limit: providers.current_context_limit(),
+                provider_id: send_provider_id,
+                state: self.context.clone(),
+            },
             history,
             config: config.clone(),
             web_access,
@@ -911,6 +920,23 @@ impl ChatStore {
         providers: &mut ProviderStore,
     ) {
         match event {
+            ChatStreamEvent::ContextUpdate(state) => {
+                if self.streaming_message_id == Some(turn.assistant_id) {
+                    let previous = std::mem::replace(&mut self.context, state);
+                    if !self.persist() {
+                        self.context = previous;
+                        self.messages.push(ChatMessage::new(
+                            ChatRole::Error,
+                            "上下文摘要／用量未能保存；原始歷史沒有刪除，請檢查資料夾寫入權限。",
+                        ));
+                    }
+                }
+            }
+            ChatStreamEvent::Usage(_) | ChatStreamEvent::CompletionConfirmed => {}
+            ChatStreamEvent::ContextOverflow(message) => {
+                self.messages
+                    .push(ChatMessage::new(ChatRole::Error, message));
+            }
             ChatStreamEvent::Partial(text) | ChatStreamEvent::Done(text) => {
                 self.accept_arrived_text(turn.assistant_id, &text);
                 if !text.is_empty() {
@@ -1321,6 +1347,7 @@ impl ChatStore {
         self.conversation_id = Uuid::new_v4();
         self.shared_prefix_count = index + 1;
         self.messages.truncate(index + 1);
+        self.context = Default::default();
         self.messages.push(ChatMessage::new(
             ChatRole::Activity,
             "Forked here — this branch diverges from the original conversation.",
@@ -1380,6 +1407,7 @@ impl ChatStore {
             self.shared_prefix_count = 0;
         }
         self.messages.truncate(count);
+        self.context = Default::default();
         if self.messages.is_empty() {
             // persist() skips empty conversations, so delete explicitly or
             // the file keeps serving the pre-truncation transcript.
@@ -1398,6 +1426,7 @@ impl ChatStore {
             self.stop();
             self.conversation_id = Uuid::new_v4();
             self.messages.clear();
+            self.context = Default::default();
             self.fork_parent_id = None;
             self.fork_message_id = None;
             self.shared_prefix_count = 0;
@@ -1414,6 +1443,7 @@ impl ChatStore {
         self.persist();
         self.conversation_id = Uuid::new_v4();
         self.messages.clear();
+        self.context = Default::default();
         self.fork_parent_id = None;
         self.fork_message_id = None;
         self.shared_prefix_count = 0;
@@ -1446,13 +1476,14 @@ impl ChatStore {
     /// Writes the current conversation to disk (a fork stores only its
     /// divergent tail) and refreshes its slot in the recent list. No-op for
     /// empty conversations (avoids junk files).
-    pub fn persist(&mut self) {
+    pub fn persist(&mut self) -> bool {
         if self.messages.is_empty() {
-            return;
+            return true;
         }
         self.search_corpus = None; // the stored set changed; rebuild on next search
         let title = Self::title_for(&self.messages);
         let conversation = Conversation {
+            context: self.context.clone(),
             id: self.conversation_id,
             title: title.clone(),
             updated_at: Utc::now(),
@@ -1460,7 +1491,10 @@ impl ChatStore {
             parent_id: self.fork_parent_id,
             fork_message_id: self.fork_message_id,
         };
-        ConversationStore::save(&conversation);
+        if let Err(error) = ConversationStore::try_save(&conversation) {
+            crate::logf!("[store] could not save conversation: {error}");
+            return false;
+        }
         self.recent.retain(|m| m.id != self.conversation_id);
         self.recent.insert(
             0,
@@ -1472,6 +1506,7 @@ impl ChatStore {
                 is_fork: self.fork_parent_id.is_some(),
             },
         );
+        true
     }
 
     fn title_for(messages: &[ChatMessage]) -> String {
@@ -1503,6 +1538,8 @@ impl Default for ChatStore {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {
+    #[serde(default)]
+    pub context: super::compaction::ContextState,
     pub id: Uuid,
     pub title: String,
     pub updated_at: DateTime<Utc>,
@@ -1590,9 +1627,15 @@ impl ConversationStore {
     }
 
     pub fn save(conversation: &Conversation) {
-        if let Ok(data) = serde_json::to_vec(conversation) {
-            let _ = std::fs::write(Self::url_for(conversation.id), data);
+        if let Err(error) = Self::try_save(conversation) {
+            crate::logf!("[store] could not save conversation: {error}");
         }
+    }
+
+    pub fn try_save(conversation: &Conversation) -> anyhow::Result<()> {
+        let data = serde_json::to_vec(conversation)?;
+        crate::paths::atomic_write(&Self::url_for(conversation.id), &data)?;
+        Ok(())
     }
 
     pub fn load(id: Uuid) -> Option<Conversation> {
@@ -2785,6 +2828,7 @@ mod tests {
         let message = ChatMessage::new(ChatRole::Assistant, target);
         let id = message.id;
         ChatStore {
+            context: Default::default(),
             messages: vec![message],
             is_streaming: true,
             pending_status: None,
@@ -3246,6 +3290,7 @@ mod tests {
         assistant.reasoning = Some("seekrit thinking xyzzy".to_string());
         ConversationStore::save(&Conversation {
             id,
+            context: Default::default(),
             title: "t".to_string(),
             updated_at: Utc::now(),
             messages: vec![ChatMessage::new(ChatRole::User, "hello"), assistant],
@@ -3269,6 +3314,7 @@ mod tests {
         let parent_id = Uuid::new_v4();
         ConversationStore::save(&Conversation {
             id: parent_id,
+            context: Default::default(),
             title: "p".to_string(),
             updated_at: Utc::now(),
             messages: vec![m1.clone(), m2.clone()],
@@ -3279,6 +3325,7 @@ mod tests {
         let m3 = ChatMessage::new(ChatRole::User, "three");
         ConversationStore::save(&Conversation {
             id: child_id,
+            context: Default::default(),
             title: "c".to_string(),
             updated_at: Utc::now(),
             messages: vec![m3.clone()],

@@ -5,6 +5,7 @@ pub mod client;
 pub mod clipboard;
 pub mod codex;
 pub mod commands;
+pub mod compaction;
 pub mod context;
 pub mod providers;
 pub mod responses;

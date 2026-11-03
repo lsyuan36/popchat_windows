@@ -1830,6 +1830,7 @@ impl PopChatApp {
                     &ev,
                     ChatStreamEvent::Done(_)
                         | ChatStreamEvent::Error(_)
+                        | ChatStreamEvent::ContextOverflow(_)
                         | ChatStreamEvent::ContentRejected { .. }
                 );
                 self.chat
@@ -2647,6 +2648,7 @@ impl PopChatApp {
         self.backend
             .set_session_id(self.chat.conversation_id.to_string());
         let OutgoingTurn {
+            context,
             history,
             config,
             web_access,
@@ -2654,7 +2656,8 @@ impl PopChatApp {
         } = turn;
         let (tx, rx) = std::sync::mpsc::channel::<ChatStreamEvent>();
         let handle = self.runtime.spawn(async move {
-            let mut stream = client::run(history, config, web_access);
+            let mut stream =
+                popchat_windows::chat::compaction::run(history, config, web_access, context);
             while let Some(ev) = stream.recv().await {
                 if tx.send(ev).is_err() {
                     break;

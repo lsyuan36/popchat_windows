@@ -263,6 +263,16 @@ impl ResponsesBackend {
             }
             if status != 200 {
                 let body = error_body(response).await;
+                if matches!(status, 400 | 413 | 422)
+                    && serde_json::from_str(&body)
+                        .ok()
+                        .as_ref()
+                        .is_some_and(super::compaction::is_overflow)
+                {
+                    let _ = tx.send(ChatStreamEvent::ContextOverflow(
+                        "ChatGPT reported context_length_exceeded".into(),
+                    ));
+                }
                 anyhow::bail!(friendly_http_error(status, &body));
             }
             return consume_stream(response, visible_prefix, reasoning_prefix, tx).await;
@@ -336,12 +346,24 @@ impl StreamState {
             return Ok(false);
         };
         if payload == "[DONE]" {
+            let _ = tx.send(ChatStreamEvent::CompletionConfirmed);
             return Ok(true);
         }
         let Ok(event) = serde_json::from_str::<Value>(payload) else {
             return Ok(false);
         };
         let outcome = &mut self.outcome;
+        if super::compaction::is_overflow(&event)
+            || super::compaction::is_overflow(&event["response"])
+        {
+            let _ = tx.send(ChatStreamEvent::ContextOverflow(
+                "ChatGPT reported context_length_exceeded".into(),
+            ));
+            anyhow::bail!("ChatGPT context limit exceeded");
+        }
+        if let Some(usage) = super::compaction::usage(&event["response"]["usage"]) {
+            let _ = tx.send(ChatStreamEvent::Usage(usage));
+        }
         match event["type"].as_str().unwrap_or("") {
             "response.output_text.delta" | "response.refusal.delta" => {
                 if let Some(piece) = event["delta"].as_str().filter(|piece| !piece.is_empty()) {
@@ -395,7 +417,10 @@ impl StreamState {
                     }
                 }
             }
-            "response.completed" | "response.done" => return Ok(true),
+            "response.completed" | "response.done" => {
+                let _ = tx.send(ChatStreamEvent::CompletionConfirmed);
+                return Ok(true);
+            }
             "response.incomplete" => {
                 outcome.incomplete_reason = Some(
                     event["response"]["incomplete_details"]["reason"]
@@ -499,6 +524,27 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn context_usage_terminal_confirmation_and_structured_overflow_are_emitted() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = StreamState::new("", "");
+        assert!(state.line("data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":120,\"output_tokens\":9}}}", &tx).unwrap());
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            ChatStreamEvent::Usage(super::super::compaction::TokenUsage {
+                input_tokens: 120,
+                output_tokens: 9
+            })
+        );
+        assert_eq!(rx.try_recv().unwrap(), ChatStreamEvent::CompletionConfirmed);
+        let mut state = StreamState::new("", "");
+        assert!(state.line("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"context_length_exceeded\"}}}", &tx).is_err());
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ChatStreamEvent::ContextOverflow(_)
+        ));
+    }
 
     #[derive(Default)]
     struct MemoryStore(Mutex<Option<Tokens>>);
@@ -606,8 +652,20 @@ mod tests {
         // Neither running turn may observe this later conversation switch.
         backend.set_session_id("conversation-c".into());
         let (first, second) = tokio::join!(collect(first), collect(second));
-        assert_eq!(first, vec![ChatStreamEvent::Done(String::new())]);
-        assert_eq!(second, vec![ChatStreamEvent::Done(String::new())]);
+        assert_eq!(
+            first,
+            vec![
+                ChatStreamEvent::CompletionConfirmed,
+                ChatStreamEvent::Done(String::new())
+            ]
+        );
+        assert_eq!(
+            second,
+            vec![
+                ChatStreamEvent::CompletionConfirmed,
+                ChatStreamEvent::Done(String::new())
+            ]
+        );
         for request in server.received_requests().await.unwrap() {
             let body: Value = serde_json::from_slice(&request.body).unwrap();
             assert_eq!(
@@ -678,6 +736,7 @@ mod tests {
                 ChatStreamEvent::Reasoning("First\n\nSecond".into()),
                 ChatStreamEvent::Partial("Hello".into()),
                 ChatStreamEvent::Partial("Hello world".into()),
+                ChatStreamEvent::CompletionConfirmed,
                 ChatStreamEvent::Done("Hello world".into()),
             ]
         );

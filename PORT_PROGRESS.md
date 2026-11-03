@@ -7,6 +7,27 @@
 
 **前次已安裝邊界（2026-11-02）：** 唯一 app 為 **PID 324**，**v0.2.0**，作者 **Evis Lai**，`%LOCALAPPDATA%\Programs\PopChat\popchat_windows.exe`，正式預設 `%APPDATA%\PopChat\PopChat\config`，**`isolated=false`**；圖示 hover／TT Norms Pro→Arial 英文預設／程式內確認下載安裝更新已接線，保留先前字級、錄製、轉場與表格 Copy。正常關閉 PID 20820／確認零實例才更新，app/helper SHA 與 manifest 核對；兩個 custom providers、偏好／指令／歷史 hashes 保留，沒有 credential importer。手動中英字體與快捷鍵不遷移；不 Save API／Send／改真正剪貼簿／啟用開機啟動。最後 raw 視窗非前景／off-screen，沒有強行喚回。單一 chat UI 約束持續適用，updater helper 不建立聊天 UI。後續 0.2.1 原始碼更新不代表已替換這份安裝。
 
+## 0.2.1 修訂重發：Auto Compact 實際送出接線
+
+- 已確認原缺口：模型預算只保存、沒有進入送出；另以使用者同意的 `qwen3.8-27b-vl`
+  合成文字實驗發現摘要請求停在助手回覆可能只續寫確認文字。初次摘要組 5/15；
+  補上明確末尾 user 摘要任務後，摘要＋近期原文與完整歷史皆為 15/15，輸入
+  21,150 → 704 tokens。這是單一資料集的可行性測試，不是全面功能驗收。
+- 正式原始碼 caller 已串接 `send → OutgoingTurn.context → start_stream → compaction::run`，
+  近上限先摘要、以 checkpoint＋近期原文送出；歷史與附件不作破壞式刪除。
+- 純 mock pipeline 與實際 ChatStore 整合首批測試通過，涵蓋分段摘要、無工具、
+  system／近期原文、失敗不提交、一次 overflow retry、部分輸出不重試、保存／重載與 legacy JSON。
+  後續取消（確實關閉停滯中的摘要 HTTP）、反覆 checkpoint 接續、只有 EOF 不提交、
+  重複助手確認文字拒絕、stale event 隔離與保存失敗 rollback 亦已通過。
+- 本輪最終 `cargo fmt`／`cargo check --locked --all-targets`／`git diff --check` 通過；
+  all-target tests：**562 library、26 app、1 store-to-pipeline integration、15 importer passed，
+  3 ignored**，無 warning。網路功能回歸使用本機 mock，不把前述可行性實驗冒充新正式流程的真實服務全驗收。
+- OpenAI-compatible／ChatGPT usage 已接入；fallback 明確為估算。Codex app-server
+  保持原生 context；圖片／原始 PDF 不會當成文字摘要，若阻止安全縮減則停止。
+- 具體演算法、取消／存檔失敗保護及未驗收範圍見 `AUTO_COMPACT.md`。
+  依使用者後續要求，沿用 0.2.1 版本重建並替換 Release，CI／發佈結果須另行核對；
+  相同版本不會自動提示更新。本輪不重裝、不啟動聊天 UI、不使用真實聊天內容。
+
 ## Swift → Rust → 應用入口
 
 | 原版函式／動作 | 本輪 Rust 路徑 | 驗證邊界 |

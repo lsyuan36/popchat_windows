@@ -51,6 +51,12 @@ impl ProviderConfig {
 /// reply is still empty and never persisted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChatStreamEvent {
+    /// Transport supplied a terminal sentinel/event (EOF alone is not enough
+    /// to commit a compaction checkpoint).
+    CompletionConfirmed,
+    Usage(super::compaction::TokenUsage),
+    ContextUpdate(super::compaction::ContextState),
+    ContextOverflow(String),
     Partial(String),
     Activity(String),
     Status(String),
@@ -411,6 +417,10 @@ async fn run_loop(
                 if tx.is_closed() {
                     return; // receiver dropped; store keeps the partial
                 }
+                if error.context_overflow {
+                    let _ = tx.send(ChatStreamEvent::ContextOverflow(error.message));
+                    return;
+                }
                 match error.content_rejection {
                     Some(capability) => {
                         let _ = tx.send(ChatStreamEvent::ContentRejected {
@@ -489,6 +499,7 @@ struct RoundOutcome {
 
 struct ClientError {
     message: String,
+    context_overflow: bool,
     /// Set when the failure was structurally attributed to a content kind.
     content_rejection: Option<ContentCapability>,
 }
@@ -497,6 +508,7 @@ impl ClientError {
     fn new(message: impl Into<String>) -> Self {
         ClientError {
             message: message.into(),
+            context_overflow: false,
             content_rejection: None,
         }
     }
@@ -648,6 +660,7 @@ async fn stream_one_round(
     let mut body = serde_json::json!({
         "model": config.model,
         "stream": true,
+        "stream_options": { "include_usage": true },
         "messages": serde_json::to_value(messages)
             .map_err(|e| ClientError::new(format!("Encoding messages failed: {e}")))?,
     });
@@ -682,6 +695,11 @@ async fn stream_one_round(
         let error_body = read_error_body(response).await?;
         let host = url_host(&config.base_url);
         return Err(ClientError {
+            context_overflow: matches!(code, 400 | 413 | 422)
+                && serde_json::from_str(&error_body)
+                    .ok()
+                    .as_ref()
+                    .is_some_and(super::compaction::is_overflow),
             message: format!(
                 "HTTP {code} from {host}: {}",
                 if error_body.is_empty() {
@@ -701,10 +719,37 @@ async fn stream_one_round(
 
     let mut consume_line = |line: &str| {
         let line = line.trim_end_matches(['\r', '\n']);
+        if let Some(value) = line
+            .strip_prefix("data:")
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s.trim()).ok())
+        {
+            if super::compaction::is_overflow(&value) {
+                let _ = tx.send(ChatStreamEvent::ContextOverflow(
+                    "Provider reported context_length_exceeded".into(),
+                ));
+                return true;
+            }
+            if let Some(usage) = super::compaction::usage(&value["usage"]) {
+                let _ = tx.send(ChatStreamEvent::Usage(usage));
+            }
+            if value["choices"][0]["finish_reason"] == "stop" {
+                let _ = tx.send(ChatStreamEvent::CompletionConfirmed);
+            }
+            if value["choices"][0]["finish_reason"]
+                .as_str()
+                .is_some_and(|reason| matches!(reason, "length" | "content_filter"))
+            {
+                let _ = tx.send(ChatStreamEvent::Error(
+                    "Response ended early and may be incomplete.".into(),
+                ));
+                return true;
+            }
+        }
         let Some(delta) = decode_delta(line) else {
             return false;
         };
         if delta.is_done {
+            let _ = tx.send(ChatStreamEvent::CompletionConfirmed);
             return true;
         }
         if let Some(piece) = delta.content {

@@ -1,7 +1,7 @@
 //! User-selected context-window budgets, not vendor capability claims.
 //!
 //! These limits describe the whole model context, NOT `max_tokens` for one
-//! response. Compaction/usage accounting is a separate consumer of this policy.
+//! response. `compaction` consumes this policy in the actual send pipeline.
 
 pub const GPT_CONTEXT_LIMIT: u32 = 1_000_000;
 pub const OTHER_CONTEXT_LIMIT: u32 = 256_000;
