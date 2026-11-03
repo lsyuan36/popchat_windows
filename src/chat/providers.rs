@@ -618,6 +618,8 @@ struct PersistedProviderState {
     #[serde(default)]
     selected_model_efforts: HashMap<Uuid, HashMap<String, String>>,
     #[serde(default)]
+    context_limits: HashMap<Uuid, HashMap<String, u32>>,
+    #[serde(default)]
     model_capabilities: HashMap<Uuid, HashMap<String, ModelCapabilities>>,
     #[serde(default)]
     capability_exceptions: HashMap<Uuid, HashMap<String, CapabilityException>>,
@@ -650,6 +652,9 @@ pub struct ProviderStore {
     pub known_model_efforts: HashMap<Uuid, HashMap<String, Vec<String>>>,
     pub default_model_efforts: HashMap<Uuid, HashMap<String, String>>,
     pub selected_model_efforts: HashMap<Uuid, HashMap<String, String>>,
+    /// Explicit context-window overrides, scoped by provider UUID + model ID.
+    /// Kept separate from API drafts and output-token generation parameters.
+    context_limits: HashMap<Uuid, HashMap<String, u32>>,
     pub model_capabilities: HashMap<Uuid, HashMap<String, ModelCapabilities>>,
     pub capability_exceptions: HashMap<Uuid, HashMap<String, CapabilityException>>,
     /// Custom endpoints only: send PDFs as native `file` content parts.
@@ -774,6 +779,7 @@ impl ProviderStore {
             known_model_efforts: state.known_model_efforts,
             default_model_efforts: state.default_model_efforts,
             selected_model_efforts: state.selected_model_efforts,
+            context_limits: state.context_limits,
             model_capabilities: state.model_capabilities,
             capability_exceptions: state.capability_exceptions,
             pdf_pass_through: state.pdf_pass_through,
@@ -837,6 +843,7 @@ impl ProviderStore {
             known_model_efforts: self.known_model_efforts.clone(),
             default_model_efforts: self.default_model_efforts.clone(),
             selected_model_efforts: self.selected_model_efforts.clone(),
+            context_limits: self.context_limits.clone(),
             model_capabilities: self.model_capabilities.clone(),
             capability_exceptions: self.capability_exceptions.clone(),
             pdf_pass_through: self.pdf_pass_through.clone(),
@@ -1031,6 +1038,70 @@ impl ProviderStore {
 
     pub fn current_reasoning_effort(&self) -> Option<String> {
         self.remembered_effort(self.selected_id, &self.current_model())
+    }
+
+    pub fn context_limit_override(&self, id: Uuid, model: &str) -> Option<u32> {
+        self.context_limits
+            .get(&id)
+            .and_then(|limits| limits.get(model.trim()))
+            .copied()
+            .filter(|tokens| *tokens > 0)
+    }
+
+    pub fn context_limit(&self, id: Uuid, model: &str) -> u32 {
+        self.context_limit_override(id, model)
+            .unwrap_or_else(|| super::context::default_context_limit(model))
+    }
+
+    pub fn current_context_limit(&self) -> u32 {
+        self.context_limit(self.selected_id, &self.current_model())
+    }
+
+    /// Explicit preference save only: no model selection, endpoint or secret
+    /// changes. Restore in-memory state too if the atomic write fails.
+    pub fn set_context_limit(
+        &mut self,
+        id: Uuid,
+        model: &str,
+        limit: Option<u32>,
+    ) -> anyhow::Result<()> {
+        if let Some(error) = self.load_error() {
+            anyhow::bail!("{error}");
+        }
+        let model = model.trim();
+        anyhow::ensure!(
+            self.providers.iter().any(|provider| provider.id == id),
+            "Provider no longer exists"
+        );
+        anyhow::ensure!(
+            !model.is_empty(),
+            "Select a model before setting its context limit"
+        );
+        anyhow::ensure!(limit != Some(0), "Context limit must be positive");
+        let previous = self.context_limits.get(&id).cloned();
+        if let Some(limit) = limit {
+            self.context_limits
+                .entry(id)
+                .or_default()
+                .insert(model.to_owned(), limit);
+        } else if let Some(limits) = self.context_limits.get_mut(&id) {
+            limits.remove(model);
+            if limits.is_empty() {
+                self.context_limits.remove(&id);
+            }
+        }
+        if let Err(error) = self.try_save() {
+            match previous {
+                Some(limits) => {
+                    self.context_limits.insert(id, limits);
+                }
+                None => {
+                    self.context_limits.remove(&id);
+                }
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// The model a provider would come back with — its remembered choice,
@@ -1405,6 +1476,7 @@ impl ProviderStore {
         self.known_model_efforts.remove(&id);
         self.default_model_efforts.remove(&id);
         self.selected_model_efforts.remove(&id);
+        self.context_limits.remove(&id);
         self.model_capabilities.remove(&id);
         self.capability_exceptions.remove(&id);
         self.pdf_pass_through.remove(&id);
@@ -1803,6 +1875,13 @@ mod tests {
             assert!(!error.contains(directory.path().to_str().unwrap()));
             assert_eq!(std::fs::read(&path).unwrap(), original);
             assert!(store.try_save().is_err());
+            assert!(store
+                .set_context_limit(store.selected_id, "gpt-4.1", Some(128_000))
+                .is_err());
+            assert_eq!(
+                store.context_limit_override(store.selected_id, "gpt-4.1"),
+                None
+            );
             // Exercise the unchecked save path used by catalog/background work.
             store.add_custom();
             store.save();
@@ -1861,6 +1940,120 @@ mod tests {
         let reloaded = ProviderStore::load_at(path, |_| None);
         assert_eq!(reloaded.selected_id, id);
         assert_eq!(reloaded.selected_provider(), Some(&provider));
+    }
+
+    #[test]
+    fn context_limits_are_isolated_by_provider_and_model_and_survive_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("provider_store.json");
+        let mut store = ProviderStore::load_at(path.clone(), |_| None);
+        let first = store.add_custom();
+        let second = store.add_custom();
+        store.selected_id = second;
+        store.selected_models.insert(first, "gpt-4.1".into());
+        store.selected_models.insert(second, "other-model".into());
+        store
+            .settings_models
+            .insert(first, "settings-only-model".into());
+        store.pdf_pass_through.insert(first, true);
+        store.try_save().unwrap();
+        let mut before: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+
+        assert_eq!(store.context_limit(first, "gpt-4.1"), 1_000_000);
+        assert_eq!(store.current_context_limit(), 256_000);
+        store
+            .set_context_limit(first, "gpt-4.1", Some(128_000))
+            .unwrap();
+        store
+            .set_context_limit(first, "other-model", Some(64_000))
+            .unwrap();
+        assert_eq!(store.context_limit(first, "gpt-4.1"), 128_000);
+        assert_eq!(store.context_limit(first, "other-model"), 64_000);
+        assert_eq!(store.context_limit(second, "gpt-4.1"), 1_000_000);
+        assert_eq!(store.current_context_limit(), 256_000);
+        assert_eq!(store.selected_id, second);
+        assert_eq!(store.current_model(), "other-model");
+        let mut after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        before.as_object_mut().unwrap().remove("context_limits");
+        after.as_object_mut().unwrap().remove("context_limits");
+        assert_eq!(
+            before, after,
+            "only the context-limit preference may change"
+        );
+
+        let mut reloaded = ProviderStore::load_at(path.clone(), |_| None);
+        assert_eq!(reloaded.context_limit(first, "gpt-4.1"), 128_000);
+        assert_eq!(reloaded.context_limit(first, "other-model"), 64_000);
+        reloaded.set_context_limit(first, "gpt-4.1", None).unwrap();
+        assert_eq!(reloaded.context_limit(first, "gpt-4.1"), 1_000_000);
+        assert_eq!(reloaded.context_limit(first, "other-model"), 64_000);
+        reloaded
+            .set_context_limit(first, "other-model", None)
+            .unwrap();
+        assert!(!reloaded.context_limits.contains_key(&first));
+        assert_eq!(
+            ProviderStore::load_at(path, |_| None).context_limit(first, "other-model"),
+            256_000
+        );
+    }
+
+    #[test]
+    fn context_limit_invalid_input_or_failed_save_preserves_preferences() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("provider_store.json");
+        let mut store = ProviderStore::load_at(path.clone(), |_| None);
+        let id = store.add_custom();
+        store
+            .set_context_limit(id, "gpt-4.1", Some(128_000))
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        for (provider, model, limit) in [
+            (id, "gpt-4.1", Some(0)),
+            (id, "  ", Some(1000)),
+            (Uuid::nil(), "gpt-4.1", Some(1000)),
+        ] {
+            assert!(store.set_context_limit(provider, model, limit).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert_eq!(store.context_limit(id, "gpt-4.1"), 128_000);
+        }
+        // Force an atomic-write failure using an owned directory as the file.
+        store.storage_path = directory.path().to_owned();
+        assert!(store
+            .set_context_limit(id, "gpt-4.1", Some(512_000))
+            .is_err());
+        assert!(store.set_context_limit(id, "gpt-4.1", None).is_err());
+        assert!(store
+            .set_context_limit(id, "different-model", Some(64_000))
+            .is_err());
+        assert_eq!(store.context_limit(id, "gpt-4.1"), 128_000);
+        assert_eq!(store.context_limit_override(id, "different-model"), None);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn context_limits_legacy_stores_use_defaults_without_model_selection_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("provider_store.json");
+        let provider: Provider = serde_json::from_str(&provider_json(None)).unwrap();
+        let id = provider.id;
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "providers": [provider], "selected_id": id,
+                "selected_models": { id.to_string(): "gpt-4.1" },
+                "settings_models": { id.to_string(): "different-settings-model" }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let store = ProviderStore::load_at(path, |_| None);
+        assert!(store.load_error().is_none());
+        assert_eq!(store.current_context_limit(), 1_000_000);
+        assert_eq!(store.current_model(), "gpt-4.1");
+        assert_eq!(store.settings_models[&id], "different-settings-model");
+        assert_eq!(store.context_limit_override(id, "gpt-4.1"), None);
     }
 
     #[test]

@@ -220,6 +220,11 @@ pub enum SettingsAction {
         model: String,
         effort: String,
     },
+    SetContextLimit {
+        provider_id: Uuid,
+        model: String,
+        limit: Option<u32>,
+    },
     ClearCapabilityException {
         provider_id: Uuid,
         model: String,
@@ -233,6 +238,12 @@ struct ChatGptState {
     plan: Option<String>,
     signing_in: bool,
     error: Option<String>,
+}
+
+#[derive(Default)]
+struct ContextLimitDraft {
+    text: String,
+    result: Option<Result<(), String>>,
 }
 
 /// 設定視窗的草稿；服務切換只載入該 UUID 的設定，不修改 stores。
@@ -277,6 +288,7 @@ pub struct SettingsUi {
     preference_save_error: Option<String>,
     search_key_dirty: bool,
     accent_picker: crate::ui::accent::AccentPicker,
+    context_limit_drafts: HashMap<(Uuid, String), ContextLimitDraft>,
 }
 
 impl SettingsUi {
@@ -347,6 +359,7 @@ impl SettingsUi {
             preference_save_error: None,
             search_key_dirty: false,
             accent_picker: crate::ui::accent::AccentPicker::default(),
+            context_limit_drafts: HashMap::new(),
         }
     }
 
@@ -1063,6 +1076,16 @@ impl SettingsUi {
             ui.hyperlink_to("取得 API 金鑰", template.key_url);
         }
         self.connection_fields(ui, runtime);
+        if let Some(id) = self.selected_provider_id() {
+            let model = self.settings.model.trim().to_owned();
+            self.context_limit_editor(
+                ui,
+                id,
+                &model,
+                providers.context_limit_override(id, &model),
+                providers.load_error().is_none(),
+            );
+        }
         if self.supports_api() {
             if self.provider.as_ref().is_some_and(|p| !p.is_preset) {
                 ui.checkbox(
@@ -1104,6 +1127,144 @@ impl SettingsUi {
         muted(ui, "切換前請先儲存變更，每個服務的連線與金鑰皆獨立保存。");
         ui.add_space(8.0);
         selected.filter(|id| Some(*id) != self.selected_provider_id())
+    }
+
+    /// Independent per-model preference editor. Rendering/typing never saves
+    /// the provider form, changes the live model or touches credentials.
+    fn context_limit_editor(
+        &mut self,
+        ui: &mut egui::Ui,
+        provider_id: Uuid,
+        model: &str,
+        stored: Option<u32>,
+        writable: bool,
+    ) {
+        use crate::chat::context::{
+            context_limit_label, default_context_limit, parse_context_limit,
+        };
+
+        ui.add_space(8.0);
+        field_label(ui, "模型上下文上限（tokens）");
+        if model.is_empty() {
+            muted(ui, "先選擇或輸入模型 ID，再設定此模型的上限。");
+            return;
+        }
+        let default = default_context_limit(model);
+        let effective = stored.unwrap_or(default);
+        ui.add(
+            egui::Label::new(format!(
+                "{model} · 目前生效 {} tokens（{}）",
+                context_limit_label(effective),
+                if stored.is_some() { "自訂" } else { "預設" },
+            ))
+            .wrap(),
+        );
+        let draft = self
+            .context_limit_drafts
+            .entry((provider_id, model.to_owned()))
+            .or_insert_with(|| ContextLimitDraft {
+                text: stored.map(|value| value.to_string()).unwrap_or_default(),
+                result: None,
+            });
+        let mut apply = None;
+        ui.push_id(("context_limit", provider_id, model), |ui| {
+            ui.add_enabled_ui(writable, |ui| {
+                if ui
+                    .add_sized(
+                        [ui.available_width(), 32.0],
+                        egui::TextEdit::singleline(&mut draft.text)
+                            .id_salt("value")
+                            .hint_text(format!(
+                                "留空用預設 {}；例如 128K、1M",
+                                context_limit_label(default)
+                            )),
+                    )
+                    .changed()
+                {
+                    draft.result = None;
+                }
+                let parsed = parse_context_limit(&draft.text);
+                if let Err(error) = &parsed {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(*error).color(ui.visuals().error_fg_color),
+                        )
+                        .wrap(),
+                    );
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(
+                            parsed.as_ref().is_ok_and(|limit| *limit != stored),
+                            egui::Button::new("儲存此模型上限"),
+                        )
+                        .clicked()
+                    {
+                        apply = parsed.ok();
+                    }
+                    if ui
+                        .add_enabled(
+                            stored.is_some() || !draft.text.is_empty(),
+                            egui::Button::new("使用預設"),
+                        )
+                        .clicked()
+                    {
+                        if stored.is_some() {
+                            apply = Some(None);
+                        } else {
+                            draft.text.clear();
+                            draft.result = None;
+                        }
+                    }
+                });
+            });
+        });
+        if let Some(result) = &draft.result {
+            match result {
+                Ok(()) => muted(ui, "此服務／模型的上限已儲存。"),
+                Err(error) => {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(error).color(ui.visuals().error_fg_color),
+                        )
+                        .wrap(),
+                    );
+                }
+            }
+        }
+        muted(ui, "GPT 預設 1M，其他預設 256K；K＝1,000、M＝1,000,000。只儲存此服務／模型的上限，不會儲存 API 草稿。");
+        muted(
+            ui,
+            "這是上下文容量估值，不是單次回答長度或服務商保證；自動壓縮流程尚未啟用。",
+        );
+        if !writable {
+            muted(ui, "服務資料讀取失敗，未開放寫入，以保留原資料。");
+        }
+        if let Some(limit) = apply {
+            self.actions.push(SettingsAction::SetContextLimit {
+                provider_id,
+                model: model.to_owned(),
+                limit,
+            });
+        }
+    }
+
+    pub fn report_context_limit_save(
+        &mut self,
+        provider_id: Uuid,
+        model: &str,
+        limit: Option<u32>,
+        result: Result<(), String>,
+    ) {
+        if let Some(draft) = self
+            .context_limit_drafts
+            .get_mut(&(provider_id, model.to_owned()))
+        {
+            if result.is_ok() {
+                draft.text = limit.map(|value| value.to_string()).unwrap_or_default();
+            }
+            draft.result = Some(result);
+        }
     }
 
     fn connection_fields(&mut self, ui: &mut egui::Ui, runtime: &tokio::runtime::Handle) {
@@ -1563,11 +1724,7 @@ impl SettingsUi {
             "自動檢查更新（每天一次）",
         );
         ui.horizontal_wrapped(|ui| {
-            ui.label(format!(
-                "PopChat {} · {}",
-                env!("CARGO_PKG_VERSION"),
-                crate::BUILD_CHANNEL
-            ));
+            ui.label(format!("PopChat {}", env!("CARGO_PKG_VERSION")));
             if ui
                 .add_enabled(
                     self.updates.state != crate::update::CheckState::Checking,
@@ -2153,6 +2310,220 @@ mod tests {
             task: None,
         });
         tx
+    }
+
+    fn context_editor_frame(
+        draft: &mut SettingsUi,
+        ctx: &egui::Context,
+        model: &str,
+        stored: Option<u32>,
+        time: f64,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(480.0, 600.0),
+                )),
+                time: Some(time),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    settings_style(ui);
+                    draft.context_limit_editor(ui, Uuid::from_u128(1), model, stored, true);
+                    assert!(ui.min_rect().width() <= 480.5);
+                });
+            },
+        )
+    }
+
+    fn text_position(output: &egui::FullOutput, label: &str) -> egui::Pos2 {
+        fn find(shape: &egui::Shape, label: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Text(text) if text.galley.job.text.contains(label) => {
+                    Some(text.pos + text.galley.size() / 2.0)
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| find(shape, label)),
+                _ => None,
+            }
+        }
+        output
+            .shapes
+            .iter()
+            .find_map(|shape| find(&shape.shape, label))
+            .expect("context setting control must be visible")
+    }
+
+    fn pointer_button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn context_limit_real_typing_and_save_only_emit_the_model_preference() {
+        let ctx = egui::Context::default();
+        let mut draft = draft();
+        let before = draft.settings.clone();
+        let _ = context_editor_frame(&mut draft, &ctx, "gpt-4.1", None, 0.0, vec![]);
+        let output = context_editor_frame(&mut draft, &ctx, "gpt-4.1", None, 0.1, vec![]);
+        let input = text_position(&output, "留空用預設");
+        let _ = context_editor_frame(
+            &mut draft,
+            &ctx,
+            "gpt-4.1",
+            None,
+            0.2,
+            vec![
+                egui::Event::PointerMoved(input),
+                pointer_button(input, true),
+            ],
+        );
+        let _ = context_editor_frame(
+            &mut draft,
+            &ctx,
+            "gpt-4.1",
+            None,
+            0.3,
+            vec![pointer_button(input, false)],
+        );
+        let output = context_editor_frame(
+            &mut draft,
+            &ctx,
+            "gpt-4.1",
+            None,
+            0.4,
+            vec![egui::Event::Text("128K".into())],
+        );
+        assert_eq!(
+            draft.context_limit_drafts[&(Uuid::from_u128(1), "gpt-4.1".into())].text,
+            "128K"
+        );
+        assert!(
+            draft.take_actions().is_empty(),
+            "typing must not save anything"
+        );
+        let save = text_position(&output, "儲存此模型上限");
+        let _ = context_editor_frame(
+            &mut draft,
+            &ctx,
+            "gpt-4.1",
+            None,
+            0.5,
+            vec![egui::Event::PointerMoved(save), pointer_button(save, true)],
+        );
+        let _ = context_editor_frame(
+            &mut draft,
+            &ctx,
+            "gpt-4.1",
+            None,
+            0.6,
+            vec![pointer_button(save, false)],
+        );
+        let actions = draft.take_actions();
+        assert!(
+            matches!(actions.as_slice(), [SettingsAction::SetContextLimit { provider_id, model, limit: Some(128_000) }] if *provider_id == Uuid::from_u128(1) && model == "gpt-4.1")
+        );
+        assert!(
+            draft.settings == before,
+            "API endpoint/key/model drafts must remain unchanged"
+        );
+        draft.report_context_limit_save(
+            Uuid::from_u128(1),
+            "gpt-4.1",
+            Some(128_000),
+            Err("fixture write failure".into()),
+        );
+        let state = &draft.context_limit_drafts[&(Uuid::from_u128(1), "gpt-4.1".into())];
+        assert_eq!(state.text, "128K");
+        assert!(state.result.as_ref().unwrap().is_err());
+    }
+
+    #[test]
+    fn context_limit_default_button_restores_only_that_model() {
+        let ctx = egui::Context::default();
+        let mut draft = draft();
+        let before = draft.settings.clone();
+        let _ = context_editor_frame(&mut draft, &ctx, "gpt-4.1", Some(128_000), 0.0, vec![]);
+        let _ = context_editor_frame(&mut draft, &ctx, "other-model", None, 0.1, vec![]);
+        draft
+            .context_limit_drafts
+            .get_mut(&(Uuid::from_u128(1), "other-model".into()))
+            .unwrap()
+            .text = "64K".into();
+        let output = context_editor_frame(&mut draft, &ctx, "gpt-4.1", Some(128_000), 0.2, vec![]);
+        let reset = text_position(&output, "使用預設");
+        let _ = context_editor_frame(
+            &mut draft,
+            &ctx,
+            "gpt-4.1",
+            Some(128_000),
+            0.3,
+            vec![
+                egui::Event::PointerMoved(reset),
+                pointer_button(reset, true),
+            ],
+        );
+        let _ = context_editor_frame(
+            &mut draft,
+            &ctx,
+            "gpt-4.1",
+            Some(128_000),
+            0.4,
+            vec![pointer_button(reset, false)],
+        );
+        let actions = draft.take_actions();
+        assert!(
+            matches!(actions.as_slice(), [SettingsAction::SetContextLimit { model, limit: None, .. }] if model == "gpt-4.1")
+        );
+        draft.report_context_limit_save(Uuid::from_u128(1), "gpt-4.1", None, Ok(()));
+        assert!(
+            draft.context_limit_drafts[&(Uuid::from_u128(1), "gpt-4.1".into())]
+                .text
+                .is_empty()
+        );
+        assert_eq!(
+            draft.context_limit_drafts[&(Uuid::from_u128(1), "other-model".into())].text,
+            "64K"
+        );
+        assert!(draft.settings == before);
+    }
+
+    #[test]
+    fn context_limit_invalid_draft_does_not_emit_an_action() {
+        let ctx = egui::Context::default();
+        let mut draft = draft();
+        let _ = context_editor_frame(&mut draft, &ctx, "model", None, 0.0, vec![]);
+        draft
+            .context_limit_drafts
+            .get_mut(&(Uuid::from_u128(1), "model".into()))
+            .unwrap()
+            .text = "0".into();
+        let output = context_editor_frame(&mut draft, &ctx, "model", None, 0.1, vec![]);
+        let save = text_position(&output, "儲存此模型上限");
+        let _ = context_editor_frame(
+            &mut draft,
+            &ctx,
+            "model",
+            None,
+            0.2,
+            vec![egui::Event::PointerMoved(save), pointer_button(save, true)],
+        );
+        let _ = context_editor_frame(
+            &mut draft,
+            &ctx,
+            "model",
+            None,
+            0.3,
+            vec![pointer_button(save, false)],
+        );
+        assert!(draft.take_actions().is_empty());
     }
 
     #[test]

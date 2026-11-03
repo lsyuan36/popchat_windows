@@ -1,7 +1,7 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-Build and package the unsigned, portable Windows x64 LOCALBUILD release.
+Build and package the unsigned, portable Windows x64 release.
 .EXAMPLE
 powershell -NoProfile -File scripts/package-release.ps1
 .EXAMPLE
@@ -222,7 +222,7 @@ $sha256 = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInv
 [IO.File]::WriteAllText((Join-Path $runDir 'SHA256SUMS.txt'), "$sha256  $assetName`n", $utf8)
 $manifest = [ordered]@{
     version = $version
-    channel = 'LOCAL BUILD'
+    channel = 'stable'
     author = 'Evis Lai'
     source_commit = $sourceCommit
     source_dirty = [bool]($dirty -or $dirtyAfter)

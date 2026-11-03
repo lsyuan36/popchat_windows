@@ -304,44 +304,7 @@ fn watch_loop(
 /// Two chat bubbles, rendered with 4× coverage sampling for small tray sizes.
 /// No external asset lookup or single-pixel placeholder at runtime.
 fn tray_pixels() -> Vec<u8> {
-    fn inside(x: f32, y: f32, left: f32, top: f32, right: f32, bottom: f32) -> bool {
-        let radius = 4.0;
-        let cx = x.clamp(left + radius, right - radius);
-        let cy = y.clamp(top + radius, bottom - radius);
-        (x - cx).powi(2) + (y - cy).powi(2) <= radius * radius
-    }
-    let mut rgba = vec![0; 32 * 32 * 4];
-    for y in 0..32 {
-        for x in 0..32 {
-            let mut covered = 0;
-            let mut front = 0;
-            for sy in 0..4 {
-                for sx in 0..4 {
-                    let px = x as f32 + (sx as f32 + 0.5) / 4.0;
-                    let py = y as f32 + (sy as f32 + 0.5) / 4.0;
-                    let a = inside(px, py, 2.0, 3.0, 23.0, 21.0)
-                        || ((4.0..=9.0).contains(&px)
-                            && (19.0..=25.0).contains(&py)
-                            && px + py < 30.0);
-                    let b = inside(px, py, 12.0, 13.0, 30.0, 28.0)
-                        || ((24.0..=28.0).contains(&px)
-                            && (26.0..=31.0).contains(&py)
-                            && py - px < 5.0);
-                    covered += u16::from(a || b);
-                    front += u16::from(b);
-                }
-            }
-            let offset = (y * 32 + x) * 4;
-            if covered > 0 {
-                let light = front * 110 / covered;
-                rgba[offset] = (44 + light) as u8;
-                rgba[offset + 1] = (112 + light / 2) as u8;
-                rgba[offset + 2] = 240;
-                rgba[offset + 3] = (covered * 255 / 16) as u8;
-            }
-        }
-    }
-    rgba
+    crate::app_icon::rgba(32)
 }
 
 #[cfg(test)]

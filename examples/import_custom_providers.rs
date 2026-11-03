@@ -31,13 +31,14 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-const MAPS: [&str; 9] = [
+const MAPS: [&str; 10] = [
     "known_models",
     "selected_models",
     "settings_models",
     "known_model_efforts",
     "default_model_efforts",
     "selected_model_efforts",
+    "context_limits",
     "model_capabilities",
     "capability_exceptions",
     "pdf_pass_through",
@@ -133,6 +134,7 @@ fn validate_store(value: &Value) -> Result<Vec<Provider>> {
         serde_json::from_value::<Option<Uuid>>(selection.clone()).map_err(|_| invalid_schema())?;
     }
     validate_map::<Vec<String>>(root, "known_models")?;
+    validate_map::<HashMap<String, u32>>(root, "context_limits")?;
     validate_map::<String>(root, "selected_models")?;
     validate_map::<String>(root, "settings_models")?;
     validate_map::<HashMap<String, Vec<String>>>(root, "known_model_efforts")?;
@@ -617,6 +619,7 @@ mod tests {
             "known_model_efforts": {CUSTOM_A: {"a": ["low", "high"]}},
             "default_model_efforts": {CUSTOM_A: {"a": "high"}},
             "selected_model_efforts": {CUSTOM_A: {"a": "low"}},
+            "context_limits": {CUSTOM_A: {"a": 128000}, PRESET: {"excluded": 64000}},
             "model_capabilities": {CUSTOM_A: {"a": {"images": true, "files": false}}},
             "capability_exceptions": {CUSTOM_A: {"a": {"images": false, "source": "manual"}}},
             "pdf_pass_through": {CUSTOM_A: true},
@@ -698,6 +701,7 @@ mod tests {
                 "selected_models" | "settings_models" => json!("different"),
                 "known_model_efforts" => json!({"a": ["different"]}),
                 "default_model_efforts" | "selected_model_efforts" => json!({"a": "different"}),
+                "context_limits" => json!({"a": 256000}),
                 "model_capabilities" => json!({"a": {"images": false}}),
                 "capability_exceptions" => json!({"a": {"source": "learned"}}),
                 "pdf_pass_through" => json!(false),

@@ -951,6 +951,7 @@ impl PopChatApp {
                         | SettingsAction::RemoveProvider(_)
                         | SettingsAction::SelectModel { .. }
                         | SettingsAction::SetEffort { .. }
+                        | SettingsAction::SetContextLimit { .. }
                         | SettingsAction::ClearCapabilityException { .. }
                 ) {
                     self.ui_error = Some(format!("原服務資料讀取失敗，未執行變更：{error}"));
@@ -1123,6 +1124,18 @@ impl PopChatApp {
                     model,
                     effort,
                 } => self.providers.set_effort(effort, provider_id, &model),
+                SettingsAction::SetContextLimit {
+                    provider_id,
+                    model,
+                    limit,
+                } => {
+                    let result = self
+                        .providers
+                        .set_context_limit(provider_id, &model, limit)
+                        .map_err(|error| format!("無法儲存此模型上限：{error:#}"));
+                    self.settings_ui
+                        .report_context_limit_save(provider_id, &model, limit, result);
+                }
                 SettingsAction::ClearCapabilityException { provider_id, model } => self
                     .providers
                     .clear_capability_exception(provider_id, &model),
@@ -3809,6 +3822,11 @@ fn main() -> eframe::Result<()> {
         && !std::env::args().any(|arg| arg == "--login-item"));
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("PopChat")
+        .with_icon(egui::IconData {
+            rgba: popchat_windows::app_icon::rgba(128),
+            width: 128,
+            height: 128,
+        })
         .with_inner_size([
             panel::DEFAULT_WIDTH + 24.0,
             panel::DEFAULT_EXPANDED_HEIGHT + 24.0,

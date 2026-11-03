@@ -33,5 +33,5 @@ not imply endorsement by its author.
   at https://sourceforge.net/projects/nsis/files/NSIS%203/3.11/ .
 
 The application's MIT license does not replace third-party licenses.
-LOCAL BUILD binaries are not code-signed. A SHA-256 digest verifies file
+Binaries are not code-signed. A SHA-256 digest verifies file
 integrity against the GitHub release metadata; it is not a publisher signature.

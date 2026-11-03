@@ -61,7 +61,9 @@ foreach ($file in ($files | Sort-Object FullName)) {
     $parent = Split-Path -Parent $relative
     $dest = if ($parent) { '\' + (Escape-Nsis $parent) } else { '' }
     $install.Add('SetOutPath "$INSTDIR' + $dest + '"')
+    $install.Add('IfErrors install_failed')
     $install.Add('File "' + (Escape-Nsis $file.FullName) + '"')
+    $install.Add('IfErrors install_failed')
     $uninstall.Add('Delete "$INSTDIR\' + (Escape-Nsis $relative) + '"')
     while ($parent) { $dirs[$parent] = $true; $parent = Split-Path -Parent $parent }
 }
@@ -74,10 +76,14 @@ $uninstallFile = Join-Path $out 'uninstall-files.nsh'
 [IO.File]::WriteAllLines($uninstallFile, $uninstall, $utf8)
 $defs = [ordered]@{
     APP_VERSION = $manifest.version; SETUP_PATH = $setup; STAGE_DIR = $stage
+    APP_ICON = Join-Path $repo 'assets\app-icon\app.ico'
     INSTALL_FILES = $installFile; UNINSTALL_FILES = $uninstallFile
     APP_SHA256 = (Get-FileHash -LiteralPath (Join-Path $stage 'popchat_windows.exe')).Hash.ToLowerInvariant()
     HELPER_SHA256 = (Get-FileHash -LiteralPath (Join-Path $stage 'popchat_updater.exe')).Hash.ToLowerInvariant()
     SIZE_KB = [string][Math]::Ceiling(($files | Measure-Object Length -Sum).Sum / 1KB)
+    # NSIS file instructions use legacy Win32 paths. Reject a destination
+    # that would overflow after appending the longest packaged relative path.
+    MAX_INSTALL_DIR_CHARS = [string][Math]::Min(200, (258 - (($files | ForEach-Object { $_.FullName.Substring($stage.Length + 1).Length } | Measure-Object -Maximum).Maximum)))
 }
 $nsisLicense = Join-Path (Split-Path -Parent $MakeNsis) 'COPYING'
 if (-not (Test-Path -LiteralPath $nsisLicense)) { throw 'NSIS compiler COPYRIGHT/COPYING notice missing.' }
@@ -91,7 +97,7 @@ if ($LASTEXITCODE -ne 0) { throw 'NSIS compilation failed.' }
 $hash = (Get-FileHash -LiteralPath $setup).Hash.ToLowerInvariant()
 [IO.File]::WriteAllText((Join-Path $out 'SHA256SUMS-Setup.txt'), "$hash  $name`n", $utf8)
 [IO.File]::WriteAllText((Join-Path $out 'installer-manifest.json'), (([ordered]@{
-    version=$manifest.version; author='Evis Lai'; channel='LOCAL BUILD'; format='NSIS'
+    version=$manifest.version; author='Evis Lai'; channel='stable'; format='NSIS'
     assetname=$name; sha256=$hash; source_commit=$manifest.source_commit
     packaging_commit=((& git -C $repo rev-parse HEAD) | Out-String).Trim()
     source_dirty=$manifest.source_dirty; test_installer=[bool]$TestInstaller; signed=$false

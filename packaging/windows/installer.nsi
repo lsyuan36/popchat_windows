@@ -10,28 +10,33 @@ ${StrRep}
   !error "Use scripts/package-installer.ps1 to build this installer."
 !endif
 !include "${PACKAGE_INCLUDE}"
+!define MUI_ICON "${APP_ICON}"
+!define MUI_UNICON "${APP_ICON}"
 
-Name "PopChat ${APP_VERSION} — LOCAL BUILD"
+Name "PopChat ${APP_VERSION}"
 OutFile "${SETUP_PATH}"
-InstallDir "$LOCALAPPDATA\Programs\PopChat"
 RequestExecutionLevel user
+AllowRootDirInstall false
+AllowSkipFiles off
 SetCompressor /SOLID lzma
 SetCompressorDictSize 32
 CRCCheck force
 ManifestDPIAware true
-BrandingText "PopChat · Evis Lai · LOCAL BUILD"
+BrandingText "PopChat · Evis Lai"
 VIProductVersion "${APP_VERSION}.0"
 VIAddVersionKey /LANG=1033 "ProductName" "PopChat Windows Setup"
 VIAddVersionKey /LANG=1033 "ProductVersion" "${APP_VERSION}"
 VIAddVersionKey /LANG=1033 "FileVersion" "${APP_VERSION}.0"
-VIAddVersionKey /LANG=1033 "FileDescription" "PopChat NSIS installer — LOCAL BUILD"
+VIAddVersionKey /LANG=1033 "FileDescription" "PopChat NSIS installer"
 VIAddVersionKey /LANG=1033 "CompanyName" "Evis Lai"
 VIAddVersionKey /LANG=1033 "LegalCopyright" "2026 Le Chen; Windows port 2026 Evis Lai"
 
 !ifdef TEST_INSTALLER
+  InstallDir "$LOCALAPPDATA\Programs\PopChat-Installer-Test"
   !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\PopChatWindowsInstallerTest"
   !define SHORTCUT_NAME "PopChat Installer Test"
 !else
+  InstallDir "$LOCALAPPDATA\Programs\PopChat"
   !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\PopChatWindows"
   !define SHORTCUT_NAME "PopChat"
 !endif
@@ -56,6 +61,108 @@ Var ProcessHandle
 Var ProcessPath
 Var ManifestText
 Var InstallMutex
+Var CanonicalDir
+
+; NSIS can discard an invalid /D= and silently select InstallDir before
+; .onInit runs. Recover the explicit request from the actual Win32 command
+; line, not $CMDLINE (NSIS removes /D= there), and validate that exact path.
+Function ReadRequestedDirectory
+  System::Call 'kernel32::GetCommandLineW() w.r0'
+  StrLen $1 $0
+  IntOp $2 ${NSIS_MAX_STRLEN} - 1
+  IntCmp $1 $2 command_line_invalid 0 command_line_invalid
+  StrCpy $1 0
+  command_line_loop:
+    StrCpy $2 $0 4 $1
+    StrCmp $2 "" command_line_done
+    StrCmp $2 " /D=" command_line_directory
+    StrCmp $2 "$\t/D=" command_line_directory
+    IntOp $1 $1 + 1
+    Goto command_line_loop
+  command_line_directory:
+    IntOp $1 $1 + 4
+    StrCpy $INSTDIR $0 "" $1
+  command_line_done:
+    Return
+  command_line_invalid:
+    SetErrorLevel 9
+    MessageBox MB_OK|MB_ICONSTOP "Installation command line is too long. Nothing was installed." /SD IDOK
+    Abort
+FunctionEnd
+
+; Unlike NSIS GetFullPathName, Win32 GetFullPathNameW does not require the
+; destination to exist. Never assign a failed result back to $INSTDIR: an
+; empty directory would turn every "$INSTDIR\..." into a drive-root write.
+!macro ValidateDirectory PREFIX
+Function ${PREFIX}ValidateDirectory
+  StrCpy $0 "$INSTDIR"
+  StrCmp $0 "" invalid_directory
+  StrCpy $1 $0 1 1
+  StrCmp $1 ":" 0 invalid_directory
+  StrCpy $1 $0 1 2
+  StrCmp $1 "\" 0 invalid_directory
+  System::Call 'kernel32::GetFullPathNameW(w r0, i ${NSIS_MAX_STRLEN}, w .r1, p 0) i.r2'
+  IntCmp $2 0 invalid_directory
+  IntCmp $2 ${NSIS_MAX_STRLEN} invalid_directory 0 invalid_directory
+  StrCpy $CanonicalDir $1
+  ; Expand existing 8.3 aliases for process/manifest identity. A fresh path
+  ; legitimately has no long-path spelling yet, so keep the lexical result.
+  StrCpy $0 $CanonicalDir
+  System::Call 'kernel32::GetLongPathNameW(w r0, w .r1, i ${NSIS_MAX_STRLEN}) i.r2'
+  IntCmp $2 0 trim_directory
+  IntCmp $2 ${NSIS_MAX_STRLEN} invalid_directory 0 invalid_directory
+  StrCpy $CanonicalDir $1
+  trim_directory:
+    StrLen $2 $CanonicalDir
+    IntCmp $2 3 invalid_directory invalid_directory
+    IntCmp $2 ${MAX_INSTALL_DIR_CHARS} 0 0 invalid_directory
+    StrCpy $1 $CanonicalDir 1 -1
+    StrCmp $1 "\" 0 check_directory
+    StrCpy $CanonicalDir $CanonicalDir -1
+    Goto trim_directory
+  check_directory:
+    StrCmp $CanonicalDir "$WINDIR" invalid_directory
+    StrCmp $CanonicalDir "$SYSDIR" invalid_directory
+    StrCmp $CanonicalDir "$PROFILE" invalid_directory
+    StrCmp $CanonicalDir "$LOCALAPPDATA" invalid_directory
+    StrCmp $CanonicalDir "$APPDATA" invalid_directory
+    StrCmp $CanonicalDir "$DESKTOP" invalid_directory
+    StrCmp $CanonicalDir "$SMPROGRAMS" invalid_directory
+    ; The formal profile must never become an install/uninstall destination.
+    StrCpy $1 "$APPDATA\PopChat\PopChat\config"
+    StrLen $2 $1
+    StrCpy $3 $CanonicalDir $2
+    StrCmp $3 $1 0 check_ancestors
+    StrCpy $3 $CanonicalDir 1 $2
+    StrCmp $3 "" invalid_directory
+    StrCmp $3 "\" invalid_directory
+  check_ancestors:
+    StrCpy $0 $CanonicalDir
+  ancestor_loop:
+    System::Call 'kernel32::GetFileAttributesW(w r0) i.r1'
+    StrCmp $1 -1 ancestor_parent
+    IntOp $2 $1 & 0x400
+    StrCmp $2 0 0 invalid_directory
+    IntOp $2 $1 & 0x10
+    StrCmp $2 0 invalid_directory
+  ancestor_parent:
+    StrLen $2 $0
+    IntCmp $2 3 directory_valid directory_valid
+  ancestor_trim:
+    StrCpy $1 $0 1 -1
+    StrCpy $0 $0 -1
+    StrCmp $1 "\" ancestor_loop ancestor_trim
+  directory_valid:
+    StrCpy $INSTDIR $CanonicalDir
+    Return
+  invalid_directory:
+    SetErrorLevel 9
+    MessageBox MB_OK|MB_ICONSTOP "Invalid installation directory. Choose a local application folder, not a drive root, profile folder, file or junction. Nothing was installed or removed." /SD IDOK
+    Abort
+FunctionEnd
+!macroend
+!insertmacro ValidateDirectory ""
+!insertmacro ValidateDirectory "un."
 
 ; No taskkill, automatic launch, reboot replacement or recursive deletion.
 ; Inspect target-path processes (including hidden/tray-only apps). A different
@@ -137,24 +244,39 @@ Function .onInit
     SetErrorLevel 4
     Abort
   ${EndIf}
+  ; Validate before NSIS's own silent-mode directory checks as well. Those
+  ; checks can otherwise return success without ever entering our section.
+  Call ReadRequestedDirectory
+  Call ValidateDirectory
 FunctionEnd
 
 Function un.onInit
   SetShellVarContext current
   SetRegView 64
   !insertmacro InstallerLock
+  Call un.ValidateDirectory
+  ReadINIStr $0 "$INSTDIR\nsis-install.ini" "PopChat" "App"
+  StrCmp $0 "PopChatWindows" 0 invalid_uninstall_marker
+  ReadINIStr $0 "$INSTDIR\nsis-install.ini" "PopChat" "InstallDir"
+  StrCmp $0 $INSTDIR 0 invalid_uninstall_marker
+  Return
+  invalid_uninstall_marker:
+    SetErrorLevel 10
+    MessageBox MB_OK|MB_ICONSTOP "Uninstaller location could not be verified. No files were removed." /SD IDOK
+    Abort
 FunctionEnd
 
 ; Write BOM-free UTF-8 JSON using Win32, not ANSI FileWrite or UTF-16.
 ; The updater verifies this manifest, including Unicode installation paths.
 Function WriteManifest
   ${StrRep} $0 "$INSTDIR" "\" "\\"
-  StrCpy $ManifestText '{"app":"PopChatWindows","version":"${APP_VERSION}","install_dir":"$0","executable":"popchat_windows.exe","sha256":"${APP_SHA256}","updater_sha256":"${HELPER_SHA256}","author":"Evis Lai","build_channel":"LOCAL BUILD","installer":"NSIS"}'
+  StrCpy $ManifestText '{"app":"PopChatWindows","version":"${APP_VERSION}","install_dir":"$0","executable":"popchat_windows.exe","sha256":"${APP_SHA256}","updater_sha256":"${HELPER_SHA256}","author":"Evis Lai","build_channel":"stable","installer":"NSIS"}'
   StrCpy $0 $ManifestText
   System::Call 'kernel32::WideCharToMultiByte(i 65001, i 0, w r0, i -1, p 0, i 0, p 0, p 0) i.r1'
   IntCmp $1 0 manifest_failed
   System::Alloc $1
   Pop $2
+  StrCmp $2 0 manifest_failed
   System::Call 'kernel32::WideCharToMultiByte(i 65001, i 0, w r0, i -1, p r2, i r1, p 0, p 0) i.r3'
   IntCmp $3 0 manifest_free_failed
   IntOp $1 $1 - 1
@@ -177,9 +299,21 @@ Function WriteManifest
 FunctionEnd
 
 Section "PopChat" SEC_APP
-  GetFullPathName $INSTDIR "$INSTDIR"
+  Call ValidateDirectory
   Call CheckProcesses
+  ClearErrors
+  CreateDirectory "$INSTDIR"
+  IfErrors install_failed
+  ; Normalize again now that a fresh destination exists, then prove it is
+  ; writable before extracting anything. Recheck the process identity too.
+  Call ValidateDirectory
+  Call CheckProcesses
+  GetTempFileName $0 "$INSTDIR"
+  IfErrors install_failed
+  Delete "$0"
+  IfErrors install_failed
   SetOutPath "$INSTDIR"
+  IfErrors install_failed
   ; Preserve the previous binaries/manifest for manual recovery if a later
   ; extraction fails. Never touch application data or credential storage.
   IfFileExists "$INSTDIR\popchat_windows.exe" 0 backup_done
@@ -201,14 +335,23 @@ Section "PopChat" SEC_APP
   !include "${INSTALL_FILES}"
   IfErrors install_failed
   SetOutPath "$INSTDIR\licenses\nsis"
+  IfErrors install_failed
   File /oname=COPYING "${NSIS_LICENSE}"
   IfErrors install_failed
   SetOutPath "$INSTDIR"
+  IfErrors install_failed
   Call WriteManifest
+  ; Win32 INI writes otherwise default to the machine's ANSI code page.
+  ; A UTF-16 BOM keeps Chinese paths intact on English Windows too.
+  FileOpen $0 "$INSTDIR\nsis-install.ini" w
+  IfErrors install_failed
+  FileWriteUTF16LE /BOM $0 "[PopChat]$\r$\nApp=PopChatWindows$\r$\nInstallDir=$INSTDIR$\r$\n"
+  FileClose $0
+  IfErrors install_failed
   WriteUninstaller "$INSTDIR\Uninstall.exe"
   CreateShortcut "$SMPROGRAMS\${SHORTCUT_NAME}.lnk" "$INSTDIR\popchat_windows.exe"
   CreateShortcut "$DESKTOP\${SHORTCUT_NAME}.lnk" "$INSTDIR\popchat_windows.exe"
-  WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayName" "PopChat — LOCAL BUILD"
+  WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayName" "PopChat"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayVersion" "${APP_VERSION}"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "Publisher" "Evis Lai"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "InstallLocation" "$INSTDIR"
@@ -236,6 +379,7 @@ Section "Uninstall"
   IfFileExists "$INSTDIR\popchat_windows.exe" uninstall_failed
   IfFileExists "$INSTDIR\popchat_updater.exe" uninstall_failed
   Delete "$INSTDIR\install-manifest.json"
+  Delete "$INSTDIR\nsis-install.ini"
   Delete "$INSTDIR\Uninstall.exe"
   ; Do not remove another installation's shared shortcuts/registration.
   ReadRegStr $0 HKCU "${UNINSTALL_KEY}" "InstallLocation"

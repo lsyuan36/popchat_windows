@@ -262,7 +262,7 @@ public static class PopChatInstallClose {
     $manifest = [ordered]@{
         app='PopChatWindows'; version=$version; install_dir=$installDir; executable=$installedExe;
         sha256=$buildHash; data_profile=$profile;
-        updater_sha256=$updaterHash; build_channel='LOCAL BUILD'; author='Evis Lai';
+        updater_sha256=$updaterHash; build_channel='stable'; author='Evis Lai';
         imported_custom_source=$(if ($UpdateOnly) { $oldManifest.imported_custom_source } else { $SourceProfile });
         installed_utc=[DateTime]::UtcNow.ToString('o'); shortcuts=@($startMenu,$desktop)
     }

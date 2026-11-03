@@ -126,7 +126,7 @@ Font Awesome font files and executable code are not distributed.
 TT Norms, Arial, other installed/proprietary fonts, font-database test
 fonts, and user-selected font files are **not** bundled. Runtime access
 to a font already installed by the user does not make it part of this
-distribution. The application and updater are unsigned LOCALBUILD artifacts;
+distribution. The application and updater are unsigned artifacts;
 these notices do not imply code signing or publisher endorsement.
 
 ## Upstream notice limitations

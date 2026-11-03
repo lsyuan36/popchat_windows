@@ -1443,7 +1443,7 @@ mod tests {
                 "install_dir": installed, "executable": installed.join(APP),
                 "data_profile": "untouched-profile", "shortcuts": ["untouched.lnk"],
                 "unknown_nested_field": { "keep": [1, 2, 3] },
-                "build_channel": "LOCAL BUILD", "author": "Evis Lai"
+                "build_channel": "stable", "author": "Evis Lai"
             });
             let bytes = serde_json::to_vec(&value).unwrap();
             fs::write(installed.join(MANIFEST), &bytes).unwrap();

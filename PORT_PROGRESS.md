@@ -5,7 +5,7 @@
 清冊的函式對照來自靜態來源審查；parent 的最新測試、隔離原生操作與截圖另記於文末。
 下表描述實作及測試覆蓋邊界，不能單憑 caller 存在推定真實帳號／完整原生驗收。
 
-**目前邊界（2026-11-02，已更新安裝）：** 唯一 app 為 **PID 324**，**v0.2.0 — LOCAL BUILD**，作者 **Evis Lai**，`%LOCALAPPDATA%\Programs\PopChat\popchat_windows.exe`，正式預設 `%APPDATA%\PopChat\PopChat\config`，**`isolated=false`**；圖示 hover／TT Norms Pro→Arial 英文預設／程式內確認下載安裝更新已接線，保留先前字級、錄製、轉場與表格 Copy。正常關閉 PID 20820／確認零實例才更新，app/helper SHA 與 manifest 核對；兩個 custom providers、偏好／指令／歷史 hashes 保留，沒有 credential importer。手動中英字體與快捷鍵不遷移；不 Save API／Send／改真正剪貼簿／啟用開機啟動。最後 raw 視窗非前景／off-screen，沒有強行喚回。單一 chat UI 約束持續適用，updater helper 不建立聊天 UI。
+**前次已安裝邊界（2026-11-02）：** 唯一 app 為 **PID 324**，**v0.2.0**，作者 **Evis Lai**，`%LOCALAPPDATA%\Programs\PopChat\popchat_windows.exe`，正式預設 `%APPDATA%\PopChat\PopChat\config`，**`isolated=false`**；圖示 hover／TT Norms Pro→Arial 英文預設／程式內確認下載安裝更新已接線，保留先前字級、錄製、轉場與表格 Copy。正常關閉 PID 20820／確認零實例才更新，app/helper SHA 與 manifest 核對；兩個 custom providers、偏好／指令／歷史 hashes 保留，沒有 credential importer。手動中英字體與快捷鍵不遷移；不 Save API／Send／改真正剪貼簿／啟用開機啟動。最後 raw 視窗非前景／off-screen，沒有強行喚回。單一 chat UI 約束持續適用，updater helper 不建立聊天 UI。後續 0.2.1 原始碼更新不代表已替換這份安裝。
 
 ## Swift → Rust → 應用入口
 
@@ -64,9 +64,20 @@ Markdown fixture 中的 `main.swift:1016 func fib` 不計入，真正的 `Messag
 
 ## 最終整合驗證
 
-### v0.2.0 — LOCAL BUILD：專案文件／公開發行／程式內更新
+### v0.2.1：首次安裝路徑修正／共用 app 圖示／模型預算
 
-- Cargo/UI/release metadata 升為 **0.2.0 / LOCAL BUILD / Evis Lai**。新 `README.md`、`NOTICE.md`、`LICENSE`、`CHANGELOG.md` 明確標記原專案 **https://github.com/lec77/PopChat** 與 **2026 Le Chen** 的 MIT 版權，不冒充原版官方發行。發行位置為 `https://github.com/lsyuan36/popchat_windows/releases/tag/v0.2.0`；GitHub 公開／發佈是獨立的遠端操作，不能從本機測試推定完成。
+- 已閱讀「PopChat Windows (fork #1)」的安裝失敗分析：NSIS `GetFullPathName` 對尚不存在的目的地可能清空 `$INSTDIR`，原測試預建資料夾而漏掉首次安裝。改用有界 Win32 `GetFullPathNameW`，不把失敗結果寫回目標；驗證絕對本機路徑、根目錄／profile／檔案／junction 及完整 payload 路徑長度，先確認目標可寫，再逐一檢查 SetOutPath／File 的結果。卸載以自身安裝 marker 驗證目錄，只移除限定檔案。
+- 安裝回歸取消預建目的地與父目錄；檢查中文嵌套新路徑、目標／父路徑被檔案佔用、重裝備份、程序 guard、Unicode ShellLink 與卸載保留未知檔案。首次安裝與對既有目錄重裝是不同驗收，不再混為一談。
+- 額外補上 NSIS 會丟棄無效 `/D=` 並回退預設路徑的情境：從 Win32 raw command line 取回明確目的地後再驗證；測試版預設目錄亦與正式版分離，不只改 registry／shortcut 名稱。卸載 marker 使用 UTF-16 BOM，避免英文 Windows INI API 把中文寫成問號。非法空路徑／過長路徑／junction 與搬動卸載程式均作負向測試。
+- `src/app_icon.rs` 共用原雙藍氣泡 renderer，保留 32px 原始 pixels；16–256px ICO 同時供 PE、NSIS、捷徑使用，視窗與 tray 共用同一來源。`build.rs` 無新 Cargo 依賴，探索 Windows SDK rc.exe，於 OUT_DIR 編譯 icon/version resource，作者 Evis Lai、版本跟隨 Cargo 0.2.1；不更動原專案版權，不冒充數位簽章。
+- 模型上下文預算：GPT 1,000,000，其他 256,000；每 provider UUID／model ID 獨立覆寫，支援還原預設、正整數/K/M 驗證、atomic save 失敗回復與 legacy store 載入。UI 真實輸入／按鈕測試確認不提交 API 草稿、不更換 live model，不接觸憑證。這只是容量偏好；usage、摘要與 overflow retry 尚未啟用。
+- 本機 fmt/check/all-target 回歸 **551 library、26 app、15 importer passed，3 ignored**；另 8 個 icon/resource 建置腳本測試通過。檔案交易、native Windows 圖示 decoder 與資源編譯／連結均有隔離驗證，未建立第二個真實聊天 UI。NSIS 完整包與 GitHub runner 驗收另行記錄，不能由這些測試推定完成。
+- 0.2.1 真實 NSIS 測試包已通過：缺少目的地／父目錄、中文 manifest＋UTF-16 marker、非法空／過長／檔案／junction 目的地拒絕、重裝、捷徑、程序 guard、搬動 uninstaller 拒絕與正常卸載保留未知檔案／備份；主程式/helper PE 七尺寸 icon resource 與版本作者亦核對。測試版獨立預設路徑的修正前曾觸發 NSIS fallback、把預設 Programs\PopChat 的程式檔寫成 0.2.1 測試 payload；已清理自己建立的測試登錄／捷徑，未自動刪回或啟動該程式，正式 installer 重裝需另行確認。應用程式資料不在 NSIS 刪除／覆寫清單內。後續 GitHub hosted runner 驗收仍須獨立確認。
+- 移除開發通道顯示，0.2.1 使用一般版本名稱；執行檔仍未簽章。原始碼升版不等於發行或替換目前已安裝版本，不自動 Save API／Send／改剪貼簿／遷移 profile。
+
+### v0.2.0：專案文件／公開發行／程式內更新
+
+- Cargo/UI/release metadata 升為 **0.2.0 / Evis Lai**。新 `README.md`、`NOTICE.md`、`LICENSE`、`CHANGELOG.md` 明確標記原專案 **https://github.com/lec77/PopChat** 與 **2026 Le Chen** 的 MIT 版權，不冒充原版官方發行。發行位置為 `https://github.com/lsyuan36/popchat_windows/releases/tag/v0.2.0`；GitHub 公開／發佈是獨立的遠端操作，不能從本機測試推定完成。
 - `update::{UpdateChecker,UpdateDownload}` 固定讀本 repo 的 `/releases/latest`，嚴格 stable `vMAJOR.MINOR.PATCH`、同 repo page/asset URL、非 draft/prerelease、唯一 `PopChat-Windows-x64.zip`、必要 GitHub asset SHA-256；HTTP metadata／下載大小／重導主機／檔案數／解壓總量／每檔有界。拒絕 traversal、ADS、links/reparse、case collisions、腳本／非預期檔案與非 AMD64 GUI PE。
 - 真實 caller：Settings poll/download → worker → `PreparedUpdate` → 明確「安裝並重新啟動」→ `SettingsAction::InstallUpdate` → `main::update_confirmation_dialog`（警告未送出／API 草稿及串流停止）→ `begin_install` worker → `InstallSession::poll`。只有 helper 验證完成回 READY 才 `visibility.close`；native helper 固定 parent PID/path handle、等 process 退出、再查無同路徑其他 app，才執行有 backup／rollback 的限定檔案交易、保存 manifest 未知欄位並啟動唯一新 UI。臨時 helper 使用舊的已安裝 helper，stage/session/App drop 不刪除交接檔案；啟動後 1.5s 內即退出會視為失敗走 rollback。不是自動靜默取代，不讀寫 profile/credential/shortcut/startup。
 - Source installer 加入 helper GUI PE guard、hash/backup、author/channel metadata 及 notices；`package-release.ps1` 為顯式 allowlist，正常要求 clean commit，輸出 ZIP／SHA256SUMS／source-commit manifest 至 ignored target。850 份 dependency notice 檔案（453 項軟體/資產 inventory）、egui 字體／STIX OFL／LPPL／MPL source availability 均隨包附帶。這是 best-effort 授權清冊，不是法律認證；TT Norms Pro／Arial 不散佈。Binary 未簽章，SHA-256 不是 publisher signature。

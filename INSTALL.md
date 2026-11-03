@@ -75,6 +75,21 @@ match the validated release ZIP. For isolated local validation, compile with
 registration and shortcut names cannot overwrite the live installation.
 The CI runner tests the actual production Setup without launching a chat UI.
 
+Version 0.2.1 fixes the first-install path handling: the destination and its
+parents may be absent. Win32 lexical normalization must succeed before the
+installer creates anything, and empty/root/profile/reparse/file destinations
+are rejected. Every `SetOutPath`/payload extraction is checked immediately,
+so failure cannot redirect later files to an earlier working directory.
+An installation marker binds the uninstaller to its own directory. The CI
+test no longer pre-creates its destination, and tests blocked file/parent
+destinations as well as reinstalling into an existing directory.
+The explicit `/D=` request is recovered from the Win32 command line, so NSIS's
+default-directory fallback cannot redirect an invalid request. Test installers
+also use a separate default directory, not only separate registry/shortcut
+names. The uninstall marker is UTF-16 with a BOM so Windows INI reads preserve
+Chinese paths on English systems. Empty/overlong/junction destinations and a
+relocated uninstaller are tested as failure cases without launching PopChat.
+
 New users can download `PopChat-Windows-x64.zip` from this repository's Releases,
 extract all files to a writable directory, and run `popchat_windows.exe`.
 Keep the adjacent `popchat_updater.exe` and `licenses` directory. No developer

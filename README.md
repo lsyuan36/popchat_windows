@@ -1,8 +1,8 @@
-# PopChat for Windows · LOCAL BUILD
+# PopChat for Windows
 
 輕量的 Windows 浮動 AI 聊天面板，以 **Rust + egui/eframe** 實作。
 
-**Windows 移植／維護：Evis Lai** · 目前版本：**0.2.0 — LOCAL BUILD**
+**Windows 移植／維護：Evis Lai** · 目前版本：**0.2.1**
 
 > 本專案移植自 **Le Chen / lec77** 的 macOS 專案
 > **[lec77/PopChat](https://github.com/lec77/PopChat)**。
@@ -11,8 +11,11 @@
 
 ## 下載與啟動
 
-從 **[本專案 Releases](https://github.com/lsyuan36/popchat_windows/releases/latest)**
-下載 **`PopChat-0.2.0-Windows-x64-Setup.exe`**（NSIS 安裝程式）。
+**0.2.1** 安裝包可從 **[GitHub Actions](https://github.com/lsyuan36/popchat_windows/actions/workflows/windows-build.yml)**
+成功的工作流程下載 `PopChat-Windows-x64-NSIS` Artifact，解壓取得
+**`PopChat-0.2.1-Windows-x64-Setup.exe`**（NSIS 安裝程式）。
+已發佈的歷史版本另見 [Releases](https://github.com/lsyuan36/popchat_windows/releases)。
+0.2.0 Setup 的首次安裝路徑問題已於 0.2.1 修正，請優先使用新版。
 
 1. 先從系統匣結束正在執行的 PopChat，再執行 Setup。
 2. 預設安裝至 `%LOCALAPPDATA%\Programs\PopChat`，只影響目前使用者。
@@ -24,7 +27,7 @@
 並將主程式、更新助手和授權文件放在一起。
 
 請勿直接在 ZIP 內執行，也不需要以系統管理員身分執行。
-目前提供 **Windows x64** LOCAL BUILD；執行檔尚未進行程式碼簽章，
+目前提供 **Windows x64** 版本；執行檔尚未進行程式碼簽章，
 Windows SmartScreen 可能顯示未識別的應用程式。請核對來源與發行頁的 SHA-256。
 
 ## 功能
@@ -73,6 +76,18 @@ ChatGPT／Codex 整合的可用性取決於帳號、方案、外部工具及服�
 安裝不更換資料目錄、不重匯入服務、不讀寫遷移憑證。
 請在確認重新啟動前完成尚未送出的訊息與未儲存的 API 編輯。
 若自動更新無法使用，仍可從 Releases 下載 ZIP 手動更新。
+
+## 每個模型的上下文上限
+
+設定 → 服務 → 選擇模型後，可編輯「模型上下文上限（tokens）」。
+未覆寫時，GPT 系列採 **1M（1,000,000）**，其他模型採
+**256K（256,000）**；這是應用程式預算，不是供應商能力保證。
+同名模型在不同服務各自保存，支援正整數、`128K`、`1M`，
+按「使用預設」可移除此模型的覆寫。
+
+「儲存此模型上限」只保存該項偏好，不會提交端點／金鑰／模型選擇草稿。
+這不是單次回答的 `max_tokens`。**0.2.1 目前只完成預算設定，auto compact
+摘要、用量追蹤及超限恢復流程尚未啟用。**
 
 ## 資料與隱私
 
@@ -123,12 +138,12 @@ cargo build --locked --release --bins --target x86_64-pc-windows-msvc --target-d
 本機打包：先執行 `scripts/package-release.ps1`，再用 NSIS 3 compiler 執行：
 
 ```powershell
-.\scripts\package-installer.ps1 -PackageDirectory target/releases/v0.2.0/<產生的目錄> -MakeNsis 'C:\Program Files (x86)\NSIS\makensis.exe'
+.\scripts\package-installer.ps1 -PackageDirectory target/releases/v0.2.1/<產生的目錄> -MakeNsis 'C:\Program Files (x86)\NSIS\makensis.exe'
 ```
 
 ## 已知限制
 
-LOCAL BUILD 仍在迭代，並非完整移植宣告。真實 provider／訂閱帳號、
+Windows 移植仍在迭代，並非完整移植宣告。真實 provider／訂閱帳號、
 原生注音、多螢幕與混合 DPI、無障礙及部分原版動畫仍需更多驗收。
 文件／公式格式也不保證涵蓋所有來源。
 

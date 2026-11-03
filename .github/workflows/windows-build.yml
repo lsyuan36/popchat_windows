@@ -22,7 +22,7 @@ concurrency:
 
 jobs:
   windows-x64:
-    name: Windows x64 NSIS · LOCAL BUILD
+    name: Windows x64 NSIS
     runs-on: windows-2022
     timeout-minutes: 60
     defaults:
@@ -83,6 +83,17 @@ jobs:
           cargo test --locked --release --target x86_64-pc-windows-msvc --target-dir target/button-review --lib update::tests -- --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked --release --target x86_64-pc-windows-msvc --target-dir target/button-review --lib updater::tests -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Test model context budgets and shared app icon
+        run: |
+          cargo test --locked --release --target x86_64-pc-windows-msvc --target-dir target/button-review --lib context -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --release --target x86_64-pc-windows-msvc --target-dir target/button-review --lib app_icon::tests -- --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustc --edition 2021 --test build.rs -o target/app-icon-resource-tests.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & ./target/app-icon-resource-tests.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build EXEs and release ZIP
@@ -160,12 +171,12 @@ jobs:
           BUILD_COMMIT: ${{ steps.package.outputs.source_commit }}
         run: |
           @"
-          ## PopChat $env:BUILD_VERSION — LOCAL BUILD
+          ## PopChat $env:BUILD_VERSION
           Author: **Evis Lai**
 
           - **PopChat-Windows-x64-NSIS**: NSIS Setup.exe, SHA-256 and installer manifest (recommended).
           - Setup installs per-user, creates shortcuts and an uninstaller; user data is preserved.
-          - Fresh install, Unicode path, reinstall and uninstall tested without launching the chat UI.
+          - Fresh install with nonexistent parents, Unicode path, invalid destinations, reinstall and uninstall tested without launching the chat UI.
           - **PopChat-Windows-x64-Release**: ZIP retained for the existing in-app updater.
           - Source commit: $env:BUILD_COMMIT
           - Windows x64, unsigned. No installed TT Norms Pro or Arial files are bundled.

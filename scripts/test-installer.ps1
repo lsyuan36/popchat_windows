@@ -23,6 +23,30 @@ using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.ComTypes;
 using System.Text;
 public static class PopChatInstallerTestPath {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr LoadLibraryEx(string path, IntPtr file, uint flags);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr FindResource(IntPtr module, IntPtr name, IntPtr type);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern IntPtr LoadResource(IntPtr module, IntPtr resource);
+    [DllImport("kernel32.dll")]
+    static extern IntPtr LockResource(IntPtr resource);
+    [DllImport("kernel32.dll")]
+    static extern bool FreeLibrary(IntPtr module);
+    public static int AppIconFrames(string path) {
+        // LOAD_LIBRARY_AS_DATAFILE: inspect resources; never execute app code.
+        IntPtr module = LoadLibraryEx(path, IntPtr.Zero, 2);
+        if (module == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+        try {
+            IntPtr group = FindResource(module, new IntPtr(1), new IntPtr(14));
+            if (group == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+            IntPtr loaded = LoadResource(module, group);
+            IntPtr data = loaded == IntPtr.Zero ? IntPtr.Zero : LockResource(loaded);
+            if (data == IntPtr.Zero || Marshal.ReadInt16(data, 0) != 0 || Marshal.ReadInt16(data, 2) != 1)
+                throw new InvalidOperationException("Invalid app icon resource");
+            return (ushort)Marshal.ReadInt16(data, 4);
+        } finally { FreeLibrary(module); }
+    }
     [ComImport, Guid("000214F9-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     interface IShellLinkW {
         void GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder path, int count, IntPtr findData, uint flags);
@@ -70,20 +94,48 @@ if ([bool]$metadata.test_installer -ne [bool]$TestInstaller -or
 $package = (Resolve-Path -LiteralPath $PackageDirectory).Path
 $release = Get-Content -LiteralPath (Join-Path $package 'release-manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 # Construct Unicode explicitly so Windows PowerShell 5.1 need not infer UTF-8.
-$leaf = 'PopChat NSIS ' + [char]0x6E2C + [char]0x8A66 + ' ' + [Guid]::NewGuid().ToString('N')
-$dir = Join-Path ([IO.Path]::GetTempPath()) $leaf
-[void][IO.Directory]::CreateDirectory($dir)
+$leaf = 'PopChat-NSIS-' + [Guid]::NewGuid().ToString('N').Substring(0,12)
+$root = Join-Path ([IO.Path]::GetTempPath()) $leaf
+$dir = Join-Path $root (([string][char]0x6E2C + [string][char]0x8A66) + '\PopChat')
+if ((Test-Path -LiteralPath $root) -or (Test-Path -LiteralPath $dir)) { throw 'Fresh-install fixture must not exist.' }
 $sentinel = Join-Path $dir 'user-file-do-not-delete.txt'
-[IO.File]::WriteAllText($sentinel, 'preserve unknown files')
 $beforeApps = @(Get-CimInstance Win32_Process -Filter "Name='popchat_windows.exe'" | ForEach-Object ProcessId) -join ','
+# Invalid destination and invalid parent are both owned files, not real drive
+# roots/system folders. Failure must not redirect installation elsewhere.
+$blocked = Join-Path ([IO.Path]::GetTempPath()) ("$leaf-blocked.txt")
+[IO.File]::WriteAllText($blocked, 'preserve blocked target')
+$tooLong = Join-Path ([IO.Path]::GetTempPath()) ('PopChat-' + ('x' * 190))
+foreach ($invalid in @($blocked, (Join-Path $blocked 'PopChat'), $tooLong, '')) {
+    $process = Start-Process -FilePath $installerPath -ArgumentList "/S /D=$invalid" -Wait -PassThru
+    if ($process.ExitCode -eq 0 -or (Test-Path -LiteralPath $reg)) { throw "Installer accepted an invalid destination: path=$invalid exit=$($process.ExitCode) registered=$(Test-Path -LiteralPath $reg)" }
+    if ([IO.File]::ReadAllText($blocked) -ne 'preserve blocked target') { throw 'Invalid-target guard changed the blocking file.' }
+}
+# A reparse-point ancestor must not redirect the payload to another folder.
+$junctionTarget = Join-Path ([IO.Path]::GetTempPath()) ("$leaf-junction-target")
+$junction = Join-Path ([IO.Path]::GetTempPath()) ("$leaf-junction")
+[void][IO.Directory]::CreateDirectory($junctionTarget)
+$junctionSentinel = Join-Path $junctionTarget 'keep.txt'
+[IO.File]::WriteAllText($junctionSentinel, 'preserve junction target')
+$null = New-Item -ItemType Junction -Path $junction -Target $junctionTarget
+$process = Start-Process -FilePath $installerPath -ArgumentList ("/S /D=" + (Join-Path $junction 'PopChat')) -Wait -PassThru
+if ($process.ExitCode -eq 0 -or (Test-Path -LiteralPath $reg) -or (Test-Path -LiteralPath (Join-Path $junctionTarget 'PopChat')) -or
+    [IO.File]::ReadAllText($junctionSentinel) -ne 'preserve junction target') { throw 'Reparse-point destination was not rejected safely.' }
 for ($pass = 0; $pass -lt 2; $pass++) {
     # /D must be last, without quotes (NSIS consumes the remainder verbatim).
     $process = Start-Process -FilePath $installerPath -ArgumentList "/S /D=$dir" -Wait -PassThru
     if ($process.ExitCode -ne 0) { throw "Installer exited $($process.ExitCode) on pass $pass." }
+    if ($pass -eq 0) {
+        [IO.File]::WriteAllText($sentinel, 'preserve unknown files')
+    }
     $manifestPath = Join-Path $dir 'install-manifest.json'
     $bytes = [IO.File]::ReadAllBytes($manifestPath)
     $utf8 = New-Object Text.UTF8Encoding($false, $true)
     $manifest = $utf8.GetString($bytes) | ConvertFrom-Json
+    $markerBytes = [IO.File]::ReadAllBytes((Join-Path $dir 'nsis-install.ini'))
+    if ($markerBytes.Length -lt 2 -or $markerBytes[0] -ne 255 -or $markerBytes[1] -ne 254 -or
+        -not ([Text.Encoding]::Unicode.GetString($markerBytes).Contains("InstallDir=$dir"))) {
+        throw 'Uninstall marker must preserve the Unicode installation path.'
+    }
     if ($manifest.app -ne 'PopChatWindows' -or $manifest.version -ne $release.version -or
         $manifest.install_dir -ne $dir -or $manifest.executable -ne 'popchat_windows.exe' -or
         $manifest.author -ne 'Evis Lai' -or $manifest.installer -ne 'NSIS') { throw 'UTF-8 updater manifest mismatch.' }
@@ -92,6 +144,9 @@ for ($pass = 0; $pass -lt 2; $pass++) {
         if ((Get-FileHash -LiteralPath (Join-Path $dir $file)).Hash -ne $expected) { throw 'Installed PE hash mismatch.' }
         $recorded = if ($file -eq 'popchat_windows.exe') { $manifest.sha256 } else { $manifest.updater_sha256 }
         if ($recorded -ne $expected) { throw 'Updater manifest hash mismatch.' }
+        $pe = Get-Item -LiteralPath (Join-Path $dir $file)
+        if ($pe.VersionInfo.ProductVersion -ne $release.version -or $pe.VersionInfo.CompanyName -ne 'Evis Lai' -or
+            [PopChatInstallerTestPath]::AppIconFrames($pe.FullName) -ne 7) { throw 'Installed app icon/version/author resource mismatch.' }
     }
     if (-not (Test-Path -LiteralPath (Join-Path $dir 'licenses\dependencies\index.json'))) { throw 'Missing licenses.' }
     $registration = Get-ItemProperty -LiteralPath $reg
@@ -122,6 +177,12 @@ $uninstaller = Join-Path $dir 'Uninstall.exe'
 # starting either PopChat executable or forcibly terminating a process.
 $probeDir = Join-Path $dir 'process-guard-probe'
 [void][IO.Directory]::CreateDirectory($probeDir)
+$movedUninstaller = Join-Path $probeDir 'Uninstall.exe'
+[IO.File]::Copy($uninstaller, $movedUninstaller, $false)
+$moved = Start-Process -FilePath $movedUninstaller -ArgumentList "/S _?=$probeDir" -Wait -PassThru
+if ($moved.ExitCode -ne 10 -or -not (Test-Path -LiteralPath $reg) -or -not (Test-Path -LiteralPath (Join-Path $dir 'popchat_windows.exe'))) {
+    throw 'Relocated uninstaller did not refuse an unverified directory.'
+}
 $probeSource = Join-Path $probeDir 'probe.rs'
 $probeExe = Join-Path $probeDir 'popchat_updater.exe'
 [IO.File]::WriteAllText($probeSource, '#![windows_subsystem = "windows"] fn main() { let _ = std::io::stdin().read_line(&mut String::new()); }')
@@ -150,4 +211,4 @@ foreach ($shortcut in $shortcuts) { if (Test-Path -LiteralPath $shortcut) { thro
 if (-not (Test-Path -LiteralPath $sentinel) -or -not (Test-Path -LiteralPath $backups[0].FullName)) { throw 'Uninstall removed unknown files or backups.' }
 $afterApps = @(Get-CimInstance Win32_Process -Filter "Name='popchat_windows.exe'" | ForEach-Object ProcessId) -join ','
 if ($beforeApps -ne $afterApps) { throw 'Smoke test changed running chat processes.' }
-Write-Output "NSIS_SMOKE_PASSED fresh_install=verified unicode_manifest=verified reinstall=verified shortcuts=verified running_process_guards=verified uninstall=verified unknown_files_and_backups=preserved no_chat_launched=true directory=$dir"
+Write-Output "NSIS_SMOKE_PASSED nonexistent_directory_and_parents=verified invalid_empty_long_file_and_junction_destinations=blocked unicode_manifest_and_marker=verified app_icon_resources=verified relocated_uninstaller=blocked reinstall=verified shortcuts=verified running_process_guards=verified uninstall=verified unknown_files_and_backups=preserved no_chat_launched=true directory=$dir"
