@@ -1,6 +1,6 @@
 [package]
 name = "popchat_windows"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 description = "PopChat Windows port — all-Rust floating chat panel for OpenAI-compatible models"
 license = "MIT"
@@ -31,6 +31,7 @@ futures = "0.3"
 # Serde
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml_ng = "0.10"
 # Errors / utils
 ab_glyph = "0.2"
 anyhow = "1"

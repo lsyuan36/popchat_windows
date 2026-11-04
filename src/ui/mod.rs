@@ -22,6 +22,7 @@ pub mod reasoning;
 pub mod reveal;
 pub mod settings;
 pub mod shortcut_list;
+pub mod skills;
 pub mod surface;
 pub mod switcher;
 pub mod theme;

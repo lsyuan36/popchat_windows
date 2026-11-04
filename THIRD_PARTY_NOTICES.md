@@ -8,7 +8,10 @@ license texts, and upstream NOTICE files are distributed in
 the same files are under `assets/licenses/dependencies/`.
 
 `licenses/dependencies/index.json` maps every inventoried component/version
-to its individual notice files and their provenance. The inventory is a
+to its individual notice files and provenance, or to an explicitly
+hash-verified bundled notice in this document. The two YAML dependency
+notices below share this already packaged file to preserve the portable
+archive layout. The inventory is a
 conservative superset of the locked normal/build dependency closure for
 `x86_64-pc-windows-msvc`, not a claim that every listed build tool or
 feature-unified dependency is linked into the executables. Root dev-only
@@ -141,6 +144,77 @@ notices remain a documented limitation requiring publisher review, rather
 than an assertion that new permission has been obtained.
 
 ## Locked Rust dependency inventory
+
+### YAML support added for Skills
+
+The following published MIT license texts are reproduced verbatim. Their
+source archives are pinned by `Cargo.lock`; `index.json` records this bundled
+document and its SHA-256 rather than adding new portable ZIP entries.
+
+#### serde_yaml_ng 0.10.0
+
+Source: <https://crates.io/api/v1/crates/serde_yaml_ng/0.10.0/download>, `LICENSE`.
+Repository: <https://github.com/acatton/serde-yaml-ng>.
+
+```text
+                                  MIT License
+
+Copyright 2024 Antoine Catton
+Copyright 2016-2024 David Tolnay
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the “Software”), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+#### unsafe-libyaml 0.2.11
+
+Source: <https://crates.io/api/v1/crates/unsafe-libyaml/0.2.11/download>, `LICENSE-MIT`.
+Repository: <https://github.com/dtolnay/unsafe-libyaml>.
+The published license file does not supply a separate copyright line; none
+has been invented here.
+
+```text
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+```
+
+### Individual notice files
 
 Full package-specific license, copyright and NOTICE files are in each
 component's subdirectory of `licenses/dependencies/`; consult `index.json`

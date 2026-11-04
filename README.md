@@ -2,7 +2,7 @@
 
 輕量的 Windows 浮動 AI 聊天面板，以 **Rust + egui/eframe** 實作。
 
-**Windows 移植／維護：Evis Lai** · 目前版本：**0.2.4**
+**Windows 移植／維護：Evis Lai** · 目前版本：**0.2.5**
 
 > 本專案移植自 **Le Chen / lec77** 的 macOS 專案
 > **[lec77/PopChat](https://github.com/lec77/PopChat)**。
@@ -11,10 +11,10 @@
 
 ## 下載與啟動
 
-從 **[GitHub Releases](https://github.com/lsyuan36/popchat_windows/releases/tag/v0.2.4)**
-下載 **`PopChat-0.2.4-Windows-x64-Setup.exe`**（NSIS 安裝程式）。
-**0.2.4** 改善安裝確認視窗，並新增 MCP 完整連線資訊的本機確認／接續測試流程。
-保留細線更新進度、繁體中文內建提示詞與 Auto Compact。0.2.1–0.2.3 使用者可用程式內更新，
+從 **[GitHub Releases](https://github.com/lsyuan36/popchat_windows/releases/tag/v0.2.5)**
+下載 **`PopChat-0.2.5-Windows-x64-Setup.exe`**（NSIS 安裝程式）。
+**0.2.5** 新增 Skills 設定、預設／自訂來源與按需載入，並改善 MCP 確認與填寫介面。
+保留細線更新進度、繁體中文內建提示詞、MCP 本機安全設定與 Auto Compact。0.2.1–0.2.4 使用者可用程式內更新，
 或先結束 PopChat 再執行新版 Setup 升級。
 0.2.0 Setup 的首次安裝路徑問題已於 0.2.1 修正，請優先使用新版。
 
@@ -114,6 +114,14 @@ HTTP 首版僅支援手動 Bearer token，不提供自動 OAuth 登入。
 顯示將修改的設定檔路徑與待確認畫面。使用者確認新增並啟用後，接續遮罩憑證的原測試要求；
 原始連線資訊不進輸入歷史或模型請求。數字內網 IP 的明文 HTTP 必須額外勾選風險同意，
 公開 HTTP 仍拒絕。建議仍在本機密碼欄輸入憑證，並優先採用 HTTPS；每次工具仍須確認。
+
+## Skills（0.2.5）
+
+設定 → Skills → 管理技能／掃描來源，可讀取 OpenCode、Claude、Codex／共用 Agents
+的個人預設路徑，也可明確指定專案或自訂資料夾。新技能預設停用，需個別啟用；
+只先提供名稱與說明，模型需要時才載入全文與技能目錄內的文字參考檔。
+不修改其他工具設定，不自動執行技能腳本。詳見 [SKILLS.md](https://github.com/lsyuan36/popchat_windows/blob/v0.2.5/SKILLS.md)。
+**0.2.4 及更早版本不含 Skills 設定，需升級至 0.2.5。**
 
 ## 資料與隱私
 

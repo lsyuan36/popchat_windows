@@ -683,6 +683,76 @@ mod tests {
             .collect()
     }
 
+    #[tokio::test]
+    async fn enabled_skills_are_lazy_function_roundtrips_and_preserve_custom_instructions() {
+        use crate::chat::{
+            mcp::McpTurn,
+            skills::{SkillStore, Source},
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use uuid::Uuid;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("skills");
+        std::fs::create_dir_all(root.join("test")).unwrap();
+        std::fs::write(root.join("test/SKILL.md"),"---\nname: Responses Test\ndescription: For fake Responses tests\n---\nRESPONSES_SKILL_BODY").unwrap();
+        let mut store = SkillStore::load_at(
+            dir.path().join("settings.json"),
+            vec![Source {
+                name: "Test".into(),
+                path: root,
+                enabled: true,
+                root_markdown: false,
+            }],
+        );
+        let skill = store.scan().skills.remove(0);
+        store.set_enabled(&skill, true).unwrap();
+        let server = MockServer::start().await;
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = count.clone();
+        Mock::given(path("/responses")).respond_with(move|request:&wiremock::Request| {
+            let body:Value=request.body_json().unwrap();let round=seen.fetch_add(1,Ordering::SeqCst);
+            assert_eq!(body["instructions"],"CUSTOM_INSTRUCTIONS_UNCHANGED");
+            assert!(!serde_json::to_string(&body["tools"]).unwrap().contains("RESPONSES_SKILL_BODY"));
+            assert!(body["tools"].as_array().unwrap().iter().any(|t|t["name"]=="load_skill" && t["strict"]==false));
+            let events=if round==0 {
+                assert!(!serde_json::to_string(&body["input"]).unwrap().contains("RESPONSES_SKILL_BODY"));
+                vec![json!({"type":"response.output_item.done","item":{"type":"function_call","call_id":"skill_call","name":"load_skill","arguments":json!({"id":skill.id}).to_string()}}),json!({"type":"response.completed"})]
+            }else{
+                assert!(body["input"].as_array().unwrap().iter().any(|item|item["type"]=="function_call_output" && item["output"].as_str().unwrap_or("").contains("RESPONSES_SKILL_BODY")));
+                vec![json!({"type":"response.output_text.delta","delta":"SKILL_LOADED"}),json!({"type":"response.completed"})]
+            };
+            ResponseTemplate::new(200).insert_header("content-type","text/event-stream").set_body_string(sse(events))
+        }).mount(&server).await;
+        let turn = McpTurn::new(vec![], false, Uuid::new_v4(), Uuid::new_v4(), |_| {
+            panic!("local skill cannot request MCP permission")
+        })
+        .with_skill_store(store);
+        let mut history = history();
+        history.insert(
+            0,
+            WireMessage::new(
+                "system",
+                Some(WireContent::Text("CUSTOM_INSTRUCTIONS_UNCHANGED".into())),
+                None,
+                None,
+            ),
+        );
+        let events = collect(backend(&server, memory_store()).start_with_mcp(
+            history,
+            config(),
+            None,
+            Some(turn),
+        ))
+        .await;
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e,ChatStreamEvent::Done(s) if s=="SKILL_LOADED")),
+            "{events:?}"
+        );
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
     async fn collect(mut rx: mpsc::UnboundedReceiver<ChatStreamEvent>) -> Vec<ChatStreamEvent> {
         tokio::time::timeout(Duration::from_secs(5), async move {
             let mut events = Vec::new();

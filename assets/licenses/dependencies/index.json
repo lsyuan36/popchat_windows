@@ -12683,6 +12683,36 @@
                                          }
                      },
                      {
+                         "name": "serde_yaml_ng",
+                         "version": "0.10.0",
+                         "license": "MIT",
+                         "kind": "rust-crate",
+                         "repository": "https://github.com/acatton/serde-yaml-ng",
+                         "source_archive_url": "https://crates.io/api/v1/crates/serde_yaml_ng/0.10.0/download",
+                         "files": [],
+                         "bundled_notice": {
+                             "path": "THIRD_PARTY_NOTICES.md",
+                             "section": "serde_yaml_ng 0.10.0",
+                             "crate_path": "LICENSE",
+                             "sha256": "1db3b76e337c1768ea613abed968b9f974a3f33ae72f817a491ff2c20efa4a92"
+                         }
+                     },
+                     {
+                         "name": "unsafe-libyaml",
+                         "version": "0.2.11",
+                         "license": "MIT",
+                         "kind": "rust-crate",
+                         "repository": "https://github.com/dtolnay/unsafe-libyaml",
+                         "source_archive_url": "https://crates.io/api/v1/crates/unsafe-libyaml/0.2.11/download",
+                         "files": [],
+                         "bundled_notice": {
+                             "path": "THIRD_PARTY_NOTICES.md",
+                             "section": "unsafe-libyaml 0.2.11",
+                             "crate_path": "LICENSE-MIT",
+                             "sha256": "1db3b76e337c1768ea613abed968b9f974a3f33ae72f817a491ff2c20efa4a92"
+                         }
+                     },
+                     {
                          "name":  "font-awesome-free",
                          "version":  "6.7.2",
                          "kind":  "embedded-icons",

@@ -148,7 +148,23 @@ foreach ($name in @('SIL_Open_Font_License_1.1.txt', 'COPYRIGHT.txt', 'SOURCE.md
 }
 $files.Add([pscustomobject]@{ Source = $indexPath; Entry = 'licenses/dependencies/index.json' })
 foreach ($entry in $licenseIndex.packages) {
-    if (@($entry.files).Count -eq 0) { throw "Empty license inventory: $($entry.name)" }
+    if (@($entry.files).Count -eq 0) {
+        # A newly added dependency can keep its full license in the existing
+        # bundled notices, without changing the portable ZIP entry contract.
+        $notice = $entry.PSObject.Properties['bundled_notice']
+        if ($null -eq $notice -or $notice.Value.path -ne 'THIRD_PARTY_NOTICES.md' -or $notice.Value.sha256 -notmatch '^[0-9a-f]{64}$') {
+            throw "Empty or invalid bundled license inventory: $($entry.name)"
+        }
+        $source = Join-Path $repo 'THIRD_PARTY_NOTICES.md'
+        Assert-RegularSource $source
+        if ((Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash -ne $notice.Value.sha256) {
+            throw "Bundled dependency notice hash mismatch: $($entry.name)"
+        }
+        if ($notice.Value.section -ne "$($entry.name) $($entry.version)" -or -not [IO.File]::ReadAllText($source).Contains("#### $($notice.Value.section)")) {
+            throw "Bundled dependency notice section missing: $($entry.name)"
+        }
+        continue
+    }
     foreach ($relative in $entry.files) {
         if ($relative -match '(^|[\\/])\.\.([\\/]|$)|^[\\/]|:|[\x00-\x1f]' -or $relative -match '\.(exe|dll|ttf|otf|woff2?|ps1|rs|c|h)$') {
             throw "Unsafe dependency license path: $relative"

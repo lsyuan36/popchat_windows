@@ -1,7 +1,36 @@
-# MCP Client（0.2.4）
+# MCP Client（0.2.5）
 
 0.2.2 加入 MCP Client 與繁體中文內建提示詞。0.2.1 使用者需確認程式內更新或
 重新下載 Setup 升級；新增設定不會自行啟用服務或啟動 MCP 程式。
+
+## 0.2.5：介面與 Skills 整合
+
+### MCP 與 system prompt
+
+MCP 不會把服務全文放入 system prompt，也不會自動載入服務的 prompts。
+已啟用服務每輪初始化／探索工具，工具名稱、說明與參數 schema 透過模型的 `tools`
+欄位提供，因此仍會占用上下文；實際執行結果在工具回合返回後才加入本輪。
+未啟用服務不會自動連線，但本機 MCP 管理工具仍會提供。
+自訂 system prompt 保持獨立，不會因 MCP 或 Skills 被覆寫。
+OpenAI 相容 backend 使用已設定的 system message；ChatGPT Responses 將其轉為
+`instructions`，沒有 system message 時使用內建繁體中文 fallback。
+Codex app-server 不注入 PopChat 的 MCP／Skills 工具，既有安全邊界維持不變。
+
+### 視窗樣式
+
+工具確認與服務填寫視窗改為一致的圓角卡片與欄位分組，主操作使用強調色，
+取消／拒絕採次要樣式；操作列不隨內容捲動，窄視窗採直向按鈕。
+工具的服務、完整目的地、執行參數與風險分區顯示；空參數改為「此工具不需要額外參數」，
+非空參數不截斷。填寫頁先呈現連線與驗證欄位，已儲存服務與進階設定分開收合，
+「允許模型提出新增草稿」移至「進階選項」。
+
+這只是介面調整，不會自動保存、啟用、測試或授權工具；密碼仍遮罩，
+內網 HTTP 仍需獨立同意，每次執行仍須明確確認。此介面調整需升級至 0.2.5。
+畫面檢查使用假資料與離線 egui 輸出，不連線真實服務、不啟動第二個聊天 UI。
+整合 Skills 後完整回歸 **620 library、29 app、1 send-pipeline integration、1 license inventory、
+15 importer passed；3 ignored，合計 666 項通過**，無 warning（4 條測試執行緒）。涵蓋等寬卡片、窄視窗固定操作列、
+完整長參數、密碼遮罩、真實按鈕點擊及原有授權／內網 HTTP 確認流程。
+Skills 的來源、個別啟停及按需載入見 [SKILLS.md](SKILLS.md)，不影響 MCP 逐次確認邊界。
 
 ## 0.2.4：完整連線資訊的本機確認流程
 

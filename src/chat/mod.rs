@@ -10,5 +10,6 @@ pub mod context;
 pub mod mcp;
 pub mod providers;
 pub mod responses;
+pub mod skills;
 pub mod store;
 pub mod web;

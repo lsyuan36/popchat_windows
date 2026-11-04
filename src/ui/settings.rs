@@ -196,22 +196,25 @@ enum SettingsTab {
     Commands,
     Hotkey,
     Mcp,
+    Skills,
 }
 
 impl SettingsTab {
-    const ALL: [(Self, &'static str); 6] = [
+    const ALL: [(Self, &'static str); 7] = [
         (Self::Service, "服務"),
         (Self::Appearance, "外觀"),
         (Self::Search, "搜尋"),
         (Self::Commands, "指令"),
         (Self::Hotkey, "快捷鍵"),
         (Self::Mcp, "MCP"),
+        (Self::Skills, "Skills"),
     ];
 }
 
 #[derive(Debug, Clone)]
 pub enum SettingsAction {
     ManageMcp,
+    ManageSkills,
     /// Register with the OS first, then call `commit_hotkey_binding` on success.
     ChangeHotkey(String),
     InstallUpdate(crate::updater::PreparedUpdate),
@@ -835,6 +838,7 @@ impl SettingsUi {
                                     SettingsTab::Commands => self.commands_section(ui),
                                     SettingsTab::Hotkey => self.hotkey_section(ui, runtime),
                                     SettingsTab::Mcp => self.mcp_section(ui),
+                                    SettingsTab::Skills => self.skills_section(ui),
                                 }
                             });
                     });
@@ -1270,6 +1274,15 @@ impl SettingsUi {
         if ui.button("管理 MCP 服務／連線測試").clicked() {
             self.actions.push(SettingsAction::ManageMcp);
         }
+    }
+
+    fn skills_section(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Skills 技能指引");
+        ui.add(egui::Label::new("讀取 OpenCode、Claude、Codex／共用 Agents 的預設技能路徑，也可指定專案或自訂資料夾。每個技能預設停用；啟用代表同意模型按需讀取並傳送其指引與文字參考檔。其他工具的設定不會被修改。").wrap());
+        if ui.button("管理技能／掃描來源").clicked() {
+            self.actions.push(SettingsAction::ManageSkills);
+        }
+        muted(ui,"只先提供名稱與說明，需要時才載入全文，不會將全部 SKILL.md 塞入 system prompt；不自動執行腳本或授予工具權限。適用於支援工具呼叫的 API／ChatGPT Responses；Codex app-server 不注入 PopChat 技能工具。");
     }
 
     pub fn report_context_limit_save(
@@ -2778,6 +2791,7 @@ mod tests {
                                         draft.hotkey_section(ui, runtime.handle())
                                     }
                                     SettingsTab::Mcp => draft.mcp_section(ui),
+                                    SettingsTab::Skills => draft.skills_section(ui),
                                 },
                             );
                             assert!(

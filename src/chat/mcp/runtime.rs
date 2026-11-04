@@ -46,6 +46,9 @@ pub struct McpTurn {
     turn_id: Uuid,
     sink: ApprovalSink,
     calls: Arc<AtomicUsize>,
+    // Local tools share the provider round-trip catalog, never MCP transport.
+    skills: crate::chat::skills::SkillTurn,
+    skill_store: Option<crate::chat::skills::SkillStore>,
 }
 
 impl McpTurn {
@@ -90,10 +93,38 @@ impl McpTurn {
             turn_id,
             sink: Arc::new(sink),
             calls: Arc::new(AtomicUsize::new(0)),
+            skills: Default::default(),
+            skill_store: None,
         }
     }
+    pub fn with_skills(mut self, skills: crate::chat::skills::SkillTurn) -> Self {
+        self.skills = skills;
+        self
+    }
+    pub fn with_skill_store(mut self, store: crate::chat::skills::SkillStore) -> Self {
+        self.skill_store = Some(store);
+        self
+    }
     pub async fn open(&self, tx: &mpsc::UnboundedSender<ChatStreamEvent>) -> Result<ToolCatalog> {
-        let management = management_schemas();
+        let mut skills = if let Some(store) = &self.skill_store {
+            ensure!(!tx.is_closed(), "聊天已取消");
+            let store = store.clone();
+            tokio::task::spawn_blocking(move || store.for_turn()).await?
+        } else {
+            self.skills.clone()
+        };
+        if self.skill_store.is_some() || !skills.is_empty() {
+            ensure!(!tx.is_closed(), "聊天已取消");
+        }
+        skills.redact_metadata(|text| self.redact_text(text));
+        let mut management = management_schemas();
+        let mut skill_schemas = skills.schemas();
+        // A skill containing a previously pasted MCP token cannot leak it via
+        // metadata. Body and reference outputs are redacted separately below.
+        for schema in &mut skill_schemas {
+            self.redact(schema);
+        }
+        management.extend(skill_schemas);
         let reserved_bytes = serde_json::to_vec(&management)?.len();
         let mut catalog = ToolCatalog {
             turn: self.clone(),
@@ -102,6 +133,7 @@ impl McpTurn {
             sessions: vec![],
             denied: std::collections::HashSet::new(),
             discovery_failures: HashMap::new(),
+            skills,
         };
         if self.allow_proposals {
             catalog.schemas.push(proposal_schema());
@@ -163,6 +195,10 @@ impl McpTurn {
             catalog.sessions.push((service.clone(), session, token));
         }
         catalog.schemas.extend(management);
+        ensure!(
+            catalog.schemas.len() <= 64 && serde_json::to_vec(&catalog.schemas)?.len() <= 65536,
+            "工具目錄超過 64 個工具或 64 KiB；請停用部分服務或技能。"
+        );
         Ok(catalog)
     }
 
@@ -215,6 +251,7 @@ pub struct ToolCatalog {
     sessions: Vec<(Service, Session, String)>,
     denied: std::collections::HashSet<String>,
     discovery_failures: HashMap<Uuid, String>,
+    skills: crate::chat::skills::SkillTurn,
 }
 impl ToolCatalog {
     pub fn schemas(&self) -> &[Value] {
@@ -227,6 +264,7 @@ impl ToolCatalog {
                 "mcp_status" | "open_mcp_settings" | "test_mcp_service"
             )
             || self.bindings.contains_key(name)
+            || self.skills.contains(name)
     }
     pub async fn execute(
         &mut self,
@@ -234,6 +272,35 @@ impl ToolCatalog {
         arguments: &str,
         tx: &mpsc::UnboundedSender<ChatStreamEvent>,
     ) -> String {
+        if self.skills.contains(name) {
+            if tx.is_closed() {
+                return "ERROR: 聊天已取消。".into();
+            }
+            let parsed = if arguments.len() <= 2048 {
+                serde_json::from_str::<Value>(arguments).ok()
+            } else {
+                None
+            };
+            if parsed
+                .as_ref()
+                .is_none_or(|args| self.turn.contains_secret(args))
+            {
+                return "ERROR: 技能參數不可包含 MCP 憑證。".into();
+            }
+            // No untrusted YAML/parser errors or absolute paths leave the app.
+            let mut result=match self.skills.execute(name,arguments) {
+                Ok(output)=>match serde_json::from_str::<Value>(&output) {
+                    Ok(mut data)=>{self.turn.redact(&mut data);data.to_string()},
+                    Err(_)=>"ERROR: 技能結果格式無效。".into(),
+                },
+                Err(_)=>"ERROR: 技能讀取未完成：可能未啟用、內容已變更、參數無效、路徑超出範圍或已達讀取上限。請由使用者檢查 Skills 設定；不可改用其他工具繞過限制。".into(),
+            };
+            self.turn.redact_text(&mut result);
+            let _ = tx.send(ChatStreamEvent::Activity(
+                "讀取已啟用的 Skills 指引／參考資料（未執行腳本）。".into(),
+            ));
+            return result;
+        }
         match self.execute_inner(name, arguments, tx).await {
             Ok(s) => s,
             Err(error) => format!("ERROR: {}", safe_error(&error)),

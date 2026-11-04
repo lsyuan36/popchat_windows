@@ -223,6 +223,7 @@ fn mcp_approval_is_current(
 
 struct PopChatApp {
     mcp: popchat_windows::ui::mcp::McpUi,
+    skills: popchat_windows::ui::skills::SkillsUi,
     mcp_approval: Option<popchat_windows::chat::mcp::ApprovalRequest>,
     chat: ChatStore,
     providers: ProviderStore,
@@ -439,6 +440,7 @@ impl PopChatApp {
         Self {
             chat,
             mcp: popchat_windows::ui::mcp::McpUi::new(),
+            skills: Default::default(),
             mcp_approval: None,
             providers,
             secrets,
@@ -1039,6 +1041,9 @@ impl PopChatApp {
             match action {
                 SettingsAction::ManageMcp => {
                     self.mcp.open = true;
+                }
+                SettingsAction::ManageSkills => {
+                    self.skills.open = true;
                 }
                 SettingsAction::SignInChatGpt => {
                     if self.auth_task.is_some() || self.auth_signing_out {
@@ -2804,7 +2809,7 @@ impl PopChatApp {
                     let _ = event_tx.send(AppEvent::McpApproval(request));
                 },
             ) {
-                Ok(mcp) => mcp,
+                Ok(mcp) => mcp.map(|turn| turn.with_skill_store(self.skills.snapshot_store())),
                 Err(_) => {
                     self.chat.messages.push(ChatMessage::new(
                         ChatRole::Error,
@@ -2860,6 +2865,12 @@ impl PopChatApp {
                 }
             }
         } else if self.update_confirmation.is_none() {
+            if self.skills.open {
+                if self.skills.show(ctx) {
+                    self.stop_active_stream();
+                }
+                return;
+            }
             if self.mcp.show(ctx, self.runtime.handle(), &mut self.secrets) {
                 self.stop_active_stream();
             }
