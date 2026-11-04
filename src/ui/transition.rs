@@ -82,9 +82,39 @@ pub fn show<R>(
     frame: TransitionFrame,
     contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> egui::InnerResponse<R> {
+    show_impl(ui, frame, false, contents)
+}
+
+/// For contents INSIDE a vertical ScrollArea. Egui gives its content Ui a
+/// viewport-sized max_rect, not infinite height. Preserve the full natural
+/// height and use the scroll area's clip; otherwise long panes look short to
+/// the scrollbar and their lower controls can never scroll into view.
+/// Width stays bounded so entrance motion cannot create horizontal overflow.
+pub fn show_scroll_contents<R>(
+    ui: &mut egui::Ui,
+    frame: TransitionFrame,
+    contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
+    show_impl(ui, frame, true, contents)
+}
+
+fn show_impl<R>(
+    ui: &mut egui::Ui,
+    frame: TransitionFrame,
+    vertical_overflow: bool,
+    contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
     let available = ui.available_rect_before_wrap();
     let original = egui::Rect::from_min_max(available.min, available.max.max(available.min));
-    let clip = original.intersect(ui.clip_rect());
+    let clip = if vertical_overflow {
+        egui::Rect::from_min_max(
+            egui::pos2(original.left(), ui.clip_rect().top()),
+            egui::pos2(original.right(), ui.clip_rect().bottom()),
+        )
+        .intersect(ui.clip_rect())
+    } else {
+        original.intersect(ui.clip_rect())
+    };
     let offset = if frame.offset.is_finite() {
         frame.offset
     } else {
@@ -103,7 +133,21 @@ pub fn show<R>(
     child.set_clip_rect(clip);
     child.multiply_opacity(opacity);
     let inner = contents(&mut child);
-    let occupied = child.min_rect().translate(-offset).intersect(original);
+    let natural = child.min_rect().translate(-offset);
+    let occupied = if vertical_overflow {
+        egui::Rect::from_min_max(
+            egui::pos2(
+                natural.left().clamp(original.left(), original.right()),
+                natural.top(),
+            ),
+            egui::pos2(
+                natural.right().clamp(original.left(), original.right()),
+                natural.bottom(),
+            ),
+        )
+    } else {
+        natural.intersect(original)
+    };
     let id = child.unique_id();
     // Dropping registers the final translated response, including close flags.
     drop(child);
@@ -637,6 +681,99 @@ mod tests {
             close(ui.min_rect().height(), 0.0);
         });
         assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn scrolling_pane_keeps_natural_height_and_bottom_controls_reachable_by_wheel() {
+        for offset in [-6.0, 0.0, 6.0] {
+            let ctx = context();
+            let mut time = 0.0;
+            let mut draw = |events: Vec<Event>| {
+                time += 0.1;
+                let mut result = None;
+                let output = ctx.run(input(time, events), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let scroll = egui::ScrollArea::vertical()
+                            .id_salt("natural_height_test")
+                            .max_height(180.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.label("Settings heading fixture");
+                                show_scroll_contents(
+                                    ui,
+                                    TransitionFrame {
+                                        opacity: 1.0,
+                                        offset: vec2(offset, 0.0),
+                                        active: offset != 0.0,
+                                    },
+                                    |ui| {
+                                        ui.label("First pane field");
+                                        ui.add_space(700.0);
+                                        ui.button("Bottom pane action")
+                                    },
+                                )
+                                .inner
+                            });
+                        result = Some((
+                            scroll.content_size,
+                            scroll.inner_rect,
+                            scroll.state.offset,
+                            scroll.inner,
+                        ));
+                    });
+                });
+                (output, result.unwrap())
+            };
+            let _ = draw(vec![]);
+            let (_, initial) = draw(vec![]);
+            assert!(
+                initial.0.y > 740.0,
+                "pane height must include all content, not only the viewport: {:?}",
+                initial.0
+            );
+            let pos = initial.1.center();
+            let (_, mut scrolled) = draw(vec![
+                Event::PointerMoved(pos),
+                Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: vec2(0.0, -10_000.0),
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+            for _ in 0..8 {
+                scrolled = draw(vec![]).1;
+            }
+            assert!(
+                scrolled.2.y > 500.0,
+                "wheel must move the viewport: {:?}",
+                scrolled.2
+            );
+            assert!(
+                scrolled.1.contains_rect(scrolled.3.interact_rect)
+                    && scrolled.3.rect.top() >= scrolled.1.top()
+                    && scrolled.3.rect.bottom() <= scrolled.1.bottom() + 0.5,
+                "bottom action must become visible: {:?} {:?}",
+                scrolled.1,
+                scrolled.3.rect
+            );
+            let pos = scrolled.3.rect.center();
+            for pressed in [true, false] {
+                let (_, result) = draw(vec![
+                    Event::PointerMoved(pos),
+                    Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]);
+                assert_eq!(
+                    result.3.clicked(),
+                    !pressed,
+                    "bottom action must receive the actual click"
+                );
+            }
+        }
     }
 
     #[test]

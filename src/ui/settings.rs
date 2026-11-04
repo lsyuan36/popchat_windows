@@ -833,18 +833,22 @@ impl SettingsUi {
                             ui.input(|input| input.time),
                             crate::ui::transition::motion_enabled(ui.ctx()),
                         );
-                        crate::ui::transition::show(ui, pane_effect, |ui| match self.active_tab {
-                            SettingsTab::Service => {
-                                self.providers_section(ui, runtime, providers, secrets);
-                            }
-                            SettingsTab::Appearance => self.appearance_section(ui),
-                            SettingsTab::Search => self.search_section(ui),
-                            SettingsTab::Commands => self.commands_section(ui),
-                            SettingsTab::Hotkey => self.hotkey_section(ui),
-                            SettingsTab::Mcp => self.mcp_section(ui),
-                            SettingsTab::Skills => self.skills_section(ui),
-                            SettingsTab::About => self.about_section(ui, runtime),
-                        });
+                        crate::ui::transition::show_scroll_contents(
+                            ui,
+                            pane_effect,
+                            |ui| match self.active_tab {
+                                SettingsTab::Service => {
+                                    self.providers_section(ui, runtime, providers, secrets);
+                                }
+                                SettingsTab::Appearance => self.appearance_section(ui),
+                                SettingsTab::Search => self.search_section(ui),
+                                SettingsTab::Commands => self.commands_section(ui),
+                                SettingsTab::Hotkey => self.hotkey_section(ui),
+                                SettingsTab::Mcp => self.mcp_section(ui),
+                                SettingsTab::Skills => self.skills_section(ui),
+                                SettingsTab::About => self.about_section(ui, runtime),
+                            },
+                        );
 
                         retry_preferences = self.preference_save_error.is_some()
                             && ui.button("重試儲存偏好設定").clicked();
@@ -2854,6 +2858,154 @@ mod tests {
             std::fs::read(dir.path().join("providers.json")).unwrap(),
             stored
         );
+        assert!(!dir.path().join("secrets.json").exists());
+    }
+
+    #[test]
+    fn every_settings_pane_scrolls_to_its_end_and_back_without_error_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut providers =
+            ProviderStore::isolated_file_for_tests(dir.path().join("providers.json"));
+        let provider = provider(1, "https://synthetic.invalid/v1");
+        providers.selected_id = provider.id;
+        providers.providers = vec![provider];
+        let secrets = SecretStore::isolated_file_for_tests(dir.path().join("secrets.json"));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let text_rect = |output: &egui::FullOutput, expected: &str| {
+            output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == expected => Some((
+                    egui::Rect::from_min_size(text.pos, text.galley.size()),
+                    shape.clip_rect,
+                )),
+                _ => None,
+            })
+        };
+        for dark in [false, true] {
+            for size in [egui::vec2(320.0, 360.0), egui::vec2(520.0, 360.0)] {
+                for (tab, _) in SettingsTab::ALL {
+                    let ctx = egui::Context::default();
+                    theme::apply(&ctx, if dark { "dark" } else { "light" }, DEFAULT_ACCENT);
+                    ctx.style_mut(|style| style.animation_time = 0.0);
+                    super::super::mcp::preview::prepare_fonts(&ctx);
+                    let mut draft = SettingsUi::from_settings(AppSettings::default());
+                    draft.sync_provider(&providers, &secrets);
+                    draft.active_tab = tab;
+                    draft.hotkey_label = Some("Alt+Down".into());
+                    let before = draft.settings.clone();
+                    let mut frames = vec![];
+                    let mut time = 0.0;
+                    let mut draw = |events: Vec<egui::Event>| {
+                        time += 0.1;
+                        frames.push(ctx.run(
+                            egui::RawInput {
+                                screen_rect: Some(egui::Rect::from_min_size(
+                                    egui::Pos2::ZERO,
+                                    size,
+                                )),
+                                time: Some(time),
+                                events,
+                                ..Default::default()
+                            },
+                            |ctx| {
+                                egui::CentralPanel::default()
+                                    .frame(super::super::surface::canvas_frame())
+                                    .show(ctx, |ui| {
+                                        super::super::surface::card_frame(dark).show(ui, |ui| {
+                                            ui.set_min_size(ui.available_size());
+                                            ui.label("PopChat · offline wheel fixture");
+                                            assert!(!draft.show(
+                                                ui,
+                                                runtime.handle(),
+                                                &providers,
+                                                &secrets
+                                            ));
+                                        });
+                                    });
+                            },
+                        ));
+                        frames.last().unwrap().clone()
+                    };
+                    let _ = draw(vec![]);
+                    let initial = draw(vec![]);
+                    let top = text_rect(&initial, "設定")
+                        .expect("settings heading starts visible")
+                        .0;
+                    let save = text_rect(&initial, "儲存設定").unwrap().0;
+                    let pos = egui::pos2(size.x - 36.0, 100.0);
+                    let wheel = |delta| {
+                        vec![
+                            egui::Event::PointerMoved(pos),
+                            egui::Event::MouseWheel {
+                                unit: egui::MouseWheelUnit::Point,
+                                delta: egui::vec2(0.0, delta),
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ]
+                    };
+                    let mut bottom = draw(wheel(-10000.0));
+                    for _ in 0..8 {
+                        bottom = draw(vec![]);
+                    }
+                    assert!(
+                        text_rect(&bottom, "設定")
+                            .is_none_or(|(rect, clip)| !clip.intersects(rect)
+                                || rect.top() < top.top() - 30.0),
+                        "wheel must actually move pane {}, not merely leave Save visible",
+                        tab as u8
+                    );
+                    let target=match tab {
+                    SettingsTab::Service=>"將 PDF 原檔傳給此端點（需模型支援）",
+                    SettingsTab::Appearance=>"下次叫出視窗時套用，仍可隨時拖曳移動。",
+                    SettingsTab::Search=>"DuckDuckGo",
+                    SettingsTab::Commands=>"新增指令",
+                    SettingsTab::Hotkey=>"也可直接將檔案拖入聊天視窗；不需要先點附件按鈕。",
+                    SettingsTab::Mcp=>"管理 MCP 服務／連線測試",
+                    SettingsTab::Skills=>"只先提供名稱與說明，需要時才載入全文，不會將全部 SKILL.md 塞入 system prompt；不自動執行腳本或授予工具權限。適用於支援工具呼叫的 API／ChatGPT Responses；Codex app-server 不注入 PopChat 技能工具。",
+                    SettingsTab::About=>"Windows 專案",
+                };
+                    let (rect, clip) = text_rect(&bottom, target)
+                        .unwrap_or_else(|| panic!("pane {} cannot reach {target}", tab as u8));
+                    assert!(
+                        clip.intersect(rect).height() >= rect.height().min(24.0),
+                        "pane {} bottom content remains clipped: {rect:?} {clip:?}",
+                        tab as u8
+                    );
+                    assert_eq!(
+                        text_rect(&bottom, "儲存設定").unwrap().0,
+                        save,
+                        "footer must stay fixed"
+                    );
+                    let mut restored = draw(wheel(10000.0));
+                    for _ in 0..8 {
+                        restored = draw(vec![]);
+                    }
+                    let restored_top = text_rect(&restored, "設定")
+                        .expect("wheel up must return to the tabs")
+                        .0;
+                    assert!((restored_top.top() - top.top()).abs() < 0.6);
+                    assert_eq!(text_rect(&restored, "儲存設定").unwrap().0, save);
+                    assert_eq!(draft.settings, before);
+                    assert!(draft.preference_save_error.is_none() && draft.save_result.is_none());
+                    assert!(draft.take_actions().is_empty());
+                    if matches!(tab, SettingsTab::Appearance | SettingsTab::Hotkey) {
+                        super::super::mcp::preview::export(
+                            &ctx,
+                            &frames,
+                            size,
+                            &format!(
+                                "settings-wheel-restored-{}-{}-{}.png",
+                                tab as u8,
+                                if dark { "dark" } else { "light" },
+                                size.x as u32
+                            ),
+                            dark,
+                        );
+                    }
+                }
+            }
+        }
         assert!(!dir.path().join("secrets.json").exists());
     }
 
