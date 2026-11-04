@@ -3,6 +3,41 @@
 use eframe::egui;
 
 pub const CARD_MARGIN: i8 = 12;
+pub const CARD_RADIUS: u8 = 24;
+/// Root-card margin plus breathing room for a modal's soft shadow.
+pub const DIALOG_CLEARANCE: f32 = 26.0;
+
+pub fn dialog_content_width(ctx: &egui::Context, max_width: f32, inner_margin: f32) -> f32 {
+    (ctx.screen_rect().width() - 2.0 * (DIALOG_CLEARANCE + inner_margin + 1.0))
+        .clamp(160.0, max_width)
+}
+
+/// Popups need a much softer, smaller shadow than egui's opaque stock shadow.
+/// Keep its reach inside the space reserved by the transparent native canvas.
+pub fn popup_shadow() -> egui::Shadow {
+    egui::Shadow {
+        offset: [0, 2],
+        blur: 12,
+        spread: 0,
+        color: egui::Color32::from_black_alpha(40),
+    }
+}
+
+/// Preserve egui's modal input/escape/outside-click handling, but never paint a
+/// square backdrop across our transparent native window (including its corners).
+pub fn modal(ctx: &egui::Context, id: egui::Id, frame: egui::Frame) -> egui::Modal {
+    let area = egui::Modal::default_area(id);
+    let card = ctx.screen_rect().shrink(f32::from(CARD_MARGIN));
+    ctx.layer_painter(area.layer()).rect_filled(
+        card,
+        egui::CornerRadius::same(CARD_RADIUS),
+        egui::Color32::from_black_alpha(180),
+    );
+    egui::Modal::new(id)
+        .area(area)
+        .backdrop_color(egui::Color32::TRANSPARENT)
+        .frame(frame.shadow(popup_shadow()))
+}
 
 /// eframe's default is a dark rectangle with alpha 180, even when the native
 /// window and CentralPanel are transparent. Clear every frame to actual zero.
@@ -24,7 +59,7 @@ pub fn card_frame(dark: bool) -> egui::Frame {
         } else {
             egui::Stroke::new(1.0_f32, egui::Color32::from_black_alpha(16))
         })
-        .corner_radius(egui::CornerRadius::same(24))
+        .corner_radius(egui::CornerRadius::same(CARD_RADIUS))
         .inner_margin(egui::Margin::symmetric(22, 18))
         .shadow(egui::Shadow {
             offset: [0, 2],
@@ -63,6 +98,218 @@ pub fn drag_window(ui: &mut egui::Ui, rect: egui::Rect, id: egui::Id) -> egui::R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scene(dark: bool, size: egui::Vec2, legacy: bool) -> (egui::Context, Vec<egui::FullOutput>) {
+        let ctx = egui::Context::default();
+        super::super::theme::apply(
+            &ctx,
+            if dark { "dark" } else { "light" },
+            super::super::theme::DEFAULT_ACCENT_HEX,
+        );
+        let mut frames = vec![];
+        for index in 0..5 {
+            frames.push(ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    time: Some(index as f64 / 4.0),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default()
+                        .frame(canvas_frame())
+                        .show(ctx, |ui| {
+                            card_frame(dark).show(ui, |ui| {
+                                ui.set_min_size(ui.available_size());
+                                ui.label("Underlying settings card");
+                            });
+                        });
+                    let frame = egui::Frame::popup(&ctx.style())
+                        .corner_radius(14)
+                        .inner_margin(18);
+                    let id = egui::Id::new("rounded-native-modal-test");
+                    let dialog = if legacy {
+                        egui::Modal::new(id)
+                            .backdrop_color(egui::Color32::from_black_alpha(180))
+                            .frame(frame)
+                    } else {
+                        modal(ctx, id, frame)
+                    };
+                    dialog.show(ctx, |ui| {
+                        ui.set_width((size.x - 110.0).clamp(100.0, 240.0));
+                        ui.label("Human confirmation only");
+                        let _ = ui.button("Close");
+                    });
+                },
+            ));
+        }
+        (ctx, frames)
+    }
+
+    #[test]
+    fn modal_backdrop_does_not_reintroduce_the_native_square_rectangle() {
+        use super::super::mcp::preview;
+        for dark in [false, true] {
+            for size in [egui::vec2(320.0, 480.0), egui::vec2(720.0, 650.0)] {
+                let (ctx, frames) = scene(dark, size, false);
+                let image = preview::render(&ctx, &frames, size, [0; 4]);
+                for (x, y) in [
+                    (0, 0),
+                    (size.x as u32 - 1, 0),
+                    (0, size.y as u32 - 1),
+                    (size.x as u32 - 1, size.y as u32 - 1),
+                    (0, size.y as u32 / 2),
+                    (size.x as u32 / 2, 0),
+                ] {
+                    assert_eq!(
+                        image.get_pixel(x, y).0[3],
+                        0,
+                        "native transparent margin must stay clear: {dark} {size:?} {x},{y}"
+                    );
+                }
+                let backdrop = frames
+                    .last()
+                    .unwrap()
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Rect(rect)
+                            if rect.fill == egui::Color32::from_black_alpha(180) =>
+                        {
+                            Some(rect)
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(backdrop.len(), 1);
+                assert_eq!(
+                    backdrop[0].corner_radius,
+                    egui::CornerRadius::same(CARD_RADIUS)
+                );
+                assert_eq!(
+                    backdrop[0].rect,
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, size)
+                        .shrink(f32::from(CARD_MARGIN))
+                );
+                let (old_ctx, old_frames) = scene(dark, size, true);
+                let legacy = preview::render(&old_ctx, &old_frames, size, [0; 4]);
+                assert_eq!(
+                    legacy.get_pixel(0, 0).0[3],
+                    180,
+                    "fixture must reproduce the old square dimming"
+                );
+                preview::export(
+                    &ctx,
+                    &frames,
+                    size,
+                    &format!(
+                        "modal-fixed-{}-{}.png",
+                        if dark { "dark" } else { "light" },
+                        size.x as u32
+                    ),
+                    dark,
+                );
+                preview::export(
+                    &old_ctx,
+                    &old_frames,
+                    size,
+                    &format!(
+                        "modal-before-{}-{}.png",
+                        if dark { "dark" } else { "light" },
+                        size.x as u32
+                    ),
+                    dark,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn transparent_modal_still_blocks_underlying_clicks_and_keeps_escape_and_outside_close() {
+        let ctx = egui::Context::default();
+        let size = egui::vec2(600.0, 450.0);
+        let mut underlying_clicked = false;
+        let mut draw = |events| {
+            let mut close = false;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        underlying_clicked |= ui.button("Must not be activated").clicked();
+                    });
+                    close = modal(
+                        ctx,
+                        egui::Id::new("modal-input-test"),
+                        egui::Frame::popup(&ctx.style()),
+                    )
+                    .show(ctx, |ui| {
+                        ui.label("Confirmation required");
+                    })
+                    .should_close();
+                },
+            );
+            (output, close)
+        };
+        for _ in 0..5 {
+            assert!(!draw(vec![]).1);
+        }
+        let position = egui::pos2(20.0, 15.0);
+        draw(vec![
+            egui::Event::PointerMoved(position),
+            egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        assert!(
+            draw(vec![egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE
+            }])
+            .1
+        );
+        assert!(
+            draw(vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE
+            }])
+            .1
+        );
+        assert!(!underlying_clicked);
+    }
+
+    #[test]
+    fn all_stock_popup_surfaces_use_the_same_soft_bounded_shadow() {
+        for dark in [false, true] {
+            let ctx = egui::Context::default();
+            super::super::theme::apply(
+                &ctx,
+                if dark { "dark" } else { "light" },
+                super::super::theme::DEFAULT_ACCENT_HEX,
+            );
+            let frame = egui::Frame::popup(&ctx.style());
+            assert_eq!(frame.shadow, popup_shadow());
+            assert_eq!(frame.stroke.width, 1.0);
+            assert!(frame.stroke.color.a() <= 23);
+            let shadow = frame.shadow;
+            assert!(
+                f32::from(shadow.blur) * 0.5
+                    + f32::from(shadow.offset[1].abs())
+                    + frame.stroke.width
+                    < f32::from(CARD_MARGIN)
+            );
+        }
+    }
 
     #[test]
     fn opacity_changes_backdrop_not_text_and_never_restores_the_dark_clear_rectangle() {

@@ -109,39 +109,69 @@ const GROUPS: &[(&str, &[Shortcut])] = &[
 /// No interactions or callbacks: all keycaps are labels, not buttons.
 pub fn show(ui: &mut Ui) {
     super::preference_layout::caption(ui, "聊天視窗中的快捷操作；全域喚出快捷鍵可在上方另外設定。");
-    ui.add_space(10.0);
+    ui.add_space(4.0);
     for (index, (heading, shortcuts)) in GROUPS.iter().enumerate() {
         if index > 0 {
-            ui.add_space(14.0);
+            ui.add_space(4.0);
         }
-        super::preference_layout::heading(ui, heading);
-        super::preference_layout::card(ui, |ui| {
-            for (index, shortcut) in shortcuts.iter().enumerate() {
-                if index > 0 {
-                    super::preference_layout::divider(ui);
+        ui.label(RichText::new(*heading).size(13.0).strong());
+        let dark = ui.visuals().dark_mode;
+        egui::Frame::new()
+            .fill(if dark {
+                egui::Color32::from_white_alpha(7)
+            } else {
+                super::theme::LIGHT_RAISED
+            })
+            .stroke(egui::Stroke::new(
+                1.0_f32,
+                if dark {
+                    egui::Color32::from_white_alpha(16)
+                } else {
+                    egui::Color32::from_black_alpha(18)
+                },
+            ))
+            .corner_radius(10)
+            .inner_margin(egui::Margin::symmetric(10, 4))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                // Read-only keycaps do not need the settings controls' 32pt hit target.
+                ui.spacing_mut().interact_size.y = 18.0;
+                ui.spacing_mut().item_spacing = egui::vec2(10.0, 1.0);
+                let columns = if ui.available_width() >= 420.0 { 2 } else { 1 };
+                for (index, shortcuts) in shortcuts.chunks(columns).enumerate() {
+                    if index > 0 {
+                        ui.add_space(3.0);
+                    }
+                    ui.columns(columns, |uis| {
+                        for (ui, shortcut) in uis.iter_mut().zip(shortcuts) {
+                            row(ui, shortcut);
+                        }
+                    });
                 }
-                row(ui, shortcut);
-            }
-        });
+            });
     }
 }
 
 fn row(ui: &mut Ui, shortcut: &Shortcut) {
     let width = ui.available_width();
-    if width < 400.0 {
+    let keys_width = shortcut
+        .bindings
+        .iter()
+        .enumerate()
+        .map(|(index, binding)| binding_width(ui, binding, index))
+        .fold(0.0_f32, f32::max);
+    let gap = ui.spacing().item_spacing.x;
+    let label_width = width - gap - keys_width;
+    if label_width < 72.0 {
         action(ui, shortcut);
-        ui.add_space(4.0);
-        ui.with_layout(Layout::top_down(Align::RIGHT), |ui| bindings(ui, shortcut));
+        bindings(ui, shortcut);
     } else {
-        let gap = ui.spacing().item_spacing.x;
-        let label_width = (width - gap) * 0.47;
-        let keys_width = width - gap - label_width;
         ui.horizontal(|ui| {
             ui.allocate_ui_with_layout(
                 egui::vec2(label_width, 0.0),
                 Layout::top_down(Align::LEFT),
                 |ui| {
-                    ui.set_min_width(label_width);
+                    ui.set_width(label_width);
                     action(ui, shortcut);
                 },
             );
@@ -149,46 +179,51 @@ fn row(ui: &mut Ui, shortcut: &Shortcut) {
                 egui::vec2(keys_width, 0.0),
                 Layout::top_down(Align::RIGHT),
                 |ui| {
-                    ui.set_min_width(keys_width);
+                    ui.set_width(keys_width);
                     bindings(ui, shortcut);
                 },
             );
         });
     }
+    if !shortcut.note.is_empty() {
+        ui.add(egui::Label::new(RichText::new(shortcut.note).size(11.0).weak()).wrap());
+    }
 }
 
 fn action(ui: &mut Ui, shortcut: &Shortcut) {
     ui.add(egui::Label::new(RichText::new(shortcut.action).size(13.0).strong()).wrap());
-    if !shortcut.note.is_empty() {
-        ui.add(egui::Label::new(RichText::new(shortcut.note).size(11.0).weak()).wrap());
+}
+
+fn binding_width(ui: &Ui, binding: &[&str], index: usize) -> f32 {
+    let text_width = |text: &str, font: egui::FontId| {
+        ui.fonts(|fonts| {
+            fonts
+                .layout_no_wrap(text.to_owned(), font, ui.visuals().text_color())
+                .size()
+                .x
+        })
+    };
+    let mut width = binding
+        .iter()
+        .map(|key| text_width(key, egui::FontId::monospace(11.0)) + 10.0)
+        .sum::<f32>();
+    width += binding.len().saturating_sub(1) as f32
+        * (8.0 + text_width("+", egui::FontId::proportional(10.0)));
+    if index > 0 {
+        width += text_width("或", egui::FontId::proportional(11.0)) + 4.0;
     }
+    width
 }
 
 fn bindings(ui: &mut Ui, shortcut: &Shortcut) {
     // Separate alternatives instead of cramming a slash into one long string.
     // Each combination fits in the narrow layout, while alternatives can stack.
     for (index, binding) in shortcut.bindings.iter().enumerate() {
-        let text_width = |text: &str, font: egui::FontId| {
-            ui.fonts(|fonts| {
-                fonts
-                    .layout_no_wrap(text.to_owned(), font, ui.visuals().text_color())
-                    .size()
-                    .x
-            })
-        };
-        let mut width: f32 = binding
-            .iter()
-            .map(|key| text_width(key, egui::FontId::monospace(11.0)) + 16.0)
-            .sum();
-        width += binding.len().saturating_sub(1) as f32
-            * (8.0 + text_width("+", egui::FontId::proportional(10.0)));
-        if index > 0 {
-            width += text_width("或", egui::FontId::proportional(11.0)) + 4.0;
-        }
+        let width = binding_width(ui, binding, index);
         // Explicit LTR prevents the enclosing right-aligned column from
         // reversing key order or making a Frame paint past its allocation.
         ui.allocate_ui_with_layout(
-            egui::vec2(width, 26.0),
+            egui::vec2(width, 20.0),
             Layout::left_to_right(Align::Center),
             |ui| {
                 ui.set_min_width(width);
@@ -224,7 +259,7 @@ fn keycap(ui: &mut Ui, key: &str) {
             },
         ))
         .corner_radius(5)
-        .inner_margin(egui::Margin::symmetric(7, 4))
+        .inner_margin(egui::Margin::symmetric(4, 2))
         .show(ui, |ui| {
             ui.add(egui::Label::new(RichText::new(key).monospace().size(11.0)).selectable(false));
         });
@@ -233,6 +268,85 @@ fn keycap(ui: &mut Ui, key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_reference_pairs_shortcuts_on_wide_surfaces_without_shrinking_controls() {
+        for width in [320.0, 520.0, 982.0] {
+            for dark in [false, true] {
+                let ctx = egui::Context::default();
+                super::super::theme::apply(
+                    &ctx,
+                    if dark { "dark" } else { "light" },
+                    super::super::theme::DEFAULT_ACCENT_HEX,
+                );
+                super::super::mcp::preview::prepare_fonts(&ctx);
+                let mut bounds = egui::Rect::NOTHING;
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 1200.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            ui.spacing_mut().interact_size.y = 32.0;
+                            bounds = ui.scope(show).response.rect;
+                            assert_eq!(
+                                ui.spacing().interact_size.y,
+                                32.0,
+                                "read-only compact spacing must not shrink real controls"
+                            );
+                        });
+                    },
+                );
+                let label = |expected: &str| {
+                    output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| match &shape.shape {
+                            egui::Shape::Text(text) if text.galley.job.text == expected => {
+                                Some(egui::Rect::from_min_size(text.pos, text.galley.size()))
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| panic!("missing {expected}"))
+                };
+                let first = label("新聊天");
+                let second = label("聊天歷史");
+                super::super::mcp::preview::export(
+                    &ctx,
+                    std::slice::from_ref(&output),
+                    egui::vec2(width, 1200.0),
+                    &format!(
+                        "shortcuts-compact-{}-{}.png",
+                        if dark { "dark" } else { "light" },
+                        width as u32
+                    ),
+                    dark,
+                );
+                if width >= 520.0 {
+                    assert!((first.top() - second.top()).abs() < 0.5);
+                    assert!(second.left() > first.right());
+                } else {
+                    assert!(second.top() > first.bottom());
+                }
+                assert!(
+                    bounds.height() < if width >= 520.0 { 700.0 } else { 900.0 },
+                    "shortcut reference is too tall: {width} {bounds:?}"
+                );
+                for (_, shortcuts) in GROUPS {
+                    for shortcut in *shortcuts {
+                        assert!(label(shortcut.action).right() <= width - 7.0);
+                        if !shortcut.note.is_empty() {
+                            assert!(label(shortcut.note).right() <= width - 7.0);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn actual_render_stays_inside_320_and_520_in_both_palettes() {

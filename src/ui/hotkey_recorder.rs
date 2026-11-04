@@ -266,7 +266,7 @@ pub fn show(ui: &mut Ui, draft: &mut String) -> bool {
     let ctx = ui.ctx().clone();
     intercept(&ctx);
     let mut recording = state(&ctx);
-    let changed = if let Some(binding) = recording.pending.take() {
+    let mut changed = if let Some(binding) = recording.pending.take() {
         let changed = *draft != binding;
         *draft = binding;
         changed
@@ -297,9 +297,22 @@ pub fn show(ui: &mut Ui, draft: &mut String) -> bool {
         if recording.active {
             cancel_clicked = ui.button("取消錄製").clicked();
             ui.label(egui::RichText::new(&recording.preview).monospace().strong());
+        } else {
+            // Some Windows/system shortcuts never reach the window as a key
+            // event. Keep an explicit draft editor as a fallback; Apply still
+            // owns validation, OS registration and persistence.
+            changed |= ui
+                .add(
+                    egui::TextEdit::singleline(draft)
+                        .id_salt("manual_hotkey_draft")
+                        .font(egui::TextStyle::Monospace)
+                        .hint_text("Alt+Left")
+                        .desired_width((ui.available_size_before_wrap().x - 8.0).max(64.0)),
+                )
+                .on_hover_text("待套用快捷鍵：可錄製或直接輸入，例如 Alt+Left；仍需按「套用」。")
+                .changed();
         }
     });
-    ui.add(egui::Label::new(egui::RichText::new(format!("待套用：{draft}")).monospace()).wrap());
     if recording.active {
         if let Some(owner) = recording.owner {
             ui.memory_mut(|memory| {
@@ -559,6 +572,96 @@ mod tests {
             true,
         );
         assert_eq!(h.draft, "Ctrl+Comma");
+    }
+
+    #[test]
+    fn alt_arrows_are_captured_immediately_after_arming_without_focus_navigation() {
+        for (key_code, expected) in [
+            (Key::ArrowLeft, "Alt+Left"),
+            (Key::ArrowRight, "Alt+Right"),
+            (Key::ArrowUp, "Alt+Up"),
+            (Key::ArrowDown, "Alt+Down"),
+        ] {
+            let mut h = Harness::new();
+            h.arm();
+            let (_, changed, blocked) =
+                h.frame(vec![key(key_code, Modifiers::ALT)], Modifiers::ALT, true);
+            assert!(blocked);
+            assert_eq!(changed, expected != "Alt+Down");
+            assert_eq!(h.draft, expected);
+            assert!(!is_recording(&h.ctx));
+            assert_eq!(h.leaked, 0);
+            h.frame(vec![release(key_code)], Modifiers::NONE, true);
+            h.idle();
+            assert!(!h.flag.load(Ordering::SeqCst));
+        }
+    }
+
+    #[test]
+    fn direct_text_input_can_set_alt_left_when_native_capture_is_unavailable() {
+        let mut h = Harness::new();
+        h.click("Alt+Down");
+        // egui-winit aliases Windows Ctrl to `command` for text editing.
+        let select_all = Modifiers {
+            ctrl: true,
+            command: true,
+            ..Modifiers::NONE
+        };
+        let (_, changed, blocked) = h.frame(
+            vec![key(Key::A, select_all), Event::Paste("Alt+Left".into())],
+            select_all,
+            true,
+        );
+        assert!(changed && !blocked);
+        assert_eq!(h.draft, "Alt+Left");
+        assert!(!is_recording(&h.ctx));
+        assert!(!h.flag.load(Ordering::SeqCst));
+        assert_eq!(
+            super::super::hotkey::normalize_binding(&h.draft).unwrap(),
+            "Alt+Left"
+        );
+    }
+
+    #[test]
+    fn record_button_and_manual_draft_share_one_row_inside_narrow_settings() {
+        for width in [250.0, 450.0] {
+            let ctx = Context::default();
+            let mut draft = "Alt+Down".to_owned();
+            let mut rect = egui::Rect::NOTHING;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width + 16.0, 160.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.spacing_mut().interact_size.y = 32.0;
+                        rect = ui
+                            .scope(|ui| {
+                                assert!(!show(ui, &mut draft));
+                            })
+                            .response
+                            .rect;
+                    });
+                },
+            );
+            assert!(
+                rect.height() <= 36.0,
+                "recorder should stay on one row: {rect:?}"
+            );
+            for shape in &output.shapes {
+                if let egui::Shape::Text(text) = &shape.shape {
+                    assert!(
+                        text.pos.x >= 8.0 && text.pos.x + text.galley.size().x <= width + 8.1,
+                        "manual draft must not overflow: {}",
+                        text.galley.job.text
+                    );
+                }
+            }
+        }
     }
 
     #[test]

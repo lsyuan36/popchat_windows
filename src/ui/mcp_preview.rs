@@ -3,6 +3,27 @@
 use eframe::egui;
 use std::{collections::HashMap, path::Path};
 
+/// Egui groups a frame's shadow and fill into Shape::Vec. Geometry assertions
+/// must inspect those children, not just top-level clipped shapes.
+pub(crate) fn rect_shapes(output: &egui::FullOutput) -> Vec<&egui::epaint::RectShape> {
+    fn collect<'a>(shape: &'a egui::Shape, out: &mut Vec<&'a egui::epaint::RectShape>) {
+        match shape {
+            egui::Shape::Rect(rect) => out.push(rect),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = vec![];
+    for clipped in &output.shapes {
+        collect(&clipped.shape, &mut out);
+    }
+    out
+}
+
 pub(crate) fn prepare_fonts(ctx: &egui::Context) {
     if std::env::var_os("POPCHAT_MCP_UI_PREVIEW_DIR").is_none() {
         return;
@@ -36,6 +57,22 @@ pub(crate) fn export(
     };
     let directory = Path::new(&directory);
     std::fs::create_dir_all(directory).unwrap();
+    let background = if dark {
+        [44, 48, 60, 255]
+    } else {
+        [230, 224, 212, 255]
+    };
+    render(ctx, frames, size, background)
+        .save(directory.join(name))
+        .unwrap();
+}
+
+pub(crate) fn render(
+    ctx: &egui::Context,
+    frames: &[egui::FullOutput],
+    size: egui::Vec2,
+    background: [u8; 4],
+) -> image::RgbaImage {
     let mut textures = HashMap::<egui::TextureId, egui::ColorImage>::new();
     for frame in frames {
         for (id, delta) in &frame.textures_delta.set {
@@ -59,11 +96,6 @@ pub(crate) fn export(
     let scale = last.pixels_per_point;
     let width = (size.x * scale).round() as u32;
     let height = (size.y * scale).round() as u32;
-    let background = if dark {
-        [44, 48, 60, 255]
-    } else {
-        [230, 224, 212, 255]
-    };
     let mut canvas = image::RgbaImage::from_pixel(width, height, image::Rgba(background));
     for primitive in ctx.tessellate(last.shapes.clone(), scale) {
         let egui::epaint::Primitive::Mesh(mesh) = primitive.primitive else {
@@ -161,9 +193,23 @@ pub(crate) fn export(
                             .round()
                             .clamp(0.0, 255.0) as u8;
                     }
+                    dst.0[3] = (src[3] + dst.0[3] as f32 * inverse)
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
                 }
             }
         }
     }
-    canvas.save(directory.join(name)).unwrap();
+    // Epaint colors above are premultiplied; PNG and image::Rgba use straight
+    // alpha. Opaque legacy previews are unchanged by this conversion.
+    for pixel in canvas.pixels_mut() {
+        if pixel.0[3] != 0 && pixel.0[3] != 255 {
+            for channel in 0..3 {
+                pixel.0[channel] = (f32::from(pixel.0[channel]) * 255.0 / f32::from(pixel.0[3]))
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    canvas
 }

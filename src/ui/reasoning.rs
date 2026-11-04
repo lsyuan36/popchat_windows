@@ -177,7 +177,11 @@ impl WaitingView {
                             ui.add(
                                 egui::Label::new(
                                     egui::RichText::new(if thinking { "Thinking" } else { status })
-                                        .size(13.0)
+                                        .size(if thinking {
+                                            13.0
+                                        } else {
+                                            super::typography::ACTIVITY_SIZE
+                                        })
                                         .color(secondary.gamma_multiply(1.0 - pulse * 0.45)),
                                 )
                                 .halign(egui::Align::Min)
@@ -541,6 +545,43 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.style_mut(|style| style.animation_time = 0.0);
         ctx
+    }
+
+    #[test]
+    fn waiting_tool_search_status_uses_small_type_without_shrinking_thinking_text() {
+        for size in [12, 24] {
+            for status in ["Searching the web", "Reading a page", "MCP tool discovery"] {
+                let ctx = context();
+                let mut waiting = WaitingView::default();
+                let output = ctx.run(input(0.0, vec![]), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        super::super::typography::apply(ui, size);
+                        waiting.show(ui, status, None);
+                    });
+                });
+                let status_shape = texts(&output)
+                    .into_iter()
+                    .find(|t| t.galley.job.text == status)
+                    .unwrap();
+                assert!(status_shape
+                    .galley
+                    .job
+                    .sections
+                    .iter()
+                    .all(|s| s.format.font_id.size == super::super::typography::ACTIVITY_SIZE));
+                let (thinking, _) = waiting_frame(&ctx, &mut waiting, "Actual reasoning content");
+                let header = texts(&thinking)
+                    .into_iter()
+                    .find(|t| t.galley.job.text == "Thinking")
+                    .unwrap();
+                assert!(header
+                    .galley
+                    .job
+                    .sections
+                    .iter()
+                    .all(|s| s.format.font_id.size == 13.0));
+            }
+        }
     }
 
     fn waiting_frame(

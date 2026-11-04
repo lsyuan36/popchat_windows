@@ -108,16 +108,17 @@ impl SkillsUi {
         };
         let mut changed = false;
         let mut close = false;
-        let modal=egui::Modal::new(egui::Id::new("skills-manager"))
-            .backdrop_color(egui::Color32::from_black_alpha(180))
-            .frame(egui::Frame::popup(&ctx.style()).fill(theme::panel_fill(palette.dark))
+        let modal=super::surface::modal(ctx,egui::Id::new("skills-manager"),
+                egui::Frame::popup(&ctx.style()).fill(theme::panel_fill(palette.dark))
                 .corner_radius(14).inner_margin(20).stroke(egui::Stroke::new(1.0_f32,border)))
             .show(ctx,|ui| {
-                ui.set_width((ctx.screen_rect().width()-80.0).clamp(220.0,640.0));
+                ui.set_width(super::surface::dialog_content_width(ctx,640.0,20.0));
                 ui.spacing_mut().item_spacing=egui::vec2(8.0,8.0);
                 ui.heading("Skills 技能設定");
                 ui.add(egui::Label::new("啟用前請確認來源可信任。啟用後，模型可讀取並傳送該技能的全文及目錄內文字參考檔；不會執行腳本，也不會取得額外 MCP 權限。").wrap());
-                let body_height=(ctx.screen_rect().height()-ui.min_size().y-126.0).max(40.0);
+                // Frame padding, footer/hint/gaps and 26pt native clearance on
+                // both sides: the modal must not overhang the parent card.
+                let body_height=(ctx.screen_rect().height()-ui.min_size().y-170.0).max(40.0);
                 let scroll=egui::ScrollArea::vertical().id_salt("skills-content")
                     .max_height(body_height).show(ui,|ui| {
                         if let Some(error)=&self.store.load_error {ui.colored_label(ui.visuals().error_fg_color,error);}
@@ -189,6 +190,7 @@ impl SkillsUi {
                         });
                         if let Some(feedback)=&self.feedback {ui.add(egui::Label::new(feedback).wrap());}
                     });
+                #[cfg(test)] ctx.data_mut(|data|data.insert_temp(egui::Id::new("skills-scroll-test-offset"),scroll.state.offset.y));
                 if scroll.content_size.y>scroll.inner_rect.height()+1.0 {ui.small("捲動以檢視更多來源與技能");}
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui| {
                     if ui.add_sized([90.0,34.0],egui::Button::new("關閉")).clicked() {close=true;}
@@ -247,6 +249,8 @@ mod tests {
         size: egui::Vec2,
         events: Vec<egui::Event>,
     ) -> (egui::FullOutput, bool) {
+        // Geometry/color snapshots should not depend on Area's fade-in clock.
+        ctx.style_mut(|style| style.animation_time = 0.0);
         let mut changed = false;
         let output = ctx.run(
             egui::RawInput {
@@ -255,6 +259,14 @@ mod tests {
                 ..Default::default()
             },
             |ctx| {
+                egui::CentralPanel::default()
+                    .frame(super::super::surface::canvas_frame())
+                    .show(ctx, |ui| {
+                        super::super::surface::card_frame(ui.visuals().dark_mode).show(ui, |ui| {
+                            ui.set_min_size(ui.available_size());
+                            ui.label("PopChat settings - offline fixture");
+                        });
+                    });
                 changed = manager.show(ctx);
             },
         );
@@ -329,6 +341,24 @@ mod tests {
                     .unwrap();
                 assert!(egui::Rect::from_min_size(egui::Pos2::ZERO, size).contains_rect(close.0));
                 assert!(close.1.contains_rect(close.0));
+                let native_safe = egui::Rect::from_min_size(egui::Pos2::ZERO, size).shrink(24.0);
+                let outer = crate::ui::mcp::preview::rect_shapes(output)
+                    .into_iter()
+                    .find(|rect| {
+                        rect.corner_radius == egui::CornerRadius::same(14)
+                            && rect.fill == theme::panel_fill(dark)
+                    })
+                    .map(|rect| rect.rect)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "missing stable modal frame: {dark} {size:?}; rects={:?}",
+                            crate::ui::mcp::preview::rect_shapes(output)
+                        )
+                    });
+                assert!(
+                    native_safe.contains_rect(outer),
+                    "modal/shadow need breathing room inside the parent card: {size:?} {outer:?}"
+                );
                 crate::ui::mcp::preview::export(
                     &ctx,
                     &frames,
@@ -383,5 +413,114 @@ mod tests {
             .unwrap();
         assert!(scan.skills.is_empty());
         assert!(manager.snapshot().is_empty());
+    }
+
+    #[test]
+    fn long_scrolled_skill_lists_keep_the_native_margin_transparent_and_the_footer_visible() {
+        use super::super::mcp::preview;
+        for dark in [false, true] {
+            for size in [egui::vec2(320.0, 480.0), egui::vec2(720.0, 650.0)] {
+                let (dir, mut manager) = fixture();
+                let root = manager.store.sources()[0].path.clone();
+                for index in 0..24 {
+                    let folder = root.join(format!("synthetic-{index:02}"));
+                    std::fs::create_dir(&folder).unwrap();
+                    std::fs::write(folder.join("SKILL.md"),format!("---\nname: Synthetic Skill {index:02}\ndescription: >\n  {}\n---\nNEVER_PRELOADED_BODY", "Use this synthetic instruction pack for offline layout verification. It has long English descriptions, nested reference paths, and deliberately repeated information to exercise wrapping and scrolling without reading any real user data. ".repeat(2))).unwrap();
+                }
+                manager.scan = manager.store.scan();
+                manager.scanned = true;
+                assert_eq!(manager.scan.skills.len(), 25);
+                let ctx = egui::Context::default();
+                theme::apply(
+                    &ctx,
+                    if dark { "dark" } else { "light" },
+                    theme::DEFAULT_ACCENT_HEX,
+                );
+                preview::prepare_fonts(&ctx);
+                let mut frames = vec![];
+                for _ in 0..5 {
+                    let (output, changed) = frame(&ctx, &mut manager, size, vec![]);
+                    assert!(!changed);
+                    frames.push(output);
+                }
+                let pointer = egui::pos2(size.x * 0.5, size.y * 0.5);
+                let (output, changed) = frame(
+                    &ctx,
+                    &mut manager,
+                    size,
+                    vec![
+                        egui::Event::PointerMoved(pointer),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: egui::vec2(0.0, -1200.0),
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+                assert!(!changed);
+                frames.push(output);
+                for _ in 0..8 {
+                    let (output, changed) = frame(&ctx, &mut manager, size, vec![]);
+                    assert!(!changed);
+                    frames.push(output);
+                }
+                let output = frames.last().unwrap();
+                let close = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.job.text == "關閉" => Some((
+                            egui::Rect::from_min_size(text.pos, text.galley.size()),
+                            shape.clip_rect,
+                        )),
+                        _ => None,
+                    })
+                    .unwrap();
+                assert!(egui::Rect::from_min_size(egui::Pos2::ZERO, size).contains_rect(close.0));
+                assert!(close.1.contains_rect(close.0));
+                let native_safe = egui::Rect::from_min_size(egui::Pos2::ZERO, size).shrink(24.0);
+                let outer = preview::rect_shapes(output)
+                    .into_iter()
+                    .find(|rect| {
+                        rect.corner_radius == egui::CornerRadius::same(14)
+                            && rect.fill == theme::panel_fill(dark)
+                    })
+                    .map(|rect| rect.rect)
+                    .unwrap();
+                assert!(
+                    native_safe.contains_rect(outer),
+                    "scrolled modal must not overhang the root card: {size:?} {outer:?}"
+                );
+                let offset: f32 = ctx
+                    .data(|data| data.get_temp(egui::Id::new("skills-scroll-test-offset")))
+                    .unwrap();
+                assert!(
+                    offset > 400.0,
+                    "long list must actually be scrolled into view: {offset}"
+                );
+                let image = preview::render(&ctx, &frames, size, [0; 4]);
+                for (x, y) in [
+                    (0, 0),
+                    (size.x as u32 - 1, 0),
+                    (0, size.y as u32 - 1),
+                    (size.x as u32 - 1, size.y as u32 - 1),
+                ] {
+                    assert_eq!(image.get_pixel(x, y).0[3], 0);
+                }
+                assert!(!dir.path().join("skills.json").exists());
+                assert!(manager.snapshot().is_empty());
+                preview::export(
+                    &ctx,
+                    &frames,
+                    size,
+                    &format!(
+                        "skills-scrolled-{}-{}.png",
+                        if dark { "dark" } else { "light" },
+                        size.x as u32
+                    ),
+                    dark,
+                );
+            }
+        }
     }
 }

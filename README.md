@@ -2,7 +2,7 @@
 
 輕量的 Windows 浮動 AI 聊天面板，以 **Rust + egui/eframe** 實作。
 
-**Windows 移植／維護：Evis Lai** · 目前版本：**0.2.6**
+**Windows 移植／維護：Evis Lai** · 目前版本：**0.2.7**
 
 > 本專案移植自 **Le Chen / lec77** 的 macOS 專案
 > **[lec77/PopChat](https://github.com/lec77/PopChat)**。
@@ -11,10 +11,11 @@
 
 ## 下載與啟動
 
-從 **[GitHub Releases](https://github.com/lsyuan36/popchat_windows/releases/tag/v0.2.6)**
-下載 **`PopChat-0.2.6-Windows-x64-Setup.exe`**（NSIS 安裝程式）。
-**0.2.6** 新增 Skills 設定、預設／自訂來源與按需載入，並改善 MCP 確認與填寫介面。
-保留細線更新進度、繁體中文內建提示詞、MCP 本機安全設定與 Auto Compact。0.2.1–0.2.4 使用者可用程式內更新，
+從 **[GitHub Releases](https://github.com/lsyuan36/popchat_windows/releases/tag/v0.2.7)**
+下載 **`PopChat-0.2.7-Windows-x64-Setup.exe`**（NSIS 安裝程式）。
+**0.2.7** 修正透明視窗遮罩與設定儲存按鈕裁切，縮小工具／搜尋提示，新增「關於」分頁，
+並提供緊湊雙欄快捷鍵表與直接輸入待套用組合。保留 Skills、MCP 本機安全設定、Auto Compact 與繁體中文內建提示詞。
+既有版本使用者可用程式內更新，
 或先結束 PopChat 再執行新版 Setup 升級。
 0.2.0 Setup 的首次安裝路徑問題已於 0.2.1 修正，請優先使用新版。
 
@@ -41,7 +42,8 @@ Windows SmartScreen 可能顯示未識別的應用程式。請核對來源與發
 - 淺色米黃／深色主題、透明度、位置設定與頁面切換動畫。
 - 中英字體分開選擇；中文預設內建 **獅尾圓體**。
 - 英文預設 **已安裝的 TT Norms Pro → Arial**；這兩種字體不隨程式散佈。
-- 聊天文字大小 **12–24 pt**、即時預覽；全域快捷鍵支援按鍵錄製。
+- 聊天文字大小 **12–24 pt**、即時預覽；工具／搜尋活動提示固定小字，正式回答字級不變。
+- 全域快捷鍵支援按鍵錄製或直接輸入，需按「套用」；聊天快捷鍵表寬版每列兩項。
 - 圖示 hover 顯示功能、快捷鍵與停用原因。
 - 從此 repo 的 Releases 檢查、下載更新，確認後安裝並重新啟動。
 
@@ -52,7 +54,7 @@ ChatGPT／Codex 整合的可用性取決於帳號、方案、外部工具及服�
 
 | 快捷鍵 | 功能 |
 |---|---|
-| `Alt+Down` | 預設全域喚出／收起，可在設定內錄製其他組合 |
+| `Alt+Down` | 預設全域喚出／收起，可在設定內錄製或直接輸入其他組合 |
 | `Ctrl+N` / `Ctrl+Y` | 新聊天／聊天歷史 |
 | `Ctrl+F` | 搜尋目前聊天 |
 | `Ctrl+G` / `Ctrl+Shift+G` | 下一個／上一個搜尋結果 |
@@ -65,10 +67,12 @@ ChatGPT／Codex 整合的可用性取決於帳號、方案、外部工具及服�
 
 輸入法組字期間的 Enter 優先用於選字；指令補完開啟時 Enter 先選取指令。
 `Alt+Space` 是 Windows 保留組合，不接受設為全域快捷鍵。
+若實機無法錄製 `Alt+Left` 等組合，可直接填入待套用欄位，再按「套用」；
+註冊衝突時保留原快捷鍵。錄製問題尚未在實機重現，不宣稱已修復原生輸入問題。
 
 ## 更新
 
-設定中的自動檢查每天最多執行一次，也可按「立即檢查更新」。
+設定 →「關於」中的自動檢查每天最多執行一次，也可按「立即檢查更新」；登入啟動、版本與專案連結也集中於此。
 更新來源僅為 **`lsyuan36/popchat_windows` 的正式 GitHub Releases**，
 不是原 macOS 專案。
 
@@ -120,7 +124,7 @@ HTTP 首版僅支援手動 Bearer token，不提供自動 OAuth 登入。
 設定 → Skills → 管理技能／掃描來源，可讀取 OpenCode、Claude、Codex／共用 Agents
 的個人預設路徑，也可明確指定專案或自訂資料夾。新技能預設停用，需個別啟用；
 只先提供名稱與說明，模型需要時才載入全文與技能目錄內的文字參考檔。
-不修改其他工具設定，不自動執行技能腳本。詳見 [SKILLS.md](https://github.com/lsyuan36/popchat_windows/blob/v0.2.6/SKILLS.md)。
+不修改其他工具設定，不自動執行技能腳本。詳見 [SKILLS.md](https://github.com/lsyuan36/popchat_windows/blob/v0.2.7/SKILLS.md)。
 **0.2.4 及更早版本不含 Skills 設定，需升級至 0.2.6。**
 
 ## 資料與隱私

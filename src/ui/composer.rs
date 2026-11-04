@@ -584,7 +584,9 @@ impl Composer {
                         .map(|r| r.width() * 0.8)
                         .unwrap_or(420.0);
                     ui.set_max_width(card_w);
-                    egui::Frame::group(ui.style())
+                    // This floats over transcript content: a transparent group
+                    // leaves a hollow outline and lets underlying text bleed in.
+                    egui::Frame::popup(ui.style())
                         .corner_radius(egui::CornerRadius::same(10))
                         .show(ui, |ui| {
                             for (i, shortcut) in fresh.iter().enumerate() {
@@ -833,6 +835,84 @@ pub fn recall_newer_index(cursor: Option<usize>) -> RecallNewer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn autocomplete_popup_has_an_opaque_soft_surface_instead_of_a_hollow_outline() {
+        for dark in [false, true] {
+            let ctx = egui::Context::default();
+            super::super::theme::apply(
+                &ctx,
+                if dark { "dark" } else { "light" },
+                super::super::theme::DEFAULT_ACCENT_HEX,
+            );
+            ctx.style_mut(|style| style.animation_time = 0.0);
+            super::super::mcp::preview::prepare_fonts(&ctx);
+            let mut composer = Composer::new();
+            composer.set_text("/fi".into());
+            let commands = ShortcutStore {
+                shortcuts: vec![crate::chat::commands::PromptShortcut {
+                    id: "fixture".into(),
+                    name: "fixture".into(),
+                    template: "Offline synthetic suggestion".into(),
+                }],
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("history.json");
+            let mut history = PromptHistory::with_storage_path(path.clone());
+            let size = egui::vec2(600.0, 450.0);
+            let mut frames = vec![];
+            for _ in 0..5 {
+                frames.push(ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default()
+                            .frame(super::super::surface::canvas_frame())
+                            .show(ctx, |ui| {
+                                super::super::surface::card_frame(dark).show(ui, |ui| {
+                                    ui.set_min_size(ui.available_size());
+                                    ui.label("Underlying transcript fixture");
+                                    ui.add_space(220.0);
+                                    assert_eq!(
+                                        composer.show(ui, &commands, &mut history),
+                                        ComposerAction::None
+                                    );
+                                });
+                            });
+                    },
+                ));
+            }
+            let output = frames.last().unwrap();
+            let text = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.job.text.starts_with("/fixture") => {
+                        Some(egui::Rect::from_min_size(text.pos, text.galley.size()))
+                    }
+                    _ => None,
+                })
+                .expect("real autocomplete suggestion must be visible");
+            assert!(super::super::mcp::preview::rect_shapes(output)
+                .into_iter()
+                .any(|rect| rect.corner_radius == egui::CornerRadius::same(10)
+                    && rect.fill.a() == 255
+                    && rect.fill == super::super::theme::panel_fill(dark)
+                    && rect.rect.contains_rect(text)));
+            assert!(!path.exists());
+            assert!(history.entries().is_empty());
+            assert_eq!(composer.text(), "/fi");
+            super::super::mcp::preview::export(
+                &ctx,
+                &frames,
+                size,
+                &format!("autocomplete-{}.png", if dark { "dark" } else { "light" }),
+                dark,
+            );
+        }
+    }
 
     #[test]
     fn streaming_keeps_editor_live_and_stop_does_not_consume_the_next_draft() {

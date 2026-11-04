@@ -671,6 +671,11 @@ pub struct ProviderStore {
 }
 
 impl ProviderStore {
+    #[cfg(test)]
+    pub(crate) fn isolated_file_for_tests(path: std::path::PathBuf) -> Self {
+        Self::load_at(path, |_| None)
+    }
+
     pub const CHATGPT_PROVIDER_NAME: &'static str = "OpenAI subscription (unofficial)";
 
     pub fn load(secrets: &SecretStore) -> Self {

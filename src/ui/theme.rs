@@ -451,6 +451,16 @@ pub fn apply(ctx: &egui::Context, appearance: &str, accent_hex: &str) -> AccentP
     visuals.code_bg_color = code_bg_for(dark);
     visuals.window_fill = panel_fill(dark);
     visuals.window_corner_radius = egui::CornerRadius::same(18);
+    visuals.popup_shadow = super::surface::popup_shadow();
+    visuals.window_shadow = super::surface::popup_shadow();
+    visuals.window_stroke = egui::Stroke::new(
+        1.0_f32,
+        if dark {
+            egui::Color32::from_white_alpha(23)
+        } else {
+            egui::Color32::from_black_alpha(16)
+        },
+    );
     let primary = visuals.override_text_color.unwrap();
     let border = if dark {
         egui::Color32::from_rgb(0x39, 0x3D, 0x49)
@@ -638,8 +648,8 @@ mod tests {
             visuals.widgets.open.weak_bg_fill,
             stock.widgets.open.weak_bg_fill
         );
-        assert_eq!(visuals.window_shadow, stock.window_shadow);
-        assert_eq!(visuals.popup_shadow, stock.popup_shadow);
+        assert_eq!(visuals.window_shadow, super::super::surface::popup_shadow());
+        assert_eq!(visuals.popup_shadow, super::super::surface::popup_shadow());
     }
 
     #[test]

@@ -153,19 +153,22 @@ fn update_confirmation_dialog(ctx: &egui::Context, version: &str, streaming: boo
         .stroke(egui::Stroke::new(1.0_f32, border))
         .corner_radius(14)
         .inner_margin(22);
-    let response = egui::Modal::new(egui::Id::new("install-update-confirmation"))
-        .backdrop_color(egui::Color32::from_black_alpha(180))
-        .frame(frame)
+    let response = surface::modal(ctx, egui::Id::new("install-update-confirmation"), frame)
         .show(ctx, |ui| {
-            ui.set_width((ctx.screen_rect().width()-80.0).clamp(160.0,420.0));
+            ui.set_width(surface::dialog_content_width(ctx,420.0,22.0));
             ui.spacing_mut().item_spacing=egui::vec2(10.0,8.0);
             ui.spacing_mut().button_padding=egui::vec2(12.0,8.0);
             ui.heading(egui::RichText::new(format!("安裝 PopChat {version}？")).size(19.0));
             ui.label(egui::RichText::new("更新已下載並通過完整性驗證").size(12.0).color(secondary));
+            // Keep this safety notice visible even when the compact body scrolls.
+            if streaming {
+                ui.add(egui::Label::new(egui::RichText::new("目前仍在生成回覆；程式關閉時會停止生成。").size(12.0).color(ui.visuals().warn_fg_color)).wrap());
+            }
             ui.add_space(6.0);
+            let body_height=(ctx.screen_rect().height()-ui.min_size().y-170.0).clamp(40.0,260.0);
             egui::ScrollArea::vertical()
                 .id_salt("update-confirmation-body")
-                .max_height((ctx.screen_rect().height()-190.0).clamp(72.0,260.0))
+                .max_height(body_height)
                 .show(ui,|ui| {
                     ui.add(egui::Label::new(egui::RichText::new("更新助手驗證完成後，程式才會關閉、安裝更新並重新啟動。").size(13.0)).wrap());
                     ui.add(egui::Label::new(egui::RichText::new("設定、服務、憑證與聊天歷史都會保留。").size(12.0).color(secondary)).wrap());
@@ -177,10 +180,6 @@ fn update_confirmation_dialog(ctx: &egui::Context, version: &str, streaming: boo
                         .show(ui,|ui| {
                             ui.label(egui::RichText::new("安裝前請確認").size(12.0).strong());
                             ui.add(egui::Label::new(egui::RichText::new("未送出的訊息與未儲存的 API 編輯不會自動保存。若尚未完成，請先返回編輯。").size(12.0).color(secondary)).wrap());
-                            if streaming {
-                                ui.add_space(2.0);
-                                ui.add(egui::Label::new(egui::RichText::new("目前仍在生成回覆；程式關閉時會停止生成。").size(12.0).color(ui.visuals().warn_fg_color)).wrap());
-                            }
                         });
                 });
             ui.add_space(10.0);
@@ -2351,7 +2350,8 @@ impl PopChatApp {
                                 ui.add_space(6.0);
                             }
                             ChatRole::Activity => {
-                                ui.label(egui::RichText::new(format!("… {}", msg.text)).weak());
+                                let _ =
+                                    popchat_windows::ui::typography::activity_label(ui, &msg.text);
                                 ui.add_space(4.0);
                             }
                         }
@@ -3587,7 +3587,19 @@ mod action_tests {
                         "primary action should be on the right"
                     );
                     assert!(output.shapes.iter().any(|shape|matches!(&shape.shape,egui::Shape::Rect(rect) if rect.fill==palette.accent && rect.rect.height()>=34.0)),"missing accent primary button");
-                    assert!(output.shapes.iter().any(|shape|matches!(&shape.shape,egui::Shape::Rect(rect) if rect.fill==egui::Color32::from_black_alpha(180) && rect.rect.size()==size)),"missing stronger backdrop");
+                    let card =
+                        viewport.shrink(f32::from(popchat_windows::ui::surface::CARD_MARGIN));
+                    assert!(output.shapes.iter().any(|shape|matches!(&shape.shape,egui::Shape::Rect(rect)
+                        if rect.fill==egui::Color32::from_black_alpha(180) && rect.rect==card
+                            && rect.corner_radius==egui::CornerRadius::same(popchat_windows::ui::surface::CARD_RADIUS))),"missing strong rounded-card backdrop");
+                    assert!(
+                        !output
+                            .shapes
+                            .iter()
+                            .any(|shape| matches!(&shape.shape,egui::Shape::Rect(rect)
+                        if rect.rect==viewport && rect.fill.a()!=0)),
+                        "must not dim transparent native-window margins"
+                    );
                 }
             }
         }

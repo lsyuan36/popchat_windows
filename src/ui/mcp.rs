@@ -43,18 +43,22 @@ impl DialogStyle {
         }
     }
     fn modal(self, ctx: &egui::Context, id: &str) -> egui::Modal {
-        egui::Modal::new(egui::Id::new(id))
-            .backdrop_color(egui::Color32::from_black_alpha(180))
-            .frame(
-                egui::Frame::popup(&ctx.style())
-                    .fill(theme::panel_fill(self.palette.dark))
-                    .stroke(egui::Stroke::new(1.0_f32, self.border))
-                    .corner_radius(14)
-                    .inner_margin(22),
-            )
+        super::surface::modal(
+            ctx,
+            egui::Id::new(id),
+            egui::Frame::popup(&ctx.style())
+                .fill(theme::panel_fill(self.palette.dark))
+                .stroke(egui::Stroke::new(1.0_f32, self.border))
+                .corner_radius(14)
+                .inner_margin(22),
+        )
     }
     fn apply(self, ui: &mut egui::Ui, max_width: f32) {
-        ui.set_width((ui.ctx().screen_rect().width() - 88.0).clamp(232.0, max_width));
+        ui.set_width(super::surface::dialog_content_width(
+            ui.ctx(),
+            max_width,
+            22.0,
+        ));
         let style = ui.style_mut();
         style.spacing.item_spacing = egui::vec2(8.0, 8.0);
         style.spacing.button_padding = egui::vec2(12.0, 8.0);
@@ -737,7 +741,7 @@ impl McpUi {
             style.heading(ui,if self.local_review.is_some(){"確認新增 MCP 服務"}else if self.id.is_some(){"編輯 MCP 服務"}else{"新增 MCP 服務"},
                 if self.local_review.is_some(){"資訊已在本機整理，確認後才會保存與啟用。"}else{"設定連線、驗證方式與工具使用權限。"});
             let body=egui::ScrollArea::vertical().id_salt("mcp-manager-content")
-                .max_height((ctx.screen_rect().height()-258.0).max(72.0)).show(ui,|ui| {
+                .max_height((ctx.screen_rect().height()-298.0).max(72.0)).show(ui,|ui| {
                     if let Some(error)=&self.store.load_error {style.note(ui,"設定暫時無法使用",error,true);}
                     if !self.pending.is_empty() {
                         style.muted(ui,&format!("另有 {} 份新增草稿等待檢視。",self.pending.len()));
@@ -782,7 +786,7 @@ pub fn approval_dialog(ctx: &egui::Context, request: &ApprovalRequest) -> Option
             else if testing {"會啟動／連線並探索工具，這次不執行工具。"}
             else {"工具可能讀寫檔案或傳送資料，請先檢查。"});
         let body=egui::ScrollArea::vertical().id_salt("mcp-approval-content")
-            .max_height((ctx.screen_rect().height()-258.0).max(72.0)).show(ui,|ui| {
+            .max_height((ctx.screen_rect().height()-298.0).max(72.0)).show(ui,|ui| {
                 style.panel(ui,|ui| {
                     detail(ui,style,"服務",&request.service.draft.name,false);
                     if !testing {detail(ui,style,"工具",&request.tool,true);}

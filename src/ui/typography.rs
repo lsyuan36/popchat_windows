@@ -5,6 +5,21 @@ use eframe::egui::{FontId, TextStyle, Ui};
 pub const DEFAULT_SIZE: u16 = 15;
 pub const MIN_SIZE: u16 = 12;
 pub const MAX_SIZE: u16 = 24;
+/// Tool/search activity is metadata, not transcript prose. Keep it small even
+/// when the user chooses a larger chat size; never scale the actual answer down.
+pub const ACTIVITY_SIZE: f32 = 12.0;
+
+pub fn activity_label(ui: &mut Ui, text: &str) -> eframe::egui::Response {
+    ui.add(
+        eframe::egui::Label::new(
+            eframe::egui::RichText::new(format!("… {text}"))
+                .size(ACTIVITY_SIZE)
+                .color(ui.visuals().weak_text_color()),
+        )
+        .wrap()
+        .selectable(true),
+    )
+}
 
 pub fn normalize(size: u16) -> u16 {
     size.clamp(MIN_SIZE, MAX_SIZE)
@@ -57,6 +72,87 @@ pub fn scaled(ui: &Ui, base: f32) -> f32 {
 mod tests {
     use super::*;
     use eframe::egui;
+
+    #[test]
+    fn tool_and_search_activity_stays_small_without_resizing_normal_chat() {
+        for appearance in ["light", "dark"] {
+            for size in [12, 15, 24] {
+                let ctx = egui::Context::default();
+                super::super::theme::apply(
+                    &ctx,
+                    appearance,
+                    super::super::theme::DEFAULT_ACCENT_HEX,
+                );
+                let samples = [
+                    "MCP connection / tool discovery: Synthetic service",
+                    "Searching: a synthetic query",
+                    "Reading: https://example.com/reference",
+                    "Skills instructions loaded on demand",
+                ];
+                let mut responses = vec![];
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(320.0, 600.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            apply(ui, size);
+                            for sample in samples {
+                                responses.push(activity_label(ui, sample));
+                            }
+                            ui.label("NORMAL_ANSWER_BODY");
+                            assert_eq!(
+                                ui.style().text_styles[&TextStyle::Body].size,
+                                f32::from(size)
+                            );
+                        });
+                    },
+                );
+                for sample in samples {
+                    let expected = format!("… {sample}");
+                    let text = output
+                        .shapes
+                        .iter()
+                        .find_map(|shape| match &shape.shape {
+                            egui::Shape::Text(text) if text.galley.job.text == expected => {
+                                Some(text)
+                            }
+                            _ => None,
+                        })
+                        .unwrap();
+                    assert!(text
+                        .galley
+                        .job
+                        .sections
+                        .iter()
+                        .all(|s| s.format.font_id.size == ACTIVITY_SIZE));
+                }
+                let normal = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.job.text == "NORMAL_ANSWER_BODY" => {
+                            Some(text)
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert!(normal
+                    .galley
+                    .job
+                    .sections
+                    .iter()
+                    .all(|s| s.format.font_id.size == f32::from(size)));
+                assert!(responses
+                    .iter()
+                    .all(|response| response.rect.width() <= 304.1));
+            }
+        }
+    }
 
     #[test]
     fn chat_styles_are_local_inherited_idempotent_and_leave_chrome_alone() {

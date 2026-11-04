@@ -197,10 +197,11 @@ enum SettingsTab {
     Hotkey,
     Mcp,
     Skills,
+    About,
 }
 
 impl SettingsTab {
-    const ALL: [(Self, &'static str); 7] = [
+    const ALL: [(Self, &'static str); 8] = [
         (Self::Service, "服務"),
         (Self::Appearance, "外觀"),
         (Self::Search, "搜尋"),
@@ -208,6 +209,7 @@ impl SettingsTab {
         (Self::Hotkey, "快捷鍵"),
         (Self::Mcp, "MCP"),
         (Self::Skills, "Skills"),
+        (Self::About, "關於"),
     ];
 }
 
@@ -757,99 +759,109 @@ impl SettingsUi {
 
         ui.scope(|ui| {
             settings_style(ui);
-            let palette = theme::current_palette(ui.ctx());
-            ui.label(egui::RichText::new("設定").size(26.0).strong());
-            muted(ui, "讓 PopChat 更適合你的工作方式");
-            if let Some(path) = crate::paths::config_dir() {
-                let label = if crate::paths::isolated_profile().is_some() {
-                    "自訂資料目錄"
-                } else {
-                    "預設資料目錄"
-                };
-                let text = format!("{label}：{}", path.display());
-                ui.add(egui::Label::new(egui::RichText::new(&text).small().weak()).truncate())
-                    .on_hover_text(text);
-            }
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                for (tab, title) in SettingsTab::ALL {
-                    let selected = self.active_tab == tab;
-                    let response = ui.add_sized(
-                        [80.0, 34.0],
-                        egui::Button::new(egui::RichText::new(title).color(if selected {
-                            palette.accent
-                        } else {
-                            secondary(palette.dark)
-                        }))
-                        .fill(if selected {
-                            palette.accent.gamma_multiply(0.10)
-                        } else {
-                            egui::Color32::TRANSPARENT
-                        })
-                        .stroke(egui::Stroke::NONE)
-                        .corner_radius(6),
-                    );
-                    if response.clicked() {
-                        self.active_tab = tab;
-                    }
-                }
-            });
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(8.0);
-
-            // Reserve a finite body and footer. Short panes never show an idle
-            // scrollbar; long model lists/errors scroll without moving Save.
-            let body_height = (ui.available_height()
-                - 58.0
-                - if self.preference_save_error.is_some() {
-                    80.0
-                } else {
-                    0.0
+            // Measure and reserve the real footer BEFORE laying out any content.
+            // Tabs, long errors and short windows must never push Save offscreen.
+            let save_requested =
+                super::chat_layout::bottom_panel(ui, egui::Id::new("settings_save_footer"), |ui| {
+                    self.save_footer(ui, providers)
                 })
-            .max(0.0);
-            let pane_effect = self.pane_transition.update(
-                self.active_tab as u64,
-                ui.input(|input| input.time),
-                crate::ui::transition::motion_enabled(ui.ctx()),
-            );
-            ui.allocate_ui_with_layout(
-                egui::vec2(ui.available_width(), body_height),
-                egui::Layout::top_down(egui::Align::Min),
-                |ui| {
-                    crate::ui::transition::show(ui, pane_effect, |ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt(("settings_pane", self.active_tab as u8))
-                            .auto_shrink([false, false])
-                            .max_height(body_height)
-                            .min_scrolled_height(0.0)
-                            .scroll_bar_visibility(
-                                egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded,
+                .inner;
+            let mut retry_preferences = false;
+            super::chat_layout::show_body(ui, egui::Id::new("settings_body"), |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt(("settings_pane", self.active_tab as u8))
+                    .auto_shrink([false, false])
+                    .max_height(ui.available_height().max(0.0))
+                    .min_scrolled_height(0.0)
+                    .show(ui, |ui| {
+                        let palette = theme::current_palette(ui.ctx());
+                        ui.label(egui::RichText::new("設定").size(26.0).strong());
+                        muted(ui, "讓 PopChat 更適合你的工作方式");
+                        if let Some(path) = crate::paths::config_dir() {
+                            let label = if crate::paths::isolated_profile().is_some() {
+                                "自訂資料目錄"
+                            } else {
+                                "預設資料目錄"
+                            };
+                            let text = format!("{label}：{}", path.display());
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(&text).small().weak())
+                                    .truncate(),
                             )
-                            .show(ui, |ui| {
-                                ui.set_width(ui.available_width());
-                                match self.active_tab {
-                                    SettingsTab::Service => {
-                                        self.providers_section(ui, runtime, providers, secrets);
-                                    }
-                                    SettingsTab::Appearance => self.appearance_section(ui),
-                                    SettingsTab::Search => self.search_section(ui),
-                                    SettingsTab::Commands => self.commands_section(ui),
-                                    SettingsTab::Hotkey => self.hotkey_section(ui, runtime),
-                                    SettingsTab::Mcp => self.mcp_section(ui),
-                                    SettingsTab::Skills => self.skills_section(ui),
+                            .on_hover_text(text);
+                        }
+                        ui.add_space(10.0);
+                        let tab_count = SettingsTab::ALL.len() as f32;
+                        let tab_width =
+                            if ui.available_width() < tab_count * 80.0 + (tab_count - 1.0) * 6.0 {
+                                56.0
+                            } else {
+                                80.0
+                            };
+                        ui.horizontal_wrapped(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            for (tab, title) in SettingsTab::ALL {
+                                let selected = self.active_tab == tab;
+                                let response = ui.add_sized(
+                                    [tab_width, 34.0],
+                                    egui::Button::new(egui::RichText::new(title).color(
+                                        if selected {
+                                            palette.accent
+                                        } else {
+                                            secondary(palette.dark)
+                                        },
+                                    ))
+                                    .fill(if selected {
+                                        palette.accent.gamma_multiply(0.10)
+                                    } else {
+                                        egui::Color32::TRANSPARENT
+                                    })
+                                    .stroke(egui::Stroke::NONE)
+                                    .corner_radius(6),
+                                );
+                                if response.clicked() {
+                                    self.active_tab = tab;
                                 }
-                            });
+                            }
+                        });
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+
+                        let pane_effect = self.pane_transition.update(
+                            self.active_tab as u64,
+                            ui.input(|input| input.time),
+                            crate::ui::transition::motion_enabled(ui.ctx()),
+                        );
+                        crate::ui::transition::show(ui, pane_effect, |ui| match self.active_tab {
+                            SettingsTab::Service => {
+                                self.providers_section(ui, runtime, providers, secrets);
+                            }
+                            SettingsTab::Appearance => self.appearance_section(ui),
+                            SettingsTab::Search => self.search_section(ui),
+                            SettingsTab::Commands => self.commands_section(ui),
+                            SettingsTab::Hotkey => self.hotkey_section(ui),
+                            SettingsTab::Mcp => self.mcp_section(ui),
+                            SettingsTab::Skills => self.skills_section(ui),
+                            SettingsTab::About => self.about_section(ui, runtime),
+                        });
+
+                        retry_preferences = self.preference_save_error.is_some()
+                            && ui.button("重試儲存偏好設定").clicked();
+                        if let Some(error) = &self.preference_save_error {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(error).color(ui.visuals().error_fg_color),
+                                )
+                                .wrap(),
+                            );
+                        }
                     });
-                },
-            );
+            });
 
             if before != self.settings || before_id != self.selected_provider_id() {
                 self.save_result = None;
             }
-            let retry_preferences =
-                self.preference_save_error.is_some() && ui.button("重試儲存偏好設定").clicked();
             if general_preferences(&self.settings) != general_preferences(&before)
                 || (self.search_key_dirty
                     && self.settings.search_engine_key != before.search_engine_key)
@@ -857,59 +869,78 @@ impl SettingsUi {
             {
                 self.persist_general_preferences();
             }
-            if let Some(error) = &self.preference_save_error {
-                ui.colored_label(ui.visuals().error_fg_color, error);
-            }
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(8.0);
-            let mut save_requested = false;
-            ui.horizontal(|ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    save_requested = ui
-                        .add_enabled(
-                            self.provider.is_some() && providers.load_error().is_none(),
-                            egui::Button::new(
-                                egui::RichText::new("儲存設定").color(palette.accent_text),
-                            )
-                            .fill(palette.accent)
-                            .min_size(egui::vec2(108.0, 34.0)),
-                        )
-                        .clicked();
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        match &self.save_result {
-                            Some(Ok(())) => muted(ui, "已儲存 · 所有設定已更新"),
-                            Some(Err(error)) => {
-                                let message = format!("儲存失敗：{error}");
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(&message)
-                                            .size(12.0)
-                                            .color(ui.visuals().error_fg_color),
-                                    )
-                                    .truncate(),
-                                )
-                                .on_hover_text(message);
-                            }
-                            None => {
-                                let dirty = self.settings != self.saved_settings
-                                    || self.selected_provider_id() != self.saved_provider_id;
-                                muted(
-                                    ui,
-                                    if dirty {
-                                        "有尚未儲存的變更"
-                                    } else {
-                                        "所有變更已儲存"
-                                    },
-                                );
-                            }
-                        }
-                    });
-                });
-            });
             save_requested
         })
         .inner
+    }
+
+    fn save_footer(&self, ui: &mut egui::Ui, providers: &ProviderStore) -> bool {
+        // Hover/focus strokes may extend a pixel beyond the button's hit rect.
+        egui::Frame::NONE
+            .inner_margin(2)
+            .show(ui, |ui| {
+                let palette = theme::current_palette(ui.ctx());
+                ui.separator();
+                ui.add_space(4.0);
+                let mut save_requested = false;
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        save_requested = ui
+                            .add_enabled(
+                                self.provider.is_some() && providers.load_error().is_none(),
+                                egui::Button::new(
+                                    egui::RichText::new("儲存設定").color(palette.accent_text),
+                                )
+                                .fill(palette.accent)
+                                .min_size(egui::vec2(108.0, 34.0)),
+                            )
+                            .clicked();
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            match &self.save_result {
+                                Some(Ok(())) => {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new("已儲存 · 所有設定已更新")
+                                                .size(12.0)
+                                                .weak(),
+                                        )
+                                        .truncate(),
+                                    );
+                                }
+                                Some(Err(error)) => {
+                                    let message = format!("儲存失敗：{error}");
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&message)
+                                                .size(12.0)
+                                                .color(ui.visuals().error_fg_color),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(message);
+                                }
+                                None => {
+                                    let dirty = self.settings != self.saved_settings
+                                        || self.selected_provider_id() != self.saved_provider_id;
+                                    let message = if dirty {
+                                        "有尚未儲存的變更"
+                                    } else {
+                                        "所有變更已儲存"
+                                    };
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(message).size(12.0).weak(),
+                                        )
+                                        .truncate(),
+                                    );
+                                }
+                            }
+                        });
+                    });
+                });
+                save_requested
+            })
+            .inner
     }
 
     fn poll_model_fetch(&mut self) {
@@ -1678,23 +1709,23 @@ impl SettingsUi {
         }
     }
 
-    fn hotkey_section(&mut self, ui: &mut egui::Ui, runtime: &tokio::runtime::Handle) {
+    fn hotkey_section(&mut self, ui: &mut egui::Ui) {
         pane_heading(ui, "隨時喚出 PopChat", "不用切換視窗，就能開始下一段對話。");
         field_label(ui, "目前的全域快捷鍵");
         let palette = theme::current_palette(ui.ctx());
         egui::Frame::new()
             .fill(control_fill(palette.dark))
             .corner_radius(8)
-            .inner_margin(20)
+            .inner_margin(egui::Margin::symmetric(12, 6))
             .show(ui, |ui| {
                 ui.set_width((ui.available_width()).max(0.0));
                 if let Some(label) = &self.hotkey_label {
-                    ui.label(egui::RichText::new(label).size(22.0).color(palette.accent));
+                    ui.label(egui::RichText::new(label).size(18.0).color(palette.accent));
                 } else {
                     ui.label(egui::RichText::new("尚未註冊成功").size(18.0));
                 }
             });
-        ui.add_space(8.0);
+        ui.add_space(4.0);
         field_label(ui, "自訂全域快捷鍵");
         if crate::ui::hotkey_recorder::show(ui, &mut self.hotkey_draft) {
             self.hotkey_update_error = None;
@@ -1734,7 +1765,10 @@ impl SettingsUi {
         field_label(ui, "聊天快捷鍵");
         crate::ui::shortcut_list::show(ui);
         muted(ui, "也可直接將檔案拖入聊天視窗；不需要先點附件按鈕。");
-        ui.add_space(12.0);
+    }
+
+    fn about_section(&mut self, ui: &mut egui::Ui, runtime: &tokio::runtime::Handle) {
+        pane_heading(ui, "關於 PopChat", "版本、更新與啟動設定。");
         let was_enabled = self.startup_enabled;
         if ui
             .checkbox(
@@ -1993,17 +2027,8 @@ impl SettingsUi {
             "讓回答連結更多資訊",
             "允許模型在需要時搜尋網頁，取得對話以外的資訊。",
         );
-        let palette = theme::current_palette(ui.ctx());
-        egui::Frame::new()
-            .fill(control_fill(palette.dark))
-            .corner_radius(8)
-            .inner_margin(16)
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.checkbox(&mut self.settings.web_search_enabled, "啟用網路搜尋");
-                muted(ui, "實際搜尋能力依使用的模型服務而定。");
-            });
-        ui.add_space(18.0);
+        let _ = search_enable_card(ui, &mut self.settings.web_search_enabled);
+        ui.add_space(10.0);
         ui.add_enabled_ui(self.settings.web_search_enabled, |ui| {
             field_label(ui, "偏好的搜尋引擎");
             egui::ComboBox::from_id_salt("settings_search_engine")
@@ -2176,6 +2201,36 @@ fn muted(ui: &mut egui::Ui, text: &str) {
     );
 }
 
+/// A short toggle should not inherit the padding of a full settings form.
+/// Keep the existing checkbox hit target; use spare horizontal room for help.
+fn search_enable_card(
+    ui: &mut egui::Ui,
+    enabled: &mut bool,
+) -> egui::InnerResponse<egui::Response> {
+    let palette = theme::current_palette(ui.ctx());
+    egui::Frame::new()
+        .fill(control_fill(palette.dark))
+        .corner_radius(8)
+        .inner_margin(egui::Margin::symmetric(12, 6))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 2.0;
+            if ui.available_width() >= 420.0 {
+                ui.horizontal(|ui| {
+                    let toggle = ui.checkbox(enabled, "啟用網路搜尋");
+                    ui.add_space(4.0);
+                    muted(ui, "實際搜尋能力依使用的模型服務而定。");
+                    toggle
+                })
+                .inner
+            } else {
+                let toggle = ui.checkbox(enabled, "啟用網路搜尋");
+                muted(ui, "實際搜尋能力依使用的模型服務而定。");
+                toggle
+            }
+        })
+}
+
 /// Download feedback is informational, not a 32pt-tall settings control.
 /// Keep text outside the track so a readable label never makes the bar thick.
 fn update_download_progress(
@@ -2346,6 +2401,461 @@ fn search_engine_label(engine: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pointer(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn search_toggle_is_compact_responsive_and_keeps_its_click_target() {
+        for dark in [false, true] {
+            for width in [300.0, 520.0] {
+                let ctx = egui::Context::default();
+                theme::apply(&ctx, if dark { "dark" } else { "light" }, DEFAULT_ACCENT);
+                super::super::mcp::preview::prepare_fonts(&ctx);
+                let mut enabled = false;
+                let mut card = egui::Rect::NOTHING;
+                let mut toggle = egui::Rect::NOTHING;
+                let mut old = egui::Rect::NOTHING;
+                let mut frames = vec![];
+                for step in 0..4 {
+                    let pos = toggle.center();
+                    frames.push(ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(width, 300.0),
+                            )),
+                            events: match step {
+                                2 => vec![egui::Event::PointerMoved(pos), pointer(pos, true)],
+                                3 => vec![pointer(pos, false)],
+                                _ => vec![],
+                            },
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::CentralPanel::default().show(ctx, |ui| {
+                                settings_style(ui);
+                                let response = search_enable_card(ui, &mut enabled);
+                                card = response.response.rect;
+                                toggle = response.inner.rect;
+                                assert!(toggle.height() >= 32.0);
+                                ui.add_space(10.0);
+                                old = egui::Frame::new()
+                                    .inner_margin(16)
+                                    .show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        let mut old_enabled = false;
+                                        ui.checkbox(&mut old_enabled, "啟用網路搜尋");
+                                        muted(ui, "實際搜尋能力依使用的模型服務而定。");
+                                    })
+                                    .response
+                                    .rect;
+                            });
+                        },
+                    ));
+                    assert_eq!(enabled, step == 3, "only an actual release toggles search");
+                }
+                assert!(
+                    card.height() <= if width >= 520.0 { 46.0 } else { 66.0 },
+                    "{width}: {card:?}"
+                );
+                assert!(card.height() + 20.0 <= old.height(), "{card:?} vs {old:?}");
+                assert!(card.right() <= width && card.contains_rect(toggle));
+                let output = frames.last().unwrap();
+                let help = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text)
+                            if text.galley.job.text == "實際搜尋能力依使用的模型服務而定。" =>
+                        {
+                            Some(egui::Rect::from_min_size(text.pos, text.galley.size()))
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert!(card.contains_rect(help));
+                if width >= 520.0 {
+                    assert!(help.left() > toggle.right());
+                } else {
+                    assert!(help.top() >= toggle.bottom());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn about_owns_startup_updates_version_and_credits_without_changing_preferences() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        assert!(SettingsTab::ALL.last() == Some(&(SettingsTab::About, "關於")));
+        for dark in [false, true] {
+            let ctx = egui::Context::default();
+            theme::apply(&ctx, if dark { "dark" } else { "light" }, DEFAULT_ACCENT);
+            let mut draft = draft();
+            let before = draft.settings.clone();
+            for tab in [SettingsTab::Hotkey, SettingsTab::About] {
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(636.0, 1200.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            settings_style(ui);
+                            match tab {
+                                SettingsTab::Hotkey => draft.hotkey_section(ui),
+                                SettingsTab::About => draft.about_section(ui, runtime.handle()),
+                                _ => unreachable!(),
+                            }
+                        });
+                    },
+                );
+                let text = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                for label in [
+                    "關於 PopChat",
+                    "登入 Windows 時啟動 PopChat（隱藏待命）",
+                    "自動檢查更新（每天一次）",
+                    "立即檢查更新",
+                    "Windows 專案",
+                    "原專案：lec77/PopChat",
+                ] {
+                    assert_eq!(
+                        text.contains(&label),
+                        tab == SettingsTab::About,
+                        "misplaced About control: {label}"
+                    );
+                }
+                for label in [
+                    format!("PopChat {}", env!("CARGO_PKG_VERSION")),
+                    format!("Windows 移植與維護：{}", crate::AUTHOR),
+                ] {
+                    assert_eq!(text.contains(&label.as_str()), tab == SettingsTab::About);
+                }
+                assert_eq!(text.contains(&"聊天快捷鍵"), tab == SettingsTab::Hotkey);
+                assert!(draft.settings == before);
+                assert!(!draft.startup_enabled);
+                assert_eq!(draft.updates.state, crate::update::CheckState::Idle);
+                assert!(matches!(
+                    draft.update_download.state,
+                    crate::update::DownloadState::Idle
+                ));
+                assert!(draft.take_actions().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn real_settings_recorder_accepts_alt_arrows_without_applying_or_saving() {
+        let dir = tempfile::tempdir().unwrap();
+        let providers = ProviderStore::isolated_file_for_tests(dir.path().join("providers.json"));
+        let secrets = SecretStore::isolated_file_for_tests(dir.path().join("secrets.json"));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        for (key, expected) in [
+            (egui::Key::ArrowLeft, "Alt+Left"),
+            (egui::Key::ArrowRight, "Alt+Right"),
+            (egui::Key::ArrowUp, "Alt+Up"),
+            (egui::Key::ArrowDown, "Alt+Down"),
+        ] {
+            let ctx = egui::Context::default();
+            let mut draft = SettingsUi::from_settings(AppSettings::default());
+            draft.sync_provider(&providers, &secrets);
+            draft.active_tab = SettingsTab::Hotkey;
+            draft.hotkey_label = Some("Alt+Down".into());
+            let mut frame = |events: Vec<egui::Event>, modifiers| {
+                ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(636.0, 900.0),
+                        )),
+                        events,
+                        modifiers,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        super::super::hotkey_recorder::intercept(ctx);
+                        theme::apply(ctx, "dark", DEFAULT_ACCENT);
+                        egui::CentralPanel::default()
+                            .frame(super::super::surface::canvas_frame())
+                            .show(ctx, |ui| {
+                                super::super::surface::card_frame(true).show(ui, |ui| {
+                                    ui.set_min_size(ui.available_size());
+                                    assert!(!draft.show(
+                                        ui,
+                                        runtime.handle(),
+                                        &providers,
+                                        &secrets
+                                    ));
+                                });
+                            });
+                    },
+                )
+            };
+            let _ = frame(vec![], egui::Modifiers::NONE);
+            let output = frame(vec![], egui::Modifiers::NONE);
+            let pos = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.job.text == "錄製快捷鍵" => {
+                        Some(text.pos + text.galley.size() * 0.5)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            for pressed in [true, false] {
+                frame(
+                    vec![egui::Event::PointerMoved(pos), pointer(pos, pressed)],
+                    egui::Modifiers::NONE,
+                );
+            }
+            assert!(super::super::hotkey_recorder::is_recording(&ctx));
+            frame(vec![], egui::Modifiers::ALT);
+            assert!(super::super::hotkey_recorder::is_recording(&ctx));
+            frame(
+                vec![egui::Event::Key {
+                    key,
+                    physical_key: Some(key),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::ALT,
+                }],
+                egui::Modifiers::ALT,
+            );
+            assert_eq!(draft.hotkey_draft, expected);
+            assert_eq!(draft.settings.hotkey_binding, "Alt+Down");
+            assert!(draft.take_actions().is_empty());
+            assert!(!super::super::hotkey_recorder::is_recording(&ctx));
+        }
+        assert!(!dir.path().join("secrets.json").exists());
+    }
+
+    #[test]
+    fn settings_save_stays_visible_and_clickable_in_every_pane_and_short_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let providers = ProviderStore::isolated_file_for_tests(dir.path().join("providers.json"));
+        let secrets = SecretStore::isolated_file_for_tests(dir.path().join("secrets.json"));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let stored = std::fs::read(dir.path().join("providers.json")).unwrap();
+        for dark in [false, true] {
+            for size in [
+                egui::vec2(320.0, 240.0),
+                egui::vec2(320.0, 360.0),
+                egui::vec2(520.0, 360.0),
+                egui::vec2(982.0, 652.0),
+            ] {
+                let ctx = egui::Context::default();
+                let palette =
+                    theme::apply(&ctx, if dark { "dark" } else { "light" }, DEFAULT_ACCENT);
+                ctx.style_mut(|style| style.animation_time = 0.0);
+                super::super::mcp::preview::prepare_fonts(&ctx);
+                let mut draft = SettingsUi::from_settings(AppSettings::default());
+                draft.sync_provider(&providers, &secrets);
+                draft.settings.system_prompt = "Synthetic custom prompt — do not replace".into();
+                draft.hotkey_label = Some("Alt+Down".into());
+                let before = draft.settings.clone();
+                // Keep the first texture atlas and all subsequent patches for snapshots.
+                let mut frames = vec![];
+                for (tab, _) in SettingsTab::ALL {
+                    draft.active_tab = tab;
+                    let mut button = egui::Rect::NOTHING;
+                    let mut anchor = None;
+                    for step in 0..6 {
+                        draft.preference_save_error = if step == 1 {
+                            None
+                        } else {
+                            Some("Synthetic preference error with long details. ".repeat(120))
+                        };
+                        draft.save_result = match step {
+                            0 => Some(Ok(())),
+                            1 => None,
+                            _ => Some(Err("Synthetic save error. ".repeat(120))),
+                        };
+                        let pos = button.center();
+                        let mut requested = false;
+                        let mut card = egui::Rect::NOTHING;
+                        frames.push(ctx.run(
+                            egui::RawInput {
+                                screen_rect: Some(egui::Rect::from_min_size(
+                                    egui::Pos2::ZERO,
+                                    size,
+                                )),
+                                events: match step {
+                                    2 => vec![
+                                        egui::Event::PointerMoved(egui::pos2(size.x / 2.0, 80.0)),
+                                        egui::Event::MouseWheel {
+                                            unit: egui::MouseWheelUnit::Point,
+                                            delta: egui::vec2(0.0, -1200.0),
+                                            modifiers: egui::Modifiers::NONE,
+                                        },
+                                    ],
+                                    4 => vec![egui::Event::PointerMoved(pos), pointer(pos, true)],
+                                    5 => vec![pointer(pos, false)],
+                                    _ => vec![],
+                                },
+                                ..Default::default()
+                            },
+                            |ctx| {
+                                egui::CentralPanel::default()
+                                    .frame(super::super::surface::canvas_frame())
+                                    .show(ctx, |ui| {
+                                        card = super::super::surface::card_frame(dark)
+                                            .show(ui, |ui| {
+                                                ui.set_min_size(ui.available_size());
+                                                ui.label("PopChat · offline fixture");
+                                                requested = draft.show(
+                                                    ui,
+                                                    runtime.handle(),
+                                                    &providers,
+                                                    &secrets,
+                                                );
+                                            })
+                                            .response
+                                            .rect;
+                                    });
+                            },
+                        ));
+                        assert_eq!(
+                            requested,
+                            step == 5,
+                            "save must require a real click: {size:?} tab {} step {step}",
+                            tab as u8
+                        );
+                        let output = frames.last().unwrap();
+                        button = super::super::mcp::preview::rect_shapes(output)
+                            .into_iter()
+                            .find(|rect| {
+                                rect.fill == palette.accent
+                                    && rect.rect.width() >= 108.0
+                                    && rect.rect.height() >= 34.0
+                            })
+                            .expect("visible Save button")
+                            .rect;
+                        if step == 1 {
+                            anchor = Some(button.center());
+                        }
+                        if let Some(anchor) = anchor {
+                            assert!(
+                                button.center().distance(anchor) < 0.6,
+                                "Save must not move when content or errors scroll"
+                            );
+                        }
+                        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                        assert!(
+                            viewport.shrink(12.0).expand(0.5).contains_rect(card),
+                            "card must not grow: {card:?} {size:?}"
+                        );
+                        assert!(
+                            card.shrink(16.0).contains_rect(button),
+                            "button outside safe card: {button:?} {card:?}"
+                        );
+                        let label = output
+                            .shapes
+                            .iter()
+                            .find_map(|shape| match &shape.shape {
+                                egui::Shape::Text(text) if text.galley.job.text == "儲存設定" => {
+                                    Some((
+                                        egui::Rect::from_min_size(text.pos, text.galley.size()),
+                                        shape.clip_rect,
+                                    ))
+                                }
+                                _ => None,
+                            })
+                            .unwrap();
+                        assert!(
+                            label.1.contains_rect(button),
+                            "entire hit target must be unclipped: {button:?} {:?}",
+                            label.1
+                        );
+                        assert!(button.contains_rect(label.0));
+                        for title in SettingsTab::ALL.map(|(_, title)| title) {
+                            for shape in &output.shapes {
+                                if let egui::Shape::Text(text) = &shape.shape {
+                                    if text.galley.job.text == title {
+                                        assert!(
+                                            text.pos.x >= card.left()
+                                                && text.pos.x + text.galley.size().x
+                                                    <= card.right(),
+                                            "tab must wrap, not widen: {title}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        if step == 1
+                            && matches!(
+                                tab,
+                                SettingsTab::Search | SettingsTab::About | SettingsTab::Hotkey
+                            )
+                            && size.y >= 360.0
+                        {
+                            super::super::mcp::preview::export(
+                                &ctx,
+                                &frames,
+                                size,
+                                &format!(
+                                    "settings-{}-{}-{}.png",
+                                    match tab {
+                                        SettingsTab::About => "about",
+                                        SettingsTab::Hotkey => "hotkey",
+                                        _ => "search",
+                                    },
+                                    if dark { "dark" } else { "light" },
+                                    size.x as u32
+                                ),
+                                dark,
+                            );
+                        }
+                    }
+                    assert_eq!(
+                        draft.settings, before,
+                        "rendering and save intention must not mutate a draft"
+                    );
+                    assert!(draft.take_actions().is_empty());
+                    if matches!(tab, SettingsTab::Search) && size.y >= 360.0 {
+                        super::super::mcp::preview::export(
+                            &ctx,
+                            &frames,
+                            size,
+                            &format!(
+                                "settings-search-scrolled-{}-{}.png",
+                                if dark { "dark" } else { "light" },
+                                size.x as u32
+                            ),
+                            dark,
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            std::fs::read(dir.path().join("providers.json")).unwrap(),
+            stored
+        );
+        assert!(!dir.path().join("secrets.json").exists());
+    }
 
     #[test]
     fn update_progress_is_a_thin_track_despite_settings_control_height() {
@@ -2787,11 +3297,10 @@ mod tests {
                                     SettingsTab::Appearance => draft.appearance_section(ui),
                                     SettingsTab::Search => draft.search_section(ui),
                                     SettingsTab::Commands => draft.commands_section(ui),
-                                    SettingsTab::Hotkey => {
-                                        draft.hotkey_section(ui, runtime.handle())
-                                    }
+                                    SettingsTab::Hotkey => draft.hotkey_section(ui),
                                     SettingsTab::Mcp => draft.mcp_section(ui),
                                     SettingsTab::Skills => draft.skills_section(ui),
+                                    SettingsTab::About => draft.about_section(ui, runtime.handle()),
                                 },
                             );
                             assert!(
