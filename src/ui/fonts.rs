@@ -326,11 +326,20 @@ pub fn show_font_preferences(ui: &mut egui::Ui, prefs: &mut FontPreferences) {
 fn build_definitions(
     prefs: &FontPreferences,
 ) -> Result<(egui::FontDefinitions, Option<String>), String> {
+    build_definitions_with(prefs, load_choice)
+}
+
+/// Keep font assembly testable with already-licensed embedded faces instead of
+/// requiring optional OS fonts. Production always passes the installed loader.
+fn build_definitions_with(
+    prefs: &FontPreferences,
+    mut load: impl FnMut(&str, bool) -> Result<egui::FontData, String>,
+) -> Result<(egui::FontDefinitions, Option<String>), String> {
     let mut defs = egui::FontDefinitions::default();
     let default = prefs.english.is_empty().then(default_english);
     let has_english = !prefs.english.is_empty() || default.is_some_and(|d| d.data.is_some());
     if !prefs.english.is_empty() {
-        let data = load_choice(&prefs.english, false)?;
+        let data = load(&prefs.english, false)?;
         defs.font_data
             .insert("selected-english".to_owned(), std::sync::Arc::new(data));
         defs.families
@@ -347,7 +356,7 @@ fn build_definitions(
     }
     let custom_chinese = !prefs.chinese.is_empty() && prefs.chinese != BUNDLED_SWEI_ID;
     if custom_chinese {
-        let data = load_choice(&prefs.chinese, true)?;
+        let data = load(&prefs.chinese, true)?;
         defs.font_data
             .insert("selected-chinese".to_owned(), std::sync::Arc::new(data));
         defs.families
@@ -484,12 +493,30 @@ pub fn install_cjk_font(ctx: &egui::Context) -> Option<String> {
 mod tests {
     use super::*;
 
+    const FIXTURE_CJK: &str = "fixture:bundled-cjk";
+    const FIXTURE_LATIN: &str = "fixture:embedded-latin";
+
+    fn fixture_choice(value: &str, chinese: bool) -> Result<egui::FontData, String> {
+        match value {
+            FIXTURE_CJK => subset_choice(BUNDLED_SWEI_BYTES.to_vec(), 0, chinese),
+            FIXTURE_LATIN => {
+                let defs = egui::FontDefinitions::default();
+                subset_choice(defs.font_data["Ubuntu-Light"].font.to_vec(), 0, chinese)
+            }
+            _ => load_choice(value, chinese),
+        }
+    }
+
+    fn fixture_definitions(prefs: &FontPreferences) -> egui::FontDefinitions {
+        build_definitions_with(prefs, fixture_choice).unwrap().0
+    }
+
     fn fonts_for(prefs: &FontPreferences) -> egui::epaint::text::Fonts {
         egui::epaint::text::Fonts::new(
             1.0,
             2048,
             egui::epaint::image::AlphaFromCoverage::default(),
-            build_definitions(prefs).unwrap().0,
+            fixture_definitions(prefs),
         )
     }
 
@@ -596,9 +623,9 @@ mod tests {
             .any(|name| name == "default-english"));
         let manual = FontPreferences {
             english: "arial.ttf".into(),
-            chinese: "kaiu.ttf".into(),
+            chinese: FIXTURE_CJK.into(),
         };
-        let manual_defs = build_definitions(&manual).unwrap().0;
+        let manual_defs = fixture_definitions(&manual);
         assert!(!manual_defs.font_data.contains_key("default-english"));
         assert_eq!(
             manual_defs.font_data["selected-english"].font,
@@ -606,7 +633,7 @@ mod tests {
         );
         assert_eq!(
             manual_defs.font_data["selected-chinese"].font,
-            load_choice("kaiu.ttf", true).unwrap().font
+            fixture_choice(FIXTURE_CJK, true).unwrap().font
         );
         let automatic = fonts_for(&prefs);
         let explicit = fonts_for(&FontPreferences {
@@ -717,7 +744,7 @@ mod tests {
     fn bundled_and_manual_chinese_leave_english_and_code_glyphs_independent() {
         let default_english = fonts_for(&FontPreferences::default());
         let manual_chinese = fonts_for(&FontPreferences {
-            chinese: "kaiu.ttf".into(),
+            chinese: FIXTURE_CJK.into(),
             ..Default::default()
         });
         let egui_fonts = egui::epaint::text::Fonts::new(
@@ -826,14 +853,16 @@ mod tests {
     fn chinese_selection_replaces_the_actual_fallback() {
         let first = FontPreferences {
             english: "arial.ttf".into(),
-            chinese: "msjh.ttc".into(),
+            chinese: FIXTURE_CJK.into(),
         };
+        // An incomplete manually selected face still precedes the permanent
+        // CJK fallback; missing glyphs must resolve without an optional OS font.
         let second = FontPreferences {
-            chinese: "kaiu.ttf".into(),
+            chinese: FIXTURE_LATIN.into(),
             ..first.clone()
         };
-        let a = build_definitions(&first).unwrap().0;
-        let b = build_definitions(&second).unwrap().0;
+        let a = fixture_definitions(&first);
+        let b = fixture_definitions(&second);
         assert_ne!(
             a.font_data["selected-chinese"].font,
             b.font_data["selected-chinese"].font
@@ -992,7 +1021,7 @@ mod tests {
     fn multilingual_english_choice_does_not_capture_selected_chinese_glyphs() {
         let chinese = FontPreferences {
             english: "arial.ttf".into(),
-            chinese: "kaiu.ttf".into(),
+            chinese: FIXTURE_CJK.into(),
         };
         let multilingual = FontPreferences {
             english: "msjh.ttc".into(),
@@ -1015,8 +1044,8 @@ mod tests {
                 .x
         );
         assert_eq!(
-            build_definitions(&chinese).unwrap().0.font_data["selected-chinese"].font,
-            build_definitions(&multilingual).unwrap().0.font_data["selected-chinese"].font
+            fixture_definitions(&chinese).font_data["selected-chinese"].font,
+            fixture_definitions(&multilingual).font_data["selected-chinese"].font
         );
     }
 

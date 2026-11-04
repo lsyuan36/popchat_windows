@@ -1,4 +1,6 @@
-# v0.2.5
+# v0.2.6
+
+- 首輪 `v0.2.5` 候選未發佈：完整 CI 揭露 4 項既有字體測試依賴選用的系統楷體。保留失敗 tag，改用既有內建字體的隔離 fixture 驗證原有字形分區與備援行為，不安裝／下載字體、不略過測試；產品的字體選擇與載入限制不變。
 
 - 新增 Skills 設定與本機來源管理：OpenCode、Claude、Codex／共用 Agents 預設路徑、舊版 Codex 相容目錄，以及明確指定的專案／自訂資料夾；個別啟停並保存於獨立的 `skills.json`，不修改其他工具設定。
 - Skills 接上 OpenAI 相容及 ChatGPT Responses 的實際工具回合；只提供已啟用技能的 metadata，透過 `load_skill`／`read_skill_file` 按需載入指引及目錄內文字參考檔，不自動執行腳本或授予 MCP 權限。

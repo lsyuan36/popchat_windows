@@ -1,9 +1,9 @@
-# MCP Client（0.2.5）
+# MCP Client（0.2.6）
 
 0.2.2 加入 MCP Client 與繁體中文內建提示詞。0.2.1 使用者需確認程式內更新或
 重新下載 Setup 升級；新增設定不會自行啟用服務或啟動 MCP 程式。
 
-## 0.2.5：介面與 Skills 整合
+## 0.2.6：介面與 Skills 整合
 
 ### MCP 與 system prompt
 
@@ -25,7 +25,7 @@ Codex app-server 不注入 PopChat 的 MCP／Skills 工具，既有安全邊界�
 「允許模型提出新增草稿」移至「進階選項」。
 
 這只是介面調整，不會自動保存、啟用、測試或授權工具；密碼仍遮罩，
-內網 HTTP 仍需獨立同意，每次執行仍須明確確認。此介面調整需升級至 0.2.5。
+內網 HTTP 仍需獨立同意，每次執行仍須明確確認。此介面調整需升級至 0.2.6。
 畫面檢查使用假資料與離線 egui 輸出，不連線真實服務、不啟動第二個聊天 UI。
 整合 Skills 後完整回歸 **620 library、29 app、1 send-pipeline integration、1 license inventory、
 15 importer passed；3 ignored，合計 666 項通過**，無 warning（4 條測試執行緒）。涵蓋等寬卡片、窄視窗固定操作列、
