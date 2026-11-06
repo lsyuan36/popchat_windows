@@ -58,7 +58,7 @@ impl ChatBackend for DelegatedBackend {
             ProviderKind::ChatGPT => self
                 .responses
                 .start_with_mcp(history, config, web_access, mcp),
-            ProviderKind::OpenAICompatible => {
+            ProviderKind::OpenAICompatible | ProviderKind::OpenCodeGo => {
                 client::run_with_mcp(history, config, web_access, mcp)
             }
             ProviderKind::CodexAppServer => self.start(history, config, web_access),
@@ -82,7 +82,9 @@ impl ChatBackend for DelegatedBackend {
             }
             // Do not re-enter client::run for a subscription kind (it delegates
             // back here); the ordinary kind is safe and keeps the adapter total.
-            ProviderKind::OpenAICompatible => client::run(history, config, web_access),
+            ProviderKind::OpenAICompatible | ProviderKind::OpenCodeGo => {
+                client::run(history, config, web_access)
+            }
         }
     }
 }

@@ -820,7 +820,7 @@ impl ChatStore {
                 // install / missing login as an error EVENT through the same
                 // path this branch would use.
             }
-            ProviderKind::OpenAICompatible => {
+            ProviderKind::OpenAICompatible | ProviderKind::OpenCodeGo => {
                 let is_local =
                     config.base_url.contains("localhost") || config.base_url.contains("127.0.0.1");
                 if config.api_key.is_empty() && !is_local {
@@ -892,6 +892,7 @@ impl ChatStore {
 
         SendOutcome::Ready(OutgoingTurn {
             context: super::compaction::ContextRequest {
+                conversation_id: self.conversation_id,
                 limit: providers.current_context_limit(),
                 provider_id: send_provider_id,
                 state: self.context.clone(),

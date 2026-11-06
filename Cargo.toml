@@ -1,6 +1,6 @@
 [package]
 name = "popchat_windows"
-version = "0.2.8"
+version = "0.2.9"
 edition = "2021"
 description = "PopChat Windows port — all-Rust floating chat panel for OpenAI-compatible models"
 license = "MIT"

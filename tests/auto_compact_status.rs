@@ -88,6 +88,7 @@ async fn actual_send_prepares_model_budget_and_compacts_without_destroying_trans
         assert_eq!(outgoing.history.len(), 82); // system + 80 old + latest
         assert_eq!(outgoing.context.limit, limit);
         assert_eq!(outgoing.context.provider_id, provider_id);
+        assert_eq!(outgoing.context.conversation_id, chat.conversation_id);
         let wire = serde_json::to_value(&outgoing.history).unwrap();
         assert_eq!(wire[0]["content"], options.system_prompt);
         for (index, message) in messages.iter().enumerate() {

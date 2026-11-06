@@ -1,3 +1,12 @@
+# v0.2.9
+
+- 新增獨立的「Opencode Go」Provider（`opencodeGo` 類型）：新目錄與升級既有目錄各新增一次，不改寫既有 Provider 的 UUID、端點、金鑰、模型或選取，不自動轉換同名／同端點的自訂服務；新服務不複製其他金鑰，也不自動切換。
+- 只有新 Go 類型補上 `x-opencode-session` 與真實的 `PopChat-Windows/<版本>` User-Agent。同一對話的後續訊息、工具回合、Auto Compact 摘要與超限恢復沿用對話 UUID，不改動歷史格式。既有 OpenAI 相容 Provider 即使同樣指向 `opencode.ai`，標頭行為也不變。
+- Go 端點與模型清單分別採官方 OpenAI 相容入口及 `/inference/go/v1/models`。對話識別標頭還須符合精確的 `opencode.ai` 主機，遇到跨來源重新導向時停止；不送給其他模型服務、模型清單或工具讀取的網頁，不冒充其他已驗證客戶端。
+- 補上本機 mock HTTP 回歸：缺少 session 會被拒絕的 Go 端點、同時進行的不同對話與工具回合、摘要與恢復、相似網域與跨來源重新導向；使用合成資料及 loopback，不連線真實 Go 推論服務，不使用真實金鑰。
+- Go 官方定位為程式代理流量；修正必要標頭不代表 PopChat 已獲官方驗證，亦不變更或規避 Go 的流量與方案限制。此獨立 Provider 自 0.2.9 提供，0.2.8 及更早版本不含此功能。
+- 完整本機回歸：646 library、29 app、3 integration、15 importer，合計 693 項通過、3 項忽略，無 warning（4 條測試執行緒）；正式成品僅採用通過對應 tag CI 的 NSIS Setup 與 877-entry ZIP，保留舊版 Release。
+
 # v0.2.8
 
 - 修正 0.2.7 設定頁的轉場容器把長內容當成一個可視區高度，導致滾輪無法捲到下方欄位的問題；垂直捲動內容保留自然高度並沿用捲動區裁切，視窗頁面的有界轉場與固定儲存列不變。

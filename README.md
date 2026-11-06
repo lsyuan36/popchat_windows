@@ -2,7 +2,7 @@
 
 輕量的 Windows 浮動 AI 聊天面板，以 **Rust + egui/eframe** 實作。
 
-**Windows 移植／維護：Evis Lai** · 目前版本：**0.2.8**
+**Windows 移植／維護：Evis Lai** · 目前版本：**0.2.9**
 
 > 本專案移植自 **Le Chen / lec77** 的 macOS 專案
 > **[lec77/PopChat](https://github.com/lec77/PopChat)**。
@@ -11,9 +11,10 @@
 
 ## 下載與啟動
 
-從 **[GitHub Releases](https://github.com/lsyuan36/popchat_windows/releases/tag/v0.2.8)**
-下載 **`PopChat-0.2.8-Windows-x64-Setup.exe`**（NSIS 安裝程式）。
-**0.2.8** 修正 0.2.7 設定頁無法以滾輪捲到下方欄位的問題，固定儲存列與頁面轉場維持不變。
+從 **[GitHub Releases](https://github.com/lsyuan36/popchat_windows/releases/tag/v0.2.9)**
+下載 **`PopChat-0.2.9-Windows-x64-Setup.exe`**（NSIS 安裝程式）。
+**0.2.9** 新增獨立的「Opencode Go」Provider，專用 session 標頭不影響原有服務、金鑰與選取。
+保留 **0.2.8** 的設定頁滾輪修正，固定儲存列與頁面轉場維持不變。
 保留 0.2.7 的圓角遮罩、小字活動提示、「關於」分頁、緊湊雙欄快捷鍵表與直接輸入待套用組合，
 以及 Skills、MCP 本機安全設定、Auto Compact 與繁體中文內建提示詞。
 既有版本使用者可用程式內更新，
@@ -100,6 +101,21 @@ ChatGPT／Codex 整合的可用性取決於帳號、方案、外部工具及服�
 Codex app-server 沿用其原生上下文管理。實作邊界與隔離驗證見 [AUTO_COMPACT.md](https://github.com/lsyuan36/popchat_windows/blob/main/AUTO_COMPACT.md)。
 原先的 0.2.1 初始包只有預算設定；0.2.2 已包含完整接線，既有安裝不會因原始碼改動自行變更。
 
+## OpenCode Go（0.2.9）
+
+`MissingSessionID`／缺少 `x-opencode-session` 指向客戶端請求缺少標頭，並非金鑰錯誤的判定。
+0.2.9 新增獨立的 **「Opencode Go」Provider**，以現有對話 UUID 提供穩定 session，讓正式回答、
+工具回合、摘要與恢復共用，並使用真實的 `PopChat-Windows/<版本>` User-Agent。
+特殊標頭只套用新 Go 類型，且對話標頭只送往 `opencode.ai`；既有 Provider 的標頭、端點、金鑰與選取不變。
+新 Provider 預設沒有金鑰或模型，不自動切換，也不從原有自訂 Go 服務搬移金鑰。使用時請在新 Provider 的
+本機金鑰欄輸入自己的 Go 金鑰，再取得模型並明確儲存／選取；不要把金鑰貼到聊天。
+**0.2.8 及更早安裝包尚不包含此 Provider**，不必刪除原有服務。
+
+OpenAI 相容入口依[官方 Go 文件](https://opencode.ai/v2/docs/console/go/#where-can-i-use-it)設定；
+目前文件列出的 Base URL 為 `https://opencode.ai/inference/go/openai/v1`，不需另加 `/chat/completions`。
+Go 主要供典型程式代理流量，PopChat 並非官方已驗證客戶端；必要標頭修正不保證所有聊天用途皆受方案支援，
+也不規避服務的流量、模型或用量限制。
+
 ## MCP 與中文 system prompt
 
 0.2.2 支援 MCP stdio／Streamable HTTP、服務管理與每次工具執行確認。
@@ -125,7 +141,7 @@ HTTP 首版僅支援手動 Bearer token，不提供自動 OAuth 登入。
 設定 → Skills → 管理技能／掃描來源，可讀取 OpenCode、Claude、Codex／共用 Agents
 的個人預設路徑，也可明確指定專案或自訂資料夾。新技能預設停用，需個別啟用；
 只先提供名稱與說明，模型需要時才載入全文與技能目錄內的文字參考檔。
-不修改其他工具設定，不自動執行技能腳本。詳見 [SKILLS.md](https://github.com/lsyuan36/popchat_windows/blob/v0.2.8/SKILLS.md)。
+不修改其他工具設定，不自動執行技能腳本。詳見 [SKILLS.md](https://github.com/lsyuan36/popchat_windows/blob/v0.2.9/SKILLS.md)。
 **0.2.4 及更早版本不含 Skills 設定，需升級至 0.2.6。**
 
 ## 資料與隱私

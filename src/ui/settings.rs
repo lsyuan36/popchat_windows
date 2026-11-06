@@ -601,7 +601,7 @@ impl SettingsUi {
         else {
             return;
         };
-        let key = if provider.kind == ProviderKind::OpenAICompatible {
+        let key = if provider.kind.uses_api_key() {
             providers.key_for(id, secrets)
         } else {
             String::new()
@@ -643,7 +643,7 @@ impl SettingsUi {
         self.provider = Some(provider.clone());
         self.settings.provider_name = provider.name.clone();
         self.settings.base_url = provider.base_url.clone();
-        self.settings.api_key = if provider.kind == ProviderKind::OpenAICompatible {
+        self.settings.api_key = if provider.kind.uses_api_key() {
             key
         } else {
             String::new()
@@ -680,7 +680,9 @@ impl SettingsUi {
     }
 
     fn supports_api(&self) -> bool {
-        self.provider.as_ref().map(|provider| provider.kind) == Some(ProviderKind::OpenAICompatible)
+        self.provider
+            .as_ref()
+            .is_some_and(|provider| provider.kind.uses_api_key())
     }
 
     fn invalidate_models(&mut self) {
@@ -1041,9 +1043,10 @@ impl SettingsUi {
         let provider_name = self.settings.provider_name.clone();
         let base_url = self.settings.base_url.trim().to_owned();
         let api_key = self.settings.api_key.trim().to_owned();
+        let kind = self.provider.as_ref().unwrap().kind;
         let (tx, rx) = mpsc::channel();
         let task = runtime.spawn(async move {
-            let result = fetch_catalog(&provider_name, &base_url, &api_key).await;
+            let result = fetch_catalog(&provider_name, &base_url, &api_key, kind).await;
             let _ = tx.send(result);
             ctx.request_repaint();
         });
@@ -1371,6 +1374,17 @@ impl SettingsUi {
         }
 
         let provider_id = self.selected_provider_id();
+        if self
+            .provider
+            .as_ref()
+            .is_some_and(|p| p.kind == ProviderKind::OpenCodeGo)
+        {
+            muted(ui,"獨立的 Opencode Go 服務；金鑰與模型不沿用其他 Provider。Go 主要供程式代理流量，仍需符合官方使用限制。");
+            ui.hyperlink_to(
+                "Opencode Go 官方說明",
+                "https://opencode.ai/v2/docs/console/go/#where-can-i-use-it",
+            );
+        }
         if api {
             field_label(ui, "API 端點");
             ui.add_sized(
@@ -2146,9 +2160,11 @@ async fn fetch_catalog(
     provider: &str,
     base_url: &str,
     api_key: &str,
+    kind: ProviderKind,
 ) -> Result<ModelCatalog, String> {
     let (models, mut capabilities) =
-        crate::chat::providers::fetch_models_list(provider, base_url, api_key).await?;
+        crate::chat::providers::fetch_models_list_with_kind(provider, base_url, api_key, kind)
+            .await?;
     // Preserve authoritative /models metadata, then supplement local Ollama's
     // OpenAI-compatible surface using its native capability endpoint.
     let native = crate::chat::providers::probe_ollama_capabilities(base_url, &models).await;
@@ -2405,6 +2421,54 @@ fn search_engine_label(engine: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opencode_go_editor_has_independent_credentials_and_does_not_switch_the_live_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut providers =
+            ProviderStore::isolated_file_for_tests(dir.path().join("providers.json"));
+        let mut secrets = SecretStore::isolated_file_for_tests(dir.path().join("secrets.json"));
+        let legacy = provider(123, ProviderStore::OPENCODE_GO_BASE_URL);
+        let old = legacy.id;
+        providers.providers.push(legacy);
+        providers.selected_id = old;
+        providers
+            .set_key("synthetic-existing-key", old, &mut secrets)
+            .unwrap();
+        providers.try_save().unwrap();
+        let before = std::fs::read(dir.path().join("providers.json")).unwrap();
+        let keys = std::fs::read(dir.path().join("secrets.json")).unwrap();
+        let go = providers
+            .providers
+            .iter()
+            .find(|p| p.kind == ProviderKind::OpenCodeGo)
+            .unwrap()
+            .id;
+        let mut editor = SettingsUi::from_settings(AppSettings::default());
+        editor.select_provider(old, &providers, &secrets);
+        assert_eq!(editor.settings.api_key, "synthetic-existing-key");
+        editor.select_provider(go, &providers, &secrets);
+        assert!(editor.supports_api());
+        assert!(editor.settings.api_key.is_empty());
+        assert_eq!(editor.settings.provider_name, "Opencode Go");
+        assert_eq!(
+            editor.settings.base_url,
+            ProviderStore::OPENCODE_GO_BASE_URL
+        );
+        assert!(editor.settings.model.is_empty());
+        assert_eq!(providers.selected_id, old);
+        editor.select_provider(old, &providers, &secrets);
+        assert_eq!(editor.settings.api_key, "synthetic-existing-key");
+        assert_eq!(
+            std::fs::read(dir.path().join("providers.json")).unwrap(),
+            before
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("secrets.json")).unwrap(),
+            keys
+        );
+        assert!(editor.take_actions().is_empty());
+    }
 
     fn pointer(pos: egui::Pos2, pressed: bool) -> egui::Event {
         egui::Event::PointerButton {
@@ -3952,7 +4016,9 @@ mod tests {
             .mount(&server)
             .await;
         let endpoint = format!("{}/v1", server.uri());
-        let catalog = fetch_catalog("Custom", &endpoint, "").await.unwrap();
+        let catalog = fetch_catalog("Custom", &endpoint, "", ProviderKind::OpenAICompatible)
+            .await
+            .unwrap();
         let mut draft = draft();
         let scope = draft.model_scope().unwrap();
         draft.publish_model_result(scope, Ok(catalog));

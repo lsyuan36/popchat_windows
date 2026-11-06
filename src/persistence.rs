@@ -115,6 +115,7 @@ fn de_provider_kind<'de, D: Deserializer<'de>>(d: D) -> Result<ProviderKind, D::
     // resetting every provider (parity with Swift's raw-string decode).
     let s = Option::<String>::deserialize(d)?.unwrap_or_default();
     Ok(match s.as_str() {
+        "opencodeGo" => ProviderKind::OpenCodeGo,
         "chatGPT" => ProviderKind::ChatGPT,
         "codexAppServer" => ProviderKind::CodexAppServer,
         _ => ProviderKind::OpenAICompatible,
@@ -291,6 +292,8 @@ pub enum ProviderKind {
     #[serde(rename = "openAICompatible")]
     #[default]
     OpenAICompatible,
+    #[serde(rename = "opencodeGo")]
+    OpenCodeGo,
     #[serde(rename = "chatGPT")]
     ChatGPT,
     #[serde(rename = "codexAppServer")]

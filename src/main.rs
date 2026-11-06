@@ -997,10 +997,11 @@ impl PopChatApp {
                 let tx = self.events_tx.clone();
                 let ctx = ctx.clone();
                 self.runtime.spawn(async move {
-                    let result = match providers::fetch_models_list(
+                    let result = match providers::fetch_models_list_with_kind(
                         &provider.name,
                         &provider.base_url,
                         &key,
+                        provider.kind,
                     )
                     .await
                     {
@@ -1473,7 +1474,7 @@ impl PopChatApp {
             .iter()
             .position(|p| p.id == id)
             .ok_or("找不到此服務")?;
-        if self.providers.providers[index].kind == ProviderKind::OpenAICompatible {
+        if self.providers.providers[index].kind.uses_api_key() {
             validate_api_endpoint(&settings.base_url)?;
             if settings.model.trim().is_empty() {
                 return Err("請輸入或選擇模型名稱".to_owned());

@@ -44,6 +44,53 @@ impl ProviderConfig {
     pub const DEFAULT_MODEL: &'static str = "deepseek-chat";
 }
 
+/// Identify this application honestly; never impersonate a validated Go agent.
+pub(crate) const USER_AGENT: &str = concat!("PopChat-Windows/", env!("CARGO_PKG_VERSION"));
+
+fn is_opencode_endpoint(url: &reqwest::Url) -> bool {
+    url.host_str() == Some("opencode.ai")
+}
+
+pub(super) fn http_client_builder(kind: ProviderKind) -> reqwest::ClientBuilder {
+    let builder = reqwest::Client::builder().timeout(Duration::from_secs(300));
+    if kind != ProviderKind::OpenCodeGo {
+        return builder;
+    }
+    builder
+        .user_agent(USER_AGENT)
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 10 {
+                attempt.error("Too many redirects")
+            } else if attempt.previous().first().is_some_and(|original| {
+                is_opencode_endpoint(original) && original.origin() != attempt.url().origin()
+            }) {
+                // Do not forward a conversation identifier to a different
+                // origin, even if the provider redirects the inference request.
+                attempt.stop()
+            } else {
+                attempt.follow()
+            }
+        }))
+}
+
+fn completion_request(
+    client: &reqwest::Client,
+    url: reqwest::Url,
+    config: &ProviderConfig,
+    body: &serde_json::Value,
+    session_id: uuid::Uuid,
+) -> reqwest::RequestBuilder {
+    let opencode = config.kind == ProviderKind::OpenCodeGo && is_opencode_endpoint(&url);
+    let mut request = client.post(url).json(body);
+    if !config.api_key.is_empty() {
+        request = request.bearer_auth(&config.api_key);
+    }
+    if opencode {
+        request = request.header("x-opencode-session", session_id.to_string());
+    }
+    request
+}
+
 // MARK: - ChatStreamEvent
 
 /// Streaming events, pi-ai style. `activity` reports tool use for the
@@ -377,16 +424,28 @@ pub fn run(
 }
 
 pub fn run_with_mcp(
+    history: Vec<WireMessage>,
+    config: ProviderConfig,
+    web_access: Option<WebAccess>,
+    mcp: Option<super::mcp::McpTurn>,
+) -> mpsc::UnboundedReceiver<ChatStreamEvent> {
+    run_with_session(history, config, web_access, mcp, uuid::Uuid::new_v4())
+}
+
+/// Capture the owning conversation once, before spawning. All tool rounds and
+/// auxiliary compaction requests must use this same ID, not one ID per request.
+pub fn run_with_session(
     mut history: Vec<WireMessage>,
     config: ProviderConfig,
     web_access: Option<WebAccess>,
     mcp: Option<super::mcp::McpTurn>,
+    session_id: uuid::Uuid,
 ) -> mpsc::UnboundedReceiver<ChatStreamEvent> {
     if let Some(turn) = &mcp {
         turn.redact_history(&mut history);
     }
     let (tx, rx) = mpsc::unbounded_channel();
-    if config.kind != ProviderKind::OpenAICompatible {
+    if !config.kind.uses_api_key() {
         if let Some(backend) = delegated_backend() {
             return backend.start_with_mcp(history, config, web_access, mcp);
         }
@@ -410,7 +469,7 @@ pub fn run_with_mcp(
         tokio::select! {
             biased;
             _ = tx.closed() => {},
-            _ = run_loop(history, config, web_access, mcp, tx.clone()) => {},
+            _ = run_loop(history, config, web_access, mcp, session_id, tx.clone()) => {},
         }
     });
     rx
@@ -421,7 +480,29 @@ async fn run_loop(
     config: ProviderConfig,
     web_access: Option<WebAccess>,
     mcp: Option<super::mcp::McpTurn>,
+    session_id: uuid::Uuid,
     tx: mpsc::UnboundedSender<ChatStreamEvent>,
+) {
+    let client = match http_client_builder(config.kind).build() {
+        Ok(client) => client,
+        Err(error) => {
+            let _ = tx.send(ChatStreamEvent::Error(format!(
+                "Building request failed: {error}"
+            )));
+            return;
+        }
+    };
+    run_loop_with_client(history, config, web_access, mcp, session_id, tx, client).await;
+}
+
+pub(super) async fn run_loop_with_client(
+    history: Vec<WireMessage>,
+    config: ProviderConfig,
+    web_access: Option<WebAccess>,
+    mcp: Option<super::mcp::McpTurn>,
+    session_id: uuid::Uuid,
+    tx: mpsc::UnboundedSender<ChatStreamEvent>,
+    client: reqwest::Client,
 ) {
     let mut messages = history;
     let mut visible = String::new();
@@ -453,6 +534,8 @@ async fn run_loop(
         }
 
         let outcome = match stream_one_round(
+            &client,
+            session_id,
             &messages,
             &config,
             &web_access,
@@ -700,6 +783,8 @@ pub fn decode_delta(line: &str) -> Option<StreamDelta> {
 
 #[allow(clippy::too_many_arguments)]
 async fn stream_one_round(
+    client: &reqwest::Client,
+    session_id: uuid::Uuid,
     messages: &[WireMessage],
     config: &ProviderConfig,
     web_access: &Option<WebAccess>,
@@ -752,15 +837,7 @@ async fn stream_one_round(
         }
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(300))
-        .build()
-        .map_err(|e| ClientError::new(format!("Building request failed: {e}")))?;
-    let mut request = client.post(url).json(&body);
-    if !config.api_key.is_empty() {
-        request = request.header("Authorization", format!("Bearer {}", config.api_key));
-    }
-    let response = request
+    let response = completion_request(client, url, config, &body, session_id)
         .send()
         .await
         .map_err(|e| ClientError::new(format!("Request failed: {e}")))?;
@@ -1049,6 +1126,178 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
+    #[test]
+    fn opencode_session_header_is_scoped_to_the_exact_provider_host() {
+        let client = http_client_builder(ProviderKind::OpenCodeGo)
+            .build()
+            .unwrap();
+        let session = uuid::Uuid::new_v4();
+        for (endpoint, expected) in [
+            (
+                "https://opencode.ai/inference/go/openai/v1/chat/completions",
+                true,
+            ),
+            ("https://opencode.ai/zen/go/v1/chat/completions", true),
+            ("https://opencode.ai/zen/v1/chat/completions", true),
+            (
+                "https://opencode.ai.evil.example/v1/chat/completions",
+                false,
+            ),
+            (
+                "https://opencode.ai@evil.example/v1/chat/completions",
+                false,
+            ),
+            ("https://example.com/opencode.ai/chat/completions", false),
+            ("http://127.0.0.1:9000/v1/chat/completions", false),
+        ] {
+            let body = json!({"model":"fixture","messages":[]});
+            let request = completion_request(
+                &client,
+                endpoint.parse().unwrap(),
+                &opencode_config(endpoint.into()),
+                &body,
+                session,
+            )
+            .build()
+            .unwrap();
+            assert_eq!(
+                request
+                    .headers()
+                    .get("x-opencode-session")
+                    .map(|v| v.to_str().unwrap()),
+                expected.then(|| session.to_string()).as_deref()
+            );
+            assert!(
+                request
+                    .headers()
+                    .get_all("authorization")
+                    .iter()
+                    .any(|value| value.to_str().unwrap() == "Bearer offline-test-key"),
+                "configured bearer authentication must be preserved: {endpoint}"
+            );
+            assert_eq!(
+                serde_json::from_slice::<Value>(request.body().unwrap().as_bytes().unwrap())
+                    .unwrap(),
+                body,
+                "routing identity must not be inserted into the prompt"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn opencode_main_and_tool_rounds_keep_conversation_identity_across_concurrent_turns() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/inference/go/openai/v1/chat/completions"))
+            .respond_with(|request: &Request| {
+                if request.headers.get("x-opencode-session").is_none() {
+                    return ResponseTemplate::new(400)
+                        .set_body_json(json!({"error":{"type":"MissingSessionID"}}));
+                }
+                assert_eq!(request.headers["user-agent"], USER_AGENT);
+                let body: Value = request.body_json().unwrap();
+                let response = if body["messages"].as_array().unwrap().len() == 1 {
+                    tool_sse("unknown", json!({}))
+                } else {
+                    format!(
+                        "{}data: [DONE]\n\n",
+                        sse(json!({"content":"fixture answer"}))
+                    )
+                };
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(response)
+            })
+            .expect(6)
+            .mount(&server)
+            .await;
+        let http = http_client_builder(ProviderKind::OpenCodeGo)
+            .no_proxy()
+            .resolve("opencode.ai", *server.address())
+            .build()
+            .unwrap();
+        let owner = uuid::Uuid::new_v4();
+        let other = uuid::Uuid::new_v4();
+        let mut receivers = vec![];
+        for session in [owner, owner, other] {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let config = opencode_config(format!(
+                "http://opencode.ai:{}/inference/go/openai/v1",
+                server.address().port()
+            ));
+            tokio::spawn(run_loop_with_client(
+                history(),
+                config,
+                Some(WebAccess::LocalTools(SearchEngineConfig::duckduckgo())),
+                None,
+                session,
+                tx,
+                http.clone(),
+            ));
+            receivers.push(rx);
+        }
+        for events in futures::future::join_all(receivers.into_iter().map(collect)).await {
+            assert_eq!(
+                events.last(),
+                Some(&ChatStreamEvent::Done("fixture answer".into()))
+            );
+        }
+        let requests = server.received_requests().await.unwrap();
+        let sessions = requests
+            .iter()
+            .map(|r| r.headers["x-opencode-session"].to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sessions
+                .iter()
+                .filter(|id| **id == owner.to_string())
+                .count(),
+            4
+        );
+        assert_eq!(
+            sessions
+                .iter()
+                .filter(|id| **id == other.to_string())
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn opencode_session_is_not_forwarded_to_another_origin_on_redirect() {
+        let source = MockServer::start().await;
+        let destination = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("location", format!("{}/other", destination.uri())),
+            )
+            .expect(1)
+            .mount(&source)
+            .await;
+        let http = http_client_builder(ProviderKind::OpenCodeGo)
+            .no_proxy()
+            .resolve("opencode.ai", *source.address())
+            .build()
+            .unwrap();
+        let endpoint = format!(
+            "http://opencode.ai:{}/chat/completions",
+            source.address().port()
+        );
+        let response = completion_request(
+            &http,
+            endpoint.parse().unwrap(),
+            &opencode_config(endpoint.clone()),
+            &json!({}),
+            uuid::Uuid::new_v4(),
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        assert!(destination.received_requests().await.unwrap().is_empty());
+    }
+
     fn config(base_url: String) -> ProviderConfig {
         ProviderConfig {
             base_url,
@@ -1057,6 +1306,52 @@ mod tests {
             reasoning_effort: Some("high".into()),
             kind: ProviderKind::OpenAICompatible,
         }
+    }
+
+    fn opencode_config(base_url: String) -> ProviderConfig {
+        let mut config = config(base_url);
+        config.kind = ProviderKind::OpenCodeGo;
+        config
+    }
+
+    #[tokio::test]
+    async fn existing_generic_opencode_endpoint_keeps_its_original_headers() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(|request: &Request| {
+                assert!(!request.headers.contains_key("x-opencode-session"));
+                assert!(!request.headers.contains_key("user-agent"));
+                ResponseTemplate::new(200).set_body_string(format!(
+                    "{}data: [DONE]\n\n",
+                    sse(json!({"content":"unchanged"}))
+                ))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        let http = http_client_builder(ProviderKind::OpenAICompatible)
+            .no_proxy()
+            .resolve("opencode.ai", *server.address())
+            .build()
+            .unwrap();
+        let config = config(format!(
+            "http://opencode.ai:{}/inference/go/openai/v1",
+            server.address().port()
+        ));
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_loop_with_client(
+            history(),
+            config,
+            None,
+            None,
+            uuid::Uuid::new_v4(),
+            tx,
+            http,
+        ));
+        assert_eq!(
+            collect(rx).await.last(),
+            Some(&ChatStreamEvent::Done("unchanged".into()))
+        );
     }
 
     fn history() -> Vec<WireMessage> {
@@ -1155,6 +1450,8 @@ mod tests {
             ))
         );
         let requests = server.received_requests().await.unwrap();
+        assert!(requests.iter().all(|request|!request.headers.contains_key("x-opencode-session")),
+            "ordinary model endpoints and fetched pages must not receive the provider-specific identity");
         let bodies: Vec<Value> = requests
             .iter()
             .filter(|r| r.method == "POST")

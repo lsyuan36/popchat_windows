@@ -1,4 +1,10 @@
-# MCP Client（0.2.8）
+# MCP Client（0.2.9）
+
+## 0.2.9：獨立 Opencode Go Provider
+
+Go 類型為每個對話提供穩定路由識別，工具回合與 Auto Compact 摘要／恢復沿用同一個 ID。
+專用標頭不套用既有 Provider，不搬移金鑰、不自動切換服務；MCP 啟用、逐次授權與自訂 system prompt 不變。
+完整本機回歸 693 項通過、3 項忽略，無 warning；僅用隔離 mock 與 loopback，不連線真實 Go 推論服務。
 
 ## 0.2.8：設定頁捲動修正
 

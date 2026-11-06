@@ -32,6 +32,8 @@ use crate::chat::store::{app_data_dir, SecretStore};
 pub enum ProviderKind {
     #[serde(rename = "openAICompatible")]
     OpenAICompatible,
+    #[serde(rename = "opencodeGo")]
+    OpenCodeGo,
     #[serde(rename = "chatGPT")]
     ChatGPT,
     #[serde(rename = "codexAppServer")]
@@ -45,11 +47,16 @@ impl Default for ProviderKind {
 }
 
 impl ProviderKind {
-    /// Raw-wire mapping (`openAICompatible` / `chatGPT` / `codexAppServer`).
+    pub fn uses_api_key(self) -> bool {
+        matches!(self, Self::OpenAICompatible | Self::OpenCodeGo)
+    }
+
+    /// Raw-wire mapping, including the opt-in `opencodeGo` transport.
     /// Unknown strings map to `None` and the caller falls back — see below.
     pub fn from_raw(raw: &str) -> Option<ProviderKind> {
         match raw {
             "openAICompatible" => Some(ProviderKind::OpenAICompatible),
+            "opencodeGo" => Some(ProviderKind::OpenCodeGo),
             "chatGPT" => Some(ProviderKind::ChatGPT),
             "codexAppServer" => Some(ProviderKind::CodexAppServer),
             _ => None,
@@ -59,6 +66,7 @@ impl ProviderKind {
     pub fn as_raw(self) -> &'static str {
         match self {
             ProviderKind::OpenAICompatible => "openAICompatible",
+            ProviderKind::OpenCodeGo => "opencodeGo",
             ProviderKind::ChatGPT => "chatGPT",
             ProviderKind::CodexAppServer => "codexAppServer",
         }
@@ -280,7 +288,7 @@ pub fn kind_default_capabilities(
                 files: Some(false),
             }
         }
-        ProviderKind::OpenAICompatible => {
+        ProviderKind::OpenAICompatible | ProviderKind::OpenCodeGo => {
             if provider.is_preset && provider.base_url.contains("api.openai.com") {
                 AttachmentCapabilities {
                     images: Some(true),
@@ -372,6 +380,20 @@ fn models_url(base_url: &str) -> String {
     format!("{}/models", base_url.trim_end_matches('/'))
 }
 
+fn models_url_for_kind(base_url: &str, kind: ProviderKind) -> String {
+    if kind == ProviderKind::OpenCodeGo {
+        if let Ok(mut url) = reqwest::Url::parse(base_url) {
+            if url.host_str() == Some("opencode.ai")
+                && url.path().trim_end_matches('/') == "/inference/go/openai/v1"
+            {
+                url.set_path("/inference/go/v1/models");
+                return url.into();
+            }
+        }
+    }
+    models_url(base_url)
+}
+
 /// `GET {baseURL}/models` with `Authorization: Bearer` when a key is set.
 /// Returns `(sorted ids, list-stated capabilities)` or a user-facing message.
 pub async fn fetch_models_list(
@@ -379,14 +401,32 @@ pub async fn fetch_models_list(
     base_url: &str,
     api_key: &str,
 ) -> Result<(Vec<String>, HashMap<String, ModelCapabilities>), String> {
+    fetch_models_list_with_kind(
+        provider_name,
+        base_url,
+        api_key,
+        ProviderKind::OpenAICompatible,
+    )
+    .await
+}
+
+pub async fn fetch_models_list_with_kind(
+    provider_name: &str,
+    base_url: &str,
+    api_key: &str,
+    kind: ProviderKind,
+) -> Result<(Vec<String>, HashMap<String, ModelCapabilities>), String> {
     if base_url.trim().is_empty() {
         return Err(format!("Add a base URL for {provider_name} first."));
     }
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(20));
+    if kind == ProviderKind::OpenCodeGo {
+        builder = builder.user_agent(super::client::USER_AGENT);
+    }
+    let client = builder
         .build()
         .map_err(|e| format!("Fetching models failed: {e}"))?;
-    let mut request = client.get(models_url(base_url));
+    let mut request = client.get(models_url_for_kind(base_url, kind));
     if !api_key.is_empty() {
         request = request.header("Authorization", format!("Bearer {api_key}"));
     }
@@ -771,6 +811,11 @@ impl ProviderStore {
             provider.name = Self::CHATGPT_PROVIDER_NAME.to_string();
         }
 
+        // Do not reinterpret an existing custom endpoint or copy its key.
+        if !migrated.iter().any(|p| p.kind == ProviderKind::OpenCodeGo) {
+            migrated.push(Self::opencode_go_preset());
+        }
+
         // A stale selection must not hide an otherwise intact catalog.
         let selected_id = selected_id.filter(|id| migrated.iter().any(|p| p.id == *id));
         let mut store = ProviderStore {
@@ -921,7 +966,23 @@ impl ProviderStore {
                 ProviderKind::OpenAICompatible,
                 None,
             ),
+            Self::opencode_go_preset(),
         ]
+    }
+
+    pub const OPENCODE_GO_NAME: &'static str = "Opencode Go";
+    pub const OPENCODE_GO_BASE_URL: &'static str = "https://opencode.ai/inference/go/openai/v1";
+
+    pub fn opencode_go_preset() -> Provider {
+        Provider::new(
+            Uuid::new_v4(),
+            Self::OPENCODE_GO_NAME,
+            Self::OPENCODE_GO_BASE_URL,
+            true,
+            "",
+            ProviderKind::OpenCodeGo,
+            None,
+        )
     }
 
     fn retired_preset_names() -> &'static [&'static str] {
@@ -1557,7 +1618,9 @@ impl ProviderStore {
         self.fetching_providers.insert(id);
         self.model_fetch_errors.remove(&id);
 
-        let result = fetch_models_list(&provider.name, &provider.base_url, api_key).await;
+        let result =
+            fetch_models_list_with_kind(&provider.name, &provider.base_url, api_key, provider.kind)
+                .await;
         self.fetching_providers.remove(&id);
         match result {
             Ok((ids, mut capabilities)) => {
@@ -1593,6 +1656,153 @@ impl ProviderStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opencode_go_is_added_once_without_changing_existing_provider_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("providers.json");
+        let mut original = ProviderStore::load_at(path.clone(), |_| None);
+        original
+            .providers
+            .retain(|p| p.kind != ProviderKind::OpenCodeGo);
+        let legacy = Provider::new(
+            Uuid::new_v4(),
+            "Opencode Go",
+            ProviderStore::OPENCODE_GO_BASE_URL,
+            false,
+            "saved-model",
+            ProviderKind::OpenAICompatible,
+            None,
+        );
+        let owner = legacy.id;
+        original.providers.push(legacy.clone());
+        original.selected_id = owner;
+        original.selected_models.insert(owner, "my-model".into());
+        original.settings_models.insert(owner, "draft-model".into());
+        original
+            .known_models
+            .insert(owner, vec!["cached-model".into()]);
+        original
+            .set_context_limit(owner, "my-model", Some(123456))
+            .unwrap();
+        original.try_save().unwrap();
+        let before: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let migrated = ProviderStore::load_at(path.clone(), |_| None);
+        assert_eq!(migrated.selected_id, owner);
+        assert_eq!(
+            migrated.providers.iter().find(|p| p.id == owner),
+            Some(&legacy)
+        );
+        let go = migrated
+            .providers
+            .iter()
+            .find(|p| p.kind == ProviderKind::OpenCodeGo)
+            .unwrap();
+        assert_ne!(go.id, owner);
+        assert_eq!(go.name, "Opencode Go");
+        assert!(go.default_model.is_empty());
+        assert!(!migrated.selected_models.contains_key(&go.id));
+        let go_id = go.id;
+        let mut after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        after["providers"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|p| p["kind"] != "opencodeGo");
+        assert_eq!(
+            after, before,
+            "all existing catalog values must stay unchanged"
+        );
+        let again = ProviderStore::load_at(path, |_| None);
+        assert_eq!(again.selected_id, owner);
+        let gos = again
+            .providers
+            .iter()
+            .filter(|p| p.kind == ProviderKind::OpenCodeGo)
+            .collect::<Vec<_>>();
+        assert_eq!(gos.len(), 1);
+        assert_eq!(gos[0].id, go_id);
+        assert_eq!(
+            ProviderKind::from_raw("opencodeGo"),
+            Some(ProviderKind::OpenCodeGo)
+        );
+        assert_eq!(
+            serde_json::to_string(&ProviderKind::OpenCodeGo).unwrap(),
+            "\"opencodeGo\""
+        );
+    }
+
+    #[test]
+    fn opencode_go_uses_its_documented_catalog_without_changing_generic_models_urls() {
+        assert_eq!(
+            models_url_for_kind(
+                ProviderStore::OPENCODE_GO_BASE_URL,
+                ProviderKind::OpenCodeGo
+            ),
+            "https://opencode.ai/inference/go/v1/models"
+        );
+        assert_eq!(
+            models_url_for_kind(
+                ProviderStore::OPENCODE_GO_BASE_URL,
+                ProviderKind::OpenAICompatible
+            ),
+            "https://opencode.ai/inference/go/openai/v1/models"
+        );
+        assert_eq!(
+            models_url_for_kind("https://proxy.example/v1", ProviderKind::OpenCodeGo),
+            "https://proxy.example/v1/models"
+        );
+    }
+
+    #[tokio::test]
+    async fn opencode_go_models_user_agent_is_opt_in_and_never_sends_a_conversation_header() {
+        use wiremock::{
+            matchers::{method, path},
+            Mock, MockServer, ResponseTemplate,
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"data":[{"id":"fixture"}]})),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        fetch_models_list_with_kind(
+            "Opencode Go",
+            &server.uri(),
+            "fixture-key",
+            ProviderKind::OpenAICompatible,
+        )
+        .await
+        .unwrap();
+        fetch_models_list_with_kind(
+            "Independent provider",
+            &server.uri(),
+            "fixture-key",
+            ProviderKind::OpenCodeGo,
+        )
+        .await
+        .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            !requests[0].headers.contains_key("user-agent"),
+            "an existing generic provider must stay unchanged"
+        );
+        assert_eq!(
+            requests[1].headers["user-agent"],
+            super::super::client::USER_AGENT
+        );
+        assert!(requests
+            .iter()
+            .all(|r| !r.headers.contains_key("x-opencode-session")));
+        assert!(requests
+            .iter()
+            .all(|r| r.headers["authorization"] == "Bearer fixture-key"));
+    }
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 

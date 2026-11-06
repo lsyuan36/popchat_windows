@@ -40,10 +40,20 @@ pub struct ContextState {
 
 #[derive(Debug, Clone)]
 pub struct ContextRequest {
+    /// Owning transcript identity, independent of the provider and summary.
+    pub conversation_id: Uuid,
     pub limit: u32,
     pub provider_id: Uuid,
     pub state: ContextState,
 }
+
+type StartTurn = fn(
+    Vec<WireMessage>,
+    ProviderConfig,
+    Option<WebAccess>,
+    Option<super::mcp::McpTurn>,
+    Uuid,
+) -> mpsc::UnboundedReceiver<ChatStreamEvent>;
 
 pub fn fingerprint(messages: &[WireMessage]) -> String {
     let data = serde_json::to_vec(messages).expect("wire messages are serializable");
@@ -195,6 +205,7 @@ async fn summarize(
     request: &ContextRequest,
     budget: u64,
     tx: &mpsc::UnboundedSender<ChatStreamEvent>,
+    start_turn: StartTurn,
 ) -> Result<Checkpoint, String> {
     if budget < 1_024 {
         return Err("上下文上限太小，無法安全產生摘要；請提高此模型的上限。".into());
@@ -275,7 +286,7 @@ async fn summarize(
         let _ = tx.send(ChatStreamEvent::Status(
             "正在壓縮舊上下文，原始聊天紀錄會完整保留…".into(),
         ));
-        let mut stream = client::run(prompt, config.clone(), None);
+        let mut stream = start_turn(prompt, config.clone(), None, None, request.conversation_id);
         let result = tokio::time::timeout(std::time::Duration::from_secs(180), async {
             let mut confirmed = false;
             while let Some(event) = stream.recv().await {
@@ -360,7 +371,7 @@ pub fn run_with_mcp(
         tokio::select! {
             biased;
             _ = tx.closed() => {},
-            _ = run_inner(history, config, web_access, request, mcp, &tx) => {},
+            _ = run_inner(history, config, web_access, request, mcp, &tx, client::run_with_session) => {},
         }
     });
     rx
@@ -373,6 +384,7 @@ async fn run_inner(
     mut request: ContextRequest,
     mcp: Option<super::mcp::McpTurn>,
     tx: &mpsc::UnboundedSender<ChatStreamEvent>,
+    start_turn: StartTurn,
 ) {
     // Codex app-server manages native context/tool state; do not invoke a
     // separate client-side summarizer with coding-agent permissions.
@@ -389,7 +401,7 @@ async fn run_inner(
     for attempt in 0..2 {
         let mut outgoing = rebuild(&history, &request.state);
         if attempt > 0 || predicted(&outgoing, &request, &config.model) >= budget {
-            match summarize(&history, &config, &request, budget, tx).await {
+            match summarize(&history, &config, &request, budget, tx, start_turn).await {
                 Ok(cp) => {
                     let before = estimate(&outgoing);
                     let mut next = request.state.clone();
@@ -413,11 +425,12 @@ async fn run_inner(
                 }
             }
         }
-        let mut stream = client::run_with_mcp(
+        let mut stream = start_turn(
             outgoing.clone(),
             config.clone(),
             web_access.clone(),
             mcp.clone(),
+            request.conversation_id,
         );
         let mut side_effects = false;
         let mut retry = false;
@@ -527,9 +540,104 @@ mod tests {
 
     fn request(limit: u32) -> ContextRequest {
         ContextRequest {
+            conversation_id: Uuid::new_v4(),
             limit,
             provider_id: Uuid::new_v4(),
             state: ContextState::default(),
+        }
+    }
+
+    /// All traffic is pinned to the mock's loopback port; never resolve or
+    /// contact the real provider and never use the user's credentials.
+    fn local_opencode_turn(
+        history: Vec<WireMessage>,
+        config: ProviderConfig,
+        web: Option<WebAccess>,
+        mcp: Option<super::super::mcp::McpTurn>,
+        session: Uuid,
+    ) -> mpsc::UnboundedReceiver<ChatStreamEvent> {
+        let port = reqwest::Url::parse(&config.base_url)
+            .unwrap()
+            .port()
+            .unwrap();
+        let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let http = client::http_client_builder(ProviderKind::OpenCodeGo)
+            .no_proxy()
+            .resolve("opencode.ai", address)
+            .build()
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(client::run_loop_with_client(
+            history, config, web, mcp, session, tx, http,
+        ));
+        rx
+    }
+
+    #[tokio::test]
+    async fn opencode_overflow_summary_and_answer_keep_the_owning_conversation_header() {
+        let server = MockServer::start().await;
+        let answers = Arc::new(AtomicUsize::new(0));
+        let count = answers.clone();
+        Mock::given(method("POST"))
+            .respond_with(move |request: &Request| {
+                assert_eq!(request.headers["user-agent"], client::USER_AGENT);
+                let body: serde_json::Value = request.body_json().unwrap();
+                if is_summary(&body) {
+                    assert!(body.get("tools").is_none());
+                    return sse("Short checkpoint of old project facts.");
+                }
+                if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(400)
+                        .set_body_json(json!({"error":{"code":"context_length_exceeded"}}))
+                } else {
+                    sse("recovered")
+                }
+            })
+            .mount(&server)
+            .await;
+        let mut config = config(&server);
+        config.kind = ProviderKind::OpenCodeGo;
+        config.base_url = format!(
+            "http://opencode.ai:{}/inference/go/openai/v1",
+            server.address().port()
+        );
+        let request = request(1_000_000);
+        let owner = request.conversation_id;
+        assert_ne!(
+            owner, request.provider_id,
+            "routing identity is the conversation, not the service"
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            run_inner(
+                history(),
+                config,
+                None,
+                request,
+                None,
+                &tx,
+                local_opencode_turn,
+            )
+            .await
+        });
+        let events = collect(&mut rx).await;
+        assert_eq!(
+            events.last(),
+            Some(&ChatStreamEvent::Done("recovered".into()))
+        );
+        assert_eq!(answers.load(Ordering::SeqCst), 2);
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests.len() >= 3,
+            "one initial answer, at least one summary and a recovered answer"
+        );
+        assert!(requests.iter().any(|r| is_summary(&r.body_json().unwrap())));
+        for request in requests {
+            assert_eq!(
+                request.headers["x-opencode-session"].to_str().unwrap(),
+                owner.to_string()
+            );
+            assert_eq!(request.headers["user-agent"], client::USER_AGENT);
         }
     }
 
