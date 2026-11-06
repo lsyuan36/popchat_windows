@@ -172,6 +172,9 @@ pub struct ChatMessage {
     /// conversations written before this existed still decode.
     #[serde(default)]
     pub reasoning: Option<String>,
+    /// Optional UI-only lifecycle metadata; old transcripts remain readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<super::activity::ToolActivity>,
 }
 
 impl ChatMessage {
@@ -183,6 +186,7 @@ impl ChatMessage {
             wire_text: None,
             attachments: Vec::new(),
             reasoning: None,
+            activity: None,
         }
     }
 }
@@ -970,6 +974,9 @@ impl ChatStore {
                     None => self.messages.push(row),
                 }
             }
+            ChatStreamEvent::ToolActivity(activity) => {
+                self.upsert_activity(turn.assistant_id, activity)
+            }
             ChatStreamEvent::Error(message) => {
                 let row = ChatMessage::new(ChatRole::Error, message);
                 // The rejection wasn't attributable, but the request carried
@@ -1012,6 +1019,27 @@ impl ChatStore {
         }
     }
 
+    fn upsert_activity(&mut self, owner: Uuid, mut activity: super::activity::ToolActivity) {
+        activity.owner = Some(owner);
+        if let Some(row) = self.messages.iter_mut().find(|m| {
+            m.role == ChatRole::Activity
+                && m.activity
+                    .as_ref()
+                    .is_some_and(|a| a.owner == Some(owner) && a.id == activity.id)
+        }) {
+            // A delayed lifecycle update must not resurrect a cancelled row.
+            if row.activity.as_ref().is_some_and(|a| !a.state.is_pending()) {
+                return;
+            }
+            row.text = activity.label.clone();
+            row.activity = Some(activity);
+        } else if let Some(index) = self.messages.iter().position(|m| m.id == owner) {
+            let mut row = ChatMessage::new(ChatRole::Activity, activity.label.clone());
+            row.activity = Some(activity);
+            self.messages.insert(index, row);
+        }
+    }
+
     fn accept_arrived_text(&mut self, message_id: Uuid, text: &str) {
         self.stream_target = text.to_owned();
         if self.reveal_drain.is_none() {
@@ -1033,6 +1061,10 @@ impl ChatStore {
     /// reveal may still be animating), commits the arrived text + thinking
     /// onto the assistant row by id, and persists.
     pub fn finish_turn(&mut self, turn: &ActiveTurn) {
+        self.settle_activities(
+            turn.assistant_id,
+            super::activity::ActivityState::Interrupted,
+        );
         // "Still ours": flush_reveal() clears streaming_message_id when a
         // new turn takes over mid-reveal.
         let still_ours = self.streaming_message_id == Some(turn.assistant_id);
@@ -1094,7 +1126,20 @@ impl ChatStore {
         // not keep pulsing after the user said stop.
         self.pending_status = None;
         self.pending_reasoning = None;
+        if let Some(owner) = self.streaming_message_id {
+            self.settle_activities(owner, super::activity::ActivityState::Cancelled);
+        }
         self.flush_reveal();
+    }
+
+    fn settle_activities(&mut self, owner: Uuid, state: super::activity::ActivityState) {
+        for row in &mut self.messages {
+            if let Some(activity) = row.activity.as_mut().filter(|a| a.owner == Some(owner)) {
+                if activity.state.is_pending() {
+                    activity.state = state;
+                }
+            }
+        }
     }
 
     /// The complete text of a message: for the row still revealing,
@@ -2866,6 +2911,89 @@ mod tests {
             streaming_mode: mode,
             reveal_drain: Some(RevealDrain::new(id, mode, std::time::Instant::now())),
         }
+    }
+
+    #[test]
+    fn activity_lifecycle_upserts_by_call_and_owner_and_stop_cannot_be_resurrected() {
+        use super::super::activity::{ActivityKind, ActivityState, ToolActivity};
+        let mut store = reveal_store(StreamingMode::PerCharacter, "answer");
+        let owner = store.messages[0].id;
+        let mut activity = ToolActivity::new(ActivityKind::McpTool, "MCP／Synthetic／Read");
+        store.upsert_activity(owner, activity.clone());
+        let row_id = store.messages[0].id;
+        activity.state = ActivityState::WaitingApproval;
+        store.upsert_activity(owner, activity.clone());
+        assert_eq!(store.messages.len(), 2);
+        assert_eq!(store.messages[0].id, row_id);
+        assert_eq!(
+            store.messages[0].activity.as_ref().unwrap().state,
+            ActivityState::WaitingApproval
+        );
+        assert_eq!(store.messages[1].id, owner);
+        let next = ChatMessage::new(ChatRole::Assistant, "next answer");
+        let next_owner = next.id;
+        store.messages.push(next);
+        store.upsert_activity(next_owner, activity.clone());
+        assert_eq!(
+            store.messages.len(),
+            4,
+            "same call id in another turn is independent"
+        );
+        store.stop();
+        assert_eq!(
+            store.messages[0].activity.as_ref().unwrap().state,
+            ActivityState::Cancelled
+        );
+        assert_eq!(
+            store.messages[2].activity.as_ref().unwrap().state,
+            ActivityState::WaitingApproval
+        );
+        activity.state = ActivityState::Succeeded;
+        store.upsert_activity(owner, activity.clone());
+        assert_eq!(
+            store.messages[0].activity.as_ref().unwrap().state,
+            ActivityState::Cancelled
+        );
+        store.upsert_activity(next_owner, activity);
+        assert_eq!(
+            store.messages[2].activity.as_ref().unwrap().state,
+            ActivityState::Succeeded
+        );
+        store.settle_activities(next_owner, ActivityState::Interrupted);
+        assert_eq!(
+            store.messages[2].activity.as_ref().unwrap().state,
+            ActivityState::Succeeded
+        );
+        let wire = history_for_wire(&store.messages, "sys", &caps_all());
+        assert_eq!(wire.len(), 3);
+        assert!(!serde_json::to_string(&wire).unwrap().contains("Synthetic"));
+    }
+
+    #[test]
+    fn activity_metadata_round_trips_in_both_history_formats_without_migrating_old_rows() {
+        use super::super::activity::ToolActivity;
+        let old = serde_json::json!({"id":Uuid::new_v4(),"role":"activity","text":"Searching: old query"});
+        let legacy: ChatMessage = serde_json::from_value(old.clone()).unwrap();
+        assert!(legacy.activity.is_none());
+        assert_eq!(legacy.text, "Searching: old query");
+        assert!(
+            serde_json::from_value::<crate::persistence::ChatMessage>(old)
+                .unwrap()
+                .activity
+                .is_none()
+        );
+        let mut activity = ToolActivity::web("web_search", r#"{"query":"fixture"}"#);
+        activity.finish("ERROR: HTTP 202: <!DOCTYPE html>synthetic-token");
+        let mut message = ChatMessage::new(ChatRole::Activity, &activity.label);
+        message.activity = Some(activity);
+        let json = serde_json::to_value(&message).unwrap();
+        let independent: crate::persistence::ChatMessage = serde_json::from_value(json).unwrap();
+        let decoded: ChatMessage =
+            serde_json::from_value(serde_json::to_value(independent).unwrap()).unwrap();
+        assert_eq!(decoded, message);
+        let json = serde_json::to_string(&decoded).unwrap();
+        assert!(!json.contains("DOCTYPE"));
+        assert!(!json.contains("synthetic-token"));
     }
 
     #[test]

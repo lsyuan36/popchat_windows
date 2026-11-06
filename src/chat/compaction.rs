@@ -306,7 +306,7 @@ async fn summarize(
                             "摘要模型請求失敗；原始歷史已保留，未送出正式回答請求。".to_string()
                         )
                     }
-                    ChatStreamEvent::Activity(_) => {
+                    ChatStreamEvent::Activity(_) | ChatStreamEvent::ToolActivity(_) => {
                         return Err("摘要意外要求工具；已停止，原始歷史已保留。".to_string())
                     }
                     _ => {}
@@ -462,7 +462,10 @@ async fn run_inner(
                 }
                 other => {
                     if matches!(&other, ChatStreamEvent::Partial(s) | ChatStreamEvent::Reasoning(s) if !s.is_empty())
-                        || matches!(&other, ChatStreamEvent::Activity(_))
+                        || matches!(
+                            &other,
+                            ChatStreamEvent::Activity(_) | ChatStreamEvent::ToolActivity(_)
+                        )
                     {
                         side_effects = true;
                     }

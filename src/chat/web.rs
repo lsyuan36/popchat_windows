@@ -10,6 +10,10 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -82,7 +86,30 @@ pub struct WebToolExecutor {
     engine: SearchEngineConfig,
     http: reqwest::Client,
     endpoints: SearchEndpoints,
+    search_guard: SearchFailureGuard,
 }
+
+/// Per-turn circuit breaker; never changes preferences, engines or credentials.
+#[derive(Debug, Clone, Default)]
+pub(super) struct SearchFailureGuard(Arc<AtomicUsize>);
+
+impl SearchFailureGuard {
+    pub fn blocked(&self, name: &str) -> bool {
+        name == "web_search" && self.0.load(Ordering::Relaxed) >= 2
+    }
+
+    pub fn observe(&self, name: &str, result: &str) {
+        if name == "web_search" {
+            if result.starts_with("ERROR: HTTP 202:") || result.starts_with("ERROR: HTTP 429:") {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            } else if !result.starts_with("ERROR: SEARCH_PAUSED:") {
+                self.0.store(0, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+pub(super) const SEARCH_PAUSED: &str = "ERROR: SEARCH_PAUSED: repeated HTTP 202/429; this search backend is paused for this turn. No request was sent. Do not call web_search again this turn; finish with available information and explain the search limitation. Do not switch services or bypass verification.";
 
 impl WebToolExecutor {
     pub fn new(engine: SearchEngineConfig) -> anyhow::Result<Self> {
@@ -94,6 +121,7 @@ impl WebToolExecutor {
             engine,
             http,
             endpoints: SearchEndpoints::default(),
+            search_guard: SearchFailureGuard::default(),
         })
     }
 
@@ -114,6 +142,9 @@ impl WebToolExecutor {
     }
 
     pub async fn execute(&self, name: &str, arguments_json: &str) -> String {
+        if self.search_guard.blocked(name) {
+            return SEARCH_PAUSED.into();
+        }
         let args = decode_arguments(arguments_json);
         let result = match name {
             "web_search" => match args.get("query").filter(|q| !q.is_empty()) {
@@ -126,7 +157,23 @@ impl WebToolExecutor {
             },
             _ => return format!("ERROR: unknown tool {name}"),
         };
-        result.unwrap_or_else(|e| format!("ERROR: {e:#}"))
+        let result = result.unwrap_or_else(|e| format!("ERROR: {e:#}"));
+        self.search_guard.observe(name, &result);
+        result
+    }
+
+    pub async fn execute_tracked(
+        &self,
+        name: &str,
+        arguments: &str,
+        mut emit: impl FnMut(ChatStreamEvent),
+    ) -> String {
+        let mut activity = super::activity::ToolActivity::web(name, arguments);
+        emit(ChatStreamEvent::ToolActivity(activity.clone()));
+        let result = self.execute(name, arguments).await;
+        activity.finish(&result);
+        emit(ChatStreamEvent::ToolActivity(activity));
+        result
     }
 
     pub async fn web_search(&self, query: &str) -> anyhow::Result<String> {
@@ -275,14 +322,16 @@ impl WebToolExecutor {
 
 async fn check_http(response: reqwest::Response) -> anyhow::Result<String> {
     let status = response.status();
+    // A search challenge can be a 2xx HTML page, not a completed result.
+    // Never echo remote error bodies (HTML, tokens or arbitrary instructions)
+    // into the activity transcript or the model's tool result.
+    if status != reqwest::StatusCode::OK {
+        return Err(anyhow::anyhow!("HTTP {}: response was not a usable result; do not repeatedly retry this backend in this turn", status.as_u16()));
+    }
     let bytes = response
         .bytes()
         .await
         .context("couldn't read the web response")?;
-    if status != reqwest::StatusCode::OK {
-        let preview = String::from_utf8_lossy(&bytes[..bytes.len().min(200)]);
-        return Err(anyhow::anyhow!("HTTP {}: {preview}", status.as_u16()));
-    }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
@@ -297,15 +346,6 @@ fn decode_arguments(json: &str) -> std::collections::HashMap<String, String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// Swift trims `.whitespaces`, not `.whitespacesAndNewlines`, for warnings.
-pub(super) fn tool_error_detail(result: &str) -> Option<&str> {
-    result.strip_prefix("ERROR:").map(|detail| {
-        detail.trim_matches(|c: char| {
-            c.is_whitespace() && !matches!(c, '\n' | '\r' | '\u{85}' | '\u{2028}' | '\u{2029}')
-        })
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -649,17 +689,9 @@ pub async fn run_with_tools<D: RoundDriver>(
         // Model requested tools: echo its output items back, then the results.
         input.extend(outcome.round_items);
         for call in &outcome.tool_calls {
-            on_event(ChatStreamEvent::Activity(WebToolExecutor::activity_label(
-                &call.name,
-                &call.arguments,
-            )));
-            let result = executor.execute(&call.name, &call.arguments).await;
-            if let Some(detail) = tool_error_detail(&result) {
-                on_event(ChatStreamEvent::Activity(format!(
-                    "⚠︎ {} failed: {}",
-                    call.name, detail
-                )));
-            }
+            let result = executor
+                .execute_tracked(&call.name, &call.arguments, &mut on_event)
+                .await;
             input.push(json!({
                 "type": "function_call_output",
                 "call_id": call.call_id,
@@ -830,6 +862,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_202_html_is_private_lifecycle_updates_and_repeated_failures_pause_only_this_turn(
+    ) {
+        use super::super::activity::ActivityState;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/challenge"))
+            .respond_with(
+                ResponseTemplate::new(202)
+                    .set_body_string("<!DOCTYPE html>\n<head>synthetic-private-token</head>"),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/page"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<p>Page still available</p>"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut executor = WebToolExecutor::new(SearchEngineConfig::DuckDuckGo).unwrap();
+        executor.endpoints.duckduckgo = format!("{}/challenge", server.uri());
+        let mut events = vec![];
+        for query in ["first", "rephrased", "third", "fourth"] {
+            let result = executor
+                .execute_tracked("web_search", &json!({"query":query}).to_string(), |e| {
+                    events.push(e)
+                })
+                .await;
+            assert!(result.starts_with("ERROR:"));
+            assert!(!result.contains("DOCTYPE"));
+            assert!(!result.contains("synthetic-private-token"));
+        }
+        assert_eq!(events.len(), 8);
+        for pair in events.chunks_exact(2) {
+            let (ChatStreamEvent::ToolActivity(start), ChatStreamEvent::ToolActivity(end)) =
+                (&pair[0], &pair[1])
+            else {
+                panic!("expected lifecycle")
+            };
+            assert_eq!(start.id, end.id);
+            assert_eq!(start.state, ActivityState::Running);
+            assert_eq!(end.state, ActivityState::Failed);
+            assert!(!end.detail.as_deref().unwrap().contains('<'));
+        }
+        assert!(
+            matches!(&events[5], ChatStreamEvent::ToolActivity(a) if a.detail.as_deref().unwrap().contains("未再送出請求"))
+        );
+        let page = executor
+            .execute(
+                "fetch_url",
+                &json!({"url":format!("{}/page",server.uri())}).to_string(),
+            )
+            .await;
+        assert_eq!(page, "Page still available");
+        assert!(executor.search_guard.blocked("web_search"));
+        assert!(!WebToolExecutor::new(SearchEngineConfig::DuckDuckGo)
+            .unwrap()
+            .search_guard
+            .blocked("web_search"));
+        server.verify().await;
+    }
+
+    #[test]
+    fn search_pause_requires_consecutive_backend_failures_and_adapter_preserves_it() {
+        let adapter = super::super::client::WebToolExecutor::new(
+            super::super::client::SearchEngineConfig::duckduckgo(),
+        );
+        adapter
+            .search_guard
+            .observe("web_search", "ERROR: HTTP 429: limited");
+        assert!(!adapter.search_guard.blocked("web_search"));
+        adapter
+            .search_guard
+            .observe("web_search", "1. A valid result");
+        adapter
+            .search_guard
+            .observe("web_search", "ERROR: HTTP 202: unavailable");
+        assert!(!adapter.search_guard.blocked("web_search"));
+        adapter
+            .search_guard
+            .observe("web_search", "ERROR: HTTP 429: unavailable");
+        assert!(adapter.clone().search_guard.blocked("web_search"));
+        assert!(!adapter.search_guard.blocked("fetch_url"));
+    }
+
+    #[tokio::test]
     async fn fetch_counts_non_ascii_characters_not_utf8_bytes() {
         let server = MockServer::start().await;
         let executor = WebToolExecutor::new(SearchEngineConfig::DuckDuckGo).unwrap();
@@ -906,7 +1024,6 @@ mod tests {
             .respond_with(ResponseTemplate::new(429).set_body_string("中".repeat(100)))
             .mount(&server)
             .await;
-        let preview = String::from_utf8_lossy(&"中".repeat(100).as_bytes()[..200]).into_owned();
         assert_eq!(
             executor
                 .execute(
@@ -914,7 +1031,7 @@ mod tests {
                     &json!({"url": format!("{}/error", server.uri())}).to_string()
                 )
                 .await,
-            format!("ERROR: HTTP 429: {preview}")
+            "ERROR: HTTP 429: response was not a usable result; do not repeatedly retry this backend in this turn"
         );
         let invalid = super::super::client::WebToolExecutor::new(
             super::super::client::SearchEngineConfig::keyed("not-an-engine", "test"),
@@ -999,14 +1116,14 @@ mod tests {
         assert_eq!(answer, "final answer");
         assert!(
             events.iter().any(
-                |e| matches!(e, ChatStreamEvent::Activity(label) if label.contains("bogus_tool"))
+                |e| matches!(e, ChatStreamEvent::ToolActivity(activity) if activity.label.contains("bogus_tool"))
             ),
             "tool activity should be labeled, got {events:?}"
         );
         assert!(
             events
                 .iter()
-                .any(|e| matches!(e, ChatStreamEvent::Activity(label) if label.contains("failed"))),
+                .any(|e| matches!(e, ChatStreamEvent::ToolActivity(activity) if activity.state == super::super::activity::ActivityState::Failed)),
             "tool failure should surface, got {events:?}"
         );
         assert_eq!(
@@ -1017,8 +1134,6 @@ mod tests {
 
     #[test]
     fn activity_labels_match_swift() {
-        assert_eq!(tool_error_detail("ERROR: \t\ntext\n \t"), Some("\ntext\n"));
-        assert_eq!(tool_error_detail("not an error"), None);
         assert_eq!(
             WebToolExecutor::activity_label("web_search", r#"{"query":"rust"}"#),
             "Searching: rust"

@@ -108,6 +108,7 @@ pub enum ChatStreamEvent {
     ContextOverflow(String),
     Partial(String),
     Activity(String),
+    ToolActivity(super::activity::ToolActivity),
     Status(String),
     /// Accumulated reasoning/thinking snapshot (like `partial`, not a delta).
     /// Displayed in a collapsed disclosure; never echoed back to the model.
@@ -288,11 +289,15 @@ pub enum WebAccess {
 #[derive(Debug, Clone)]
 pub struct WebToolExecutor {
     pub engine: SearchEngineConfig,
+    pub(super) search_guard: super::web::SearchFailureGuard,
 }
 
 impl WebToolExecutor {
     pub fn new(engine: SearchEngineConfig) -> Self {
-        WebToolExecutor { engine }
+        WebToolExecutor {
+            engine,
+            search_guard: Default::default(),
+        }
     }
 
     /// Human-readable transcript label for a tool call, derived from the
@@ -302,12 +307,31 @@ impl WebToolExecutor {
     }
 
     pub async fn execute(&self, name: &str, arguments_json: &str) -> String {
-        match super::web::SearchEngineConfig::try_from(&self.engine)
+        if self.search_guard.blocked(name) {
+            return super::web::SEARCH_PAUSED.into();
+        }
+        let result = match super::web::SearchEngineConfig::try_from(&self.engine)
             .and_then(super::web::WebToolExecutor::new)
         {
             Ok(executor) => executor.execute(name, arguments_json).await,
             Err(error) => format!("ERROR: {error:#}"),
-        }
+        };
+        self.search_guard.observe(name, &result);
+        result
+    }
+
+    pub async fn execute_tracked(
+        &self,
+        name: &str,
+        arguments: &str,
+        mut emit: impl FnMut(ChatStreamEvent),
+    ) -> String {
+        let mut activity = super::activity::ToolActivity::web(name, arguments);
+        emit(ChatStreamEvent::ToolActivity(activity.clone()));
+        let result = self.execute(name, arguments).await;
+        activity.finish(&result);
+        emit(ChatStreamEvent::ToolActivity(activity));
+        result
     }
 }
 
@@ -598,10 +622,6 @@ pub(super) async fn run_loop_with_client(
             if tx.is_closed() {
                 return;
             }
-            let _ = tx.send(ChatStreamEvent::Activity(WebToolExecutor::activity_label(
-                &call.function.name,
-                &call.function.arguments,
-            )));
             let result =
                 if let Some(catalog) = mcp.as_mut().filter(|c| c.contains(&call.function.name)) {
                     catalog
@@ -609,17 +629,20 @@ pub(super) async fn run_loop_with_client(
                         .await
                 } else if let Some(executor) = &executor {
                     executor
-                        .execute(&call.function.name, &call.function.arguments)
+                        .execute_tracked(&call.function.name, &call.function.arguments, |event| {
+                            let _ = tx.send(event);
+                        })
                         .await
                 } else {
-                    "ERROR: Unknown or disabled tool.".into()
+                    let result = "ERROR: Unknown or disabled tool.".to_string();
+                    let mut activity = super::activity::ToolActivity::web(
+                        &call.function.name,
+                        &call.function.arguments,
+                    );
+                    activity.finish(&result);
+                    let _ = tx.send(ChatStreamEvent::ToolActivity(activity));
+                    result
                 };
-            if let Some(detail) = super::web::tool_error_detail(&result) {
-                let _ = tx.send(ChatStreamEvent::Activity(format!(
-                    "⚠︎ {} failed: {}",
-                    call.function.name, detail
-                )));
-            }
             messages.push(WireMessage::new(
                 "tool",
                 Some(WireContent::Text(result)),
@@ -1441,7 +1464,24 @@ mod tests {
             Some(WebAccess::LocalTools(SearchEngineConfig::duckduckgo())),
         ))
         .await;
-        assert!(events.contains(&ChatStreamEvent::Activity(format!("Reading: {page}"))));
+        let activities: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ChatStreamEvent::ToolActivity(activity) => Some(activity),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(activities.len(), 2);
+        assert_eq!(activities[0].id, activities[1].id);
+        assert_eq!(
+            activities[0].state,
+            super::super::activity::ActivityState::Running
+        );
+        assert_eq!(
+            activities[1].state,
+            super::super::activity::ActivityState::Succeeded
+        );
+        assert!(activities[0].label.starts_with("讀取網頁："));
         assert!(events.contains(&ChatStreamEvent::Reasoning("think-1think-2".into())));
         assert_eq!(
             events.last(),
@@ -1504,15 +1544,14 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|e| **e == ChatStreamEvent::Activity("Tool: unknown".into()))
+                .filter(|e| matches!(e, ChatStreamEvent::ToolActivity(a) if a.label == "工具：unknown" && a.state == super::super::activity::ActivityState::Running))
                 .count(),
             10
         );
         assert_eq!(
             events
                 .iter()
-                .filter(|e| **e
-                    == ChatStreamEvent::Activity("⚠︎ unknown failed: unknown tool unknown".into()))
+                .filter(|e| matches!(e, ChatStreamEvent::ToolActivity(a) if a.label == "工具：unknown" && a.state == super::super::activity::ActivityState::Failed))
                 .count(),
             10
         );

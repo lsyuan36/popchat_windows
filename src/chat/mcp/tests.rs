@@ -32,6 +32,12 @@ fn tools() -> Value {
     json!([{"name":"echo","description":"Untrusted test description","inputSchema":{"type":"object","properties":{"text":{"type":"string"},"optional_note":{"type":"string"}},"required":["text"]}}])
 }
 
+fn control_events(rx: &mut mpsc::UnboundedReceiver<ChatStreamEvent>) -> Vec<ChatStreamEvent> {
+    std::iter::from_fn(|| rx.try_recv().ok())
+        .filter(|event| !matches!(event, ChatStreamEvent::ToolActivity(_)))
+        .collect()
+}
+
 #[test]
 fn private_http_requires_a_separate_persisted_destination_approval() {
     for url in [
@@ -264,8 +270,8 @@ async fn management_tools_are_available_without_services_and_do_not_change_confi
         .await
         .contains("未保存"));
     assert_eq!(
-        rx.try_recv().unwrap(),
-        ChatStreamEvent::McpOpenSettings(None)
+        control_events(&mut rx),
+        vec![ChatStreamEvent::McpOpenSettings(None)]
     );
     for (name, args) in [
         ("mcp_status", json!({"token":"must-not-be-accepted"})),
@@ -277,7 +283,7 @@ async fn management_tools_are_available_without_services_and_do_not_change_confi
             .await
             .starts_with("ERROR:"));
     }
-    assert!(rx.try_recv().is_err());
+    assert!(control_events(&mut rx).is_empty());
     assert!(!path.exists());
     assert!(!dir.path().join("secrets.json").exists());
 }
@@ -909,10 +915,11 @@ async fn responses_actual_tool_loop_supports_mcp_without_native_credentials_or_w
 
 #[tokio::test]
 async fn tool_call_requires_explicit_approval_and_denial_executes_nothing() {
+    use crate::chat::activity::{ActivityKind, ActivityState};
     for approved in [false, true] {
         let calls = Arc::new(AtomicUsize::new(0));
         let server = server(calls.clone()).await;
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
         let (approval_tx, mut approval_rx) = mpsc::unbounded_channel();
         let service = service(&server.uri());
         let id = service.id;
@@ -926,6 +933,19 @@ async fn tool_call_requires_explicit_approval_and_denial_executes_nothing() {
             },
         );
         let mut catalog = turn.open(&tx).await.unwrap();
+        let mut discovery = vec![];
+        while let Ok(ChatStreamEvent::ToolActivity(activity)) = rx.try_recv() {
+            discovery.push(activity);
+        }
+        assert_eq!(discovery.len(), 2);
+        assert_eq!(discovery[0].id, discovery[1].id);
+        assert_eq!(discovery[1].kind, ActivityKind::McpDiscovery);
+        assert_eq!(discovery[1].state, ActivityState::Succeeded);
+        assert!(discovery[1]
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("尚未執行工具"));
         let name = catalog.schemas()[0]["function"]["name"]
             .as_str()
             .unwrap()
@@ -940,8 +960,29 @@ async fn tool_call_requires_explicit_approval_and_denial_executes_nothing() {
         assert_eq!(request.tool, "echo");
         assert_eq!(request.arguments["text"], "reviewed arguments");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let mut lifecycle = vec![];
+        while let Ok(ChatStreamEvent::ToolActivity(activity)) = rx.try_recv() {
+            assert_eq!(activity.label, "MCP／Fixture MCP／echo");
+            lifecycle.push(activity);
+        }
+        assert_eq!(
+            lifecycle.last().unwrap().state,
+            ActivityState::WaitingApproval
+        );
         request.respond.send(approved).unwrap();
         let result = handle.await.unwrap();
+        while let Ok(ChatStreamEvent::ToolActivity(activity)) = rx.try_recv() {
+            lifecycle.push(activity);
+        }
+        assert!(lifecycle.iter().all(|a| a.id == lifecycle[0].id));
+        assert_eq!(
+            lifecycle.last().unwrap().state,
+            if approved {
+                ActivityState::Succeeded
+            } else {
+                ActivityState::Denied
+            }
+        );
         assert_eq!(calls.load(Ordering::SeqCst), usize::from(approved));
         assert!(if approved {
             result.contains("reviewed arguments")
@@ -968,14 +1009,14 @@ async fn conversational_proposal_only_emits_review_event_and_never_connects() {
         .await;
     assert!(result.contains("尚未儲存"));
     assert!(
-        matches!(rx.try_recv().unwrap(),ChatStreamEvent::McpProposal(d) if d.name=="Draft only")
+        matches!(control_events(&mut rx).as_slice(), [ChatStreamEvent::McpProposal(d)] if d.name == "Draft only")
     );
     let malicious = json!({"name":"bad","enabled":true,"transport":{"type":"http","url":"https://example.com/mcp"}});
     assert!(catalog
         .execute("propose_mcp_service", &malicious.to_string(), &tx)
         .await
         .starts_with("ERROR:"));
-    assert!(rx.try_recv().is_err());
+    assert!(control_events(&mut rx).is_empty());
 }
 
 #[tokio::test]

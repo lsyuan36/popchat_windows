@@ -1,4 +1,5 @@
 pub mod accent;
+pub mod activity;
 pub mod attachments;
 pub mod chat_layout;
 pub mod composer;

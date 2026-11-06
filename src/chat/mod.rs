@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod attach;
 pub mod backends;
 pub mod chatgpt_auth;

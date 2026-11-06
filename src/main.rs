@@ -2351,12 +2351,43 @@ impl PopChatApp {
                                 ui.add_space(6.0);
                             }
                             ChatRole::Activity => {
-                                let _ =
-                                    popchat_windows::ui::typography::activity_label(ui, &msg.text);
-                                ui.add_space(4.0);
+                                if message_index == 0
+                                    || self.chat.messages[message_index - 1].role
+                                        != ChatRole::Activity
+                                {
+                                    let count = self.chat.messages[message_index..]
+                                        .iter()
+                                        .take_while(|m| m.role == ChatRole::Activity)
+                                        .count();
+                                    let group =
+                                        &self.chat.messages[message_index..message_index + count];
+                                    let rect = ui
+                                        .scope(|ui| {
+                                            popchat_windows::ui::activity::show(
+                                                ui,
+                                                group,
+                                                self.active_stream
+                                                    .as_ref()
+                                                    .filter(|_| self.chat.is_streaming)
+                                                    .map(|s| s.turn.assistant_id),
+                                            )
+                                        })
+                                        .response
+                                        .rect;
+                                    if self.find.open
+                                        && find_scroll
+                                        && active_hit
+                                            .is_some_and(|(id, _)| group.iter().any(|m| m.id == id))
+                                    {
+                                        ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                                    }
+                                }
                             }
                         }
-                        if self.find.open && hits.iter().any(|(id, _)| *id == msg.id) {
+                        if self.find.open
+                            && msg.role != ChatRole::Activity
+                            && hits.iter().any(|(id, _)| *id == msg.id)
+                        {
                             let active = active_hit
                                 .filter(|(id, _)| *id == msg.id)
                                 .map(|(_, occurrence)| occurrence);

@@ -1,5 +1,6 @@
 use super::{Draft, McpStore, Service, Session};
 use crate::chat::{
+    activity::{ActivityKind, ActivityState, ToolActivity},
     client::{ChatStreamEvent, WireContent, WireMessage},
     store::SecretStore,
 };
@@ -139,10 +140,10 @@ impl McpTurn {
             catalog.schemas.push(proposal_schema());
         }
         for (service, token) in self.services.iter().filter(|(s, _)| s.enabled) {
-            let _ = tx.send(ChatStreamEvent::Activity(format!(
-                "MCP 連線／工具探索：{}（工具執行仍須確認）",
-                service.draft.name
-            )));
+            let mut label = format!("MCP／{}：連線與探索工具", service.draft.name);
+            self.redact_text(&mut label);
+            let mut activity = ToolActivity::new(ActivityKind::McpDiscovery, label);
+            let _ = tx.send(ChatStreamEvent::ToolActivity(activity.clone()));
             let discovery = async {
                 ensure!(
                     !self.contains_secret(&serde_json::to_value(&service.draft)?),
@@ -164,13 +165,13 @@ impl McpTurn {
                     catalog
                         .discovery_failures
                         .insert(service.id, safe_error(&error));
-                    let _ = tx.send(ChatStreamEvent::Activity(
-                        "MCP 連線／工具探索未完成；可使用 mcp_status 查狀態，或經確認後重新測試。"
-                            .into(),
-                    ));
+                    activity.state = ActivityState::Failed;
+                    activity.detail = Some(safe_error(&error));
+                    let _ = tx.send(ChatStreamEvent::ToolActivity(activity));
                     continue;
                 }
             };
+            let tool_count = tools.len();
             for tool in tools {
                 let name = tool["name"].as_str().unwrap_or_default();
                 let digest = format!("{:x}", Sha256::digest(name.as_bytes()));
@@ -193,6 +194,11 @@ impl McpTurn {
                 );
             }
             catalog.sessions.push((service.clone(), session, token));
+            activity.state = ActivityState::Succeeded;
+            activity.detail = Some(format!(
+                "工具目錄已就緒（{tool_count} 項）；尚未執行工具，執行仍須逐次確認。"
+            ));
+            let _ = tx.send(ChatStreamEvent::ToolActivity(activity));
         }
         catalog.schemas.extend(management);
         ensure!(
@@ -272,6 +278,40 @@ impl ToolCatalog {
         arguments: &str,
         tx: &mpsc::UnboundedSender<ChatStreamEvent>,
     ) -> String {
+        let label = if let Some((index, tool)) = self.bindings.get(name) {
+            format!("MCP／{}／{}", self.sessions[*index].0.draft.name, tool)
+        } else {
+            match name {
+                "mcp_status" => "MCP：查詢本輪狀態".into(),
+                "open_mcp_settings" => "MCP：開啟設定".into(),
+                "test_mcp_service" => "MCP：測試連線（不執行工具）".into(),
+                "propose_mcp_service" => "MCP：提出新增草稿（未儲存或啟用）".into(),
+                _ if self.skills.contains(name) => {
+                    "Skills：讀取指引／參考資料（不執行腳本）".into()
+                }
+                _ => "MCP：未知工具".into(),
+            }
+        };
+        let mut activity = ToolActivity::new(ActivityKind::McpTool, label);
+        if self.bindings.contains_key(name) || name == "test_mcp_service" {
+            activity.state = ActivityState::WaitingApproval;
+        }
+        let _ = tx.send(ChatStreamEvent::ToolActivity(activity.clone()));
+        let result = self
+            .execute_tracked_inner(name, arguments, tx, &mut activity)
+            .await;
+        activity.finish(&result);
+        let _ = tx.send(ChatStreamEvent::ToolActivity(activity));
+        result
+    }
+
+    async fn execute_tracked_inner(
+        &mut self,
+        name: &str,
+        arguments: &str,
+        tx: &mpsc::UnboundedSender<ChatStreamEvent>,
+        activity: &mut ToolActivity,
+    ) -> String {
         if self.skills.contains(name) {
             if tx.is_closed() {
                 return "ERROR: 聊天已取消。".into();
@@ -296,14 +336,15 @@ impl ToolCatalog {
                 Err(_)=>"ERROR: 技能讀取未完成：可能未啟用、內容已變更、參數無效、路徑超出範圍或已達讀取上限。請由使用者檢查 Skills 設定；不可改用其他工具繞過限制。".into(),
             };
             self.turn.redact_text(&mut result);
-            let _ = tx.send(ChatStreamEvent::Activity(
-                "讀取已啟用的 Skills 指引／參考資料（未執行腳本）。".into(),
-            ));
             return result;
         }
-        match self.execute_inner(name, arguments, tx).await {
+        match self.execute_inner(name, arguments, tx, activity).await {
             Ok(s) => s,
-            Err(error) => format!("ERROR: {}", safe_error(&error)),
+            Err(error) => {
+                activity.state = ActivityState::Failed;
+                activity.detail = Some(safe_error(&error));
+                format!("ERROR: {}", safe_error(&error))
+            }
         }
     }
     async fn execute_inner(
@@ -311,6 +352,7 @@ impl ToolCatalog {
         name: &str,
         arguments: &str,
         tx: &mpsc::UnboundedSender<ChatStreamEvent>,
+        activity: &mut ToolActivity,
     ) -> Result<String> {
         ensure!(arguments.len() <= 16384, "MCP 工具參數過大。");
         let args: Value = serde_json::from_str(arguments)?;
@@ -324,6 +366,7 @@ impl ToolCatalog {
             "本輪 MCP 工具／草稿數量超過上限。"
         );
         if self.denied.contains(name) {
+            activity.state = ActivityState::Denied;
             return Ok("ERROR: 使用者已在本輪拒絕此 MCP 工具，不再重複詢問或執行。".into());
         }
         match name {
@@ -348,7 +391,7 @@ impl ToolCatalog {
             }
             "test_mcp_service" => {
                 let target: TestArgs = serde_json::from_value(args)?;
-                return self.test_service(target.service_id, tx).await;
+                return self.test_service(target.service_id, tx, activity).await;
             }
             _ => {}
         }
@@ -366,6 +409,8 @@ impl ToolCatalog {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("未知 MCP 工具"))?;
         let (service, session, token) = &mut self.sessions[index];
+        activity.state = ActivityState::WaitingApproval;
+        let _ = tx.send(ChatStreamEvent::ToolActivity(activity.clone()));
         let (respond, decision) = oneshot::channel();
         (self.turn.sink)(ApprovalRequest {
             action: ApprovalAction::ToolCall,
@@ -383,13 +428,12 @@ impl ToolCatalog {
             .unwrap_or(false);
         if !approved {
             self.denied.insert(name.to_string());
+            activity.state = ActivityState::Denied;
             return Ok("ERROR: 使用者拒絕這次 MCP 工具呼叫，或確認已逾時。沒有執行任何工具；未收到新的使用者要求前，不要重複提出。".into());
         }
         ensure!(!tx.is_closed(), "聊天已取消");
-        let _ = tx.send(ChatStreamEvent::Activity(format!(
-            "MCP 工具執行：{} / {}",
-            service.draft.name, tool
-        )));
+        activity.state = ActivityState::Running;
+        let _ = tx.send(ChatStreamEvent::ToolActivity(activity.clone()));
         let mut result = session.call(&tool, args).await?;
         self.turn.redact(&mut result);
         let mut output = String::new();
@@ -438,6 +482,7 @@ impl ToolCatalog {
         &mut self,
         id: Uuid,
         tx: &mpsc::UnboundedSender<ChatStreamEvent>,
+        activity: &mut ToolActivity,
     ) -> Result<String> {
         let (service, token) = self
             .turn
@@ -455,8 +500,15 @@ impl ToolCatalog {
         );
         let key = format!("test:{id}");
         if self.denied.contains(&key) {
+            activity.state = ActivityState::Denied;
             return Ok("ERROR: 使用者已拒絕此服務的連線測試，本輪不再詢問或連線。".into());
         }
+        activity.label = crate::chat::activity::single_line(
+            &format!("MCP／{}：測試連線（不執行工具）", service.draft.name),
+            180,
+        );
+        activity.state = ActivityState::WaitingApproval;
+        let _ = tx.send(ChatStreamEvent::ToolActivity(activity.clone()));
         let (respond, decision) = oneshot::channel();
         (self.turn.sink)(ApprovalRequest {
             action: ApprovalAction::ConnectionTest,
@@ -474,12 +526,12 @@ impl ToolCatalog {
             .unwrap_or(false);
         if !approved {
             self.denied.insert(key);
+            activity.state = ActivityState::Denied;
             return Ok("ERROR: 使用者拒絕連線測試或確認已逾時；未啟動程式或連線。".into());
         }
         ensure!(!tx.is_closed(), "聊天已取消");
-        let _ = tx.send(ChatStreamEvent::Activity(
-            "MCP 連線測試已獲准：只做握手與工具探索，不執行工具或啟用服務。".into(),
-        ));
+        activity.state = ActivityState::Running;
+        let _ = tx.send(ChatStreamEvent::ToolActivity(activity.clone()));
         let mut session = Session::connect(&service, token).await?;
         let tools = session.tools().await?;
         ensure!(

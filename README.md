@@ -2,7 +2,7 @@
 
 輕量的 Windows 浮動 AI 聊天面板，以 **Rust + egui/eframe** 實作。
 
-**Windows 移植／維護：Evis Lai** · 目前版本：**0.2.9**
+**Windows 移植／維護：Evis Lai** · 目前版本：**0.2.10**
 
 > 本專案移植自 **Le Chen / lec77** 的 macOS 專案
 > **[lec77/PopChat](https://github.com/lec77/PopChat)**。
@@ -11,9 +11,12 @@
 
 ## 下載與啟動
 
-從 **[GitHub Releases](https://github.com/lsyuan36/popchat_windows/releases/tag/v0.2.9)**
-下載 **`PopChat-0.2.9-Windows-x64-Setup.exe`**（NSIS 安裝程式）。
-**0.2.9** 新增獨立的「Opencode Go」Provider，專用 session 標頭不影響原有服務、金鑰與選取。
+從 **[GitHub Releases](https://github.com/lsyuan36/popchat_windows/releases/tag/v0.2.10)**
+下載 **`PopChat-0.2.10-Windows-x64-Setup.exe`**（NSIS 安裝程式）。
+**0.2.10** 將工具、MCP 與搜尋活動集中為可收合的 12 pt 小字區塊，同次呼叫更新狀態，
+搜尋錯誤不再攤開 HTML；同輪連續兩次 HTTP 202／429 後暫停該搜尋後端，不自動換服務。
+正式回答、思考字級與 MCP 逐次授權不變，舊歷史無須遷移。
+保留 **0.2.9** 的獨立「Opencode Go」Provider，專用 session 標頭不影響原有服務、金鑰與選取。
 保留 **0.2.8** 的設定頁滾輪修正，固定儲存列與頁面轉場維持不變。
 保留 0.2.7 的圓角遮罩、小字活動提示、「關於」分頁、緊湊雙欄快捷鍵表與直接輸入待套用組合，
 以及 Skills、MCP 本機安全設定、Auto Compact 與繁體中文內建提示詞。
@@ -141,7 +144,7 @@ HTTP 首版僅支援手動 Bearer token，不提供自動 OAuth 登入。
 設定 → Skills → 管理技能／掃描來源，可讀取 OpenCode、Claude、Codex／共用 Agents
 的個人預設路徑，也可明確指定專案或自訂資料夾。新技能預設停用，需個別啟用；
 只先提供名稱與說明，模型需要時才載入全文與技能目錄內的文字參考檔。
-不修改其他工具設定，不自動執行技能腳本。詳見 [SKILLS.md](https://github.com/lsyuan36/popchat_windows/blob/v0.2.9/SKILLS.md)。
+不修改其他工具設定，不自動執行技能腳本。詳見 [SKILLS.md](https://github.com/lsyuan36/popchat_windows/blob/v0.2.10/SKILLS.md)。
 **0.2.4 及更早版本不含 Skills 設定，需升級至 0.2.6。**
 
 ## 資料與隱私

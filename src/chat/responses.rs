@@ -236,25 +236,23 @@ impl ResponsesBackend {
             // any visible message paired with the function calls.
             input.extend(outcome.round_items);
             for call in outcome.tool_calls {
-                let _ = tx.send(ChatStreamEvent::Activity(WebToolExecutor::activity_label(
-                    &call.name,
-                    &call.arguments,
-                )));
                 let result = if let Some(catalog) = mcp.as_mut().filter(|c| c.contains(&call.name))
                 {
                     catalog.execute(&call.name, &call.arguments, tx).await
                 } else if let Some(executor) = &executor {
-                    executor.execute(&call.name, &call.arguments).await
+                    executor
+                        .execute_tracked(&call.name, &call.arguments, |event| {
+                            let _ = tx.send(event);
+                        })
+                        .await
                 } else {
-                    "ERROR: Unknown or disabled tool.".into()
+                    let result = "ERROR: Unknown or disabled tool.".to_string();
+                    let mut activity =
+                        super::activity::ToolActivity::web(&call.name, &call.arguments);
+                    activity.finish(&result);
+                    let _ = tx.send(ChatStreamEvent::ToolActivity(activity));
+                    result
                 };
-                if let Some(detail) = result.strip_prefix("ERROR:") {
-                    let _ = tx.send(ChatStreamEvent::Activity(format!(
-                        "⚠︎ {} failed: {}",
-                        call.name,
-                        detail.trim()
-                    )));
-                }
                 input.push(json!({"type": "function_call_output", "call_id": call.call_id, "output": result}));
             }
             round += 1;
@@ -1017,9 +1015,9 @@ mod tests {
             Some(WebAccess::LocalTools(SearchEngineConfig::duckduckgo())),
         ))
         .await;
-        assert!(events.contains(&ChatStreamEvent::Activity("Tool: bogus_tool".into())));
+        assert!(events.iter().any(|e| matches!(e, ChatStreamEvent::ToolActivity(a) if a.label == "工具：bogus_tool" && a.state == super::super::activity::ActivityState::Running)));
         assert!(events.iter().any(
-            |e| matches!(e, ChatStreamEvent::Activity(text) if text.contains("bogus_tool failed:"))
+            |e| matches!(e, ChatStreamEvent::ToolActivity(a) if a.label == "工具：bogus_tool" && a.state == super::super::activity::ActivityState::Failed)
         ));
         assert!(events.contains(&ChatStreamEvent::Reasoning("Thinking\n\nConcluded".into())));
         assert_eq!(
@@ -1073,7 +1071,7 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|e| matches!(e, ChatStreamEvent::Activity(text) if text == "Tool: bogus"))
+                .filter(|e| matches!(e, ChatStreamEvent::ToolActivity(a) if a.label == "工具：bogus" && a.state == super::super::activity::ActivityState::Running))
                 .count(),
             10
         );

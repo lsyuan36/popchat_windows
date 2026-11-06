@@ -194,6 +194,8 @@ pub struct ChatMessage {
     /// conversations written before it existed still decode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<crate::chat::activity::ToolActivity>,
 }
 
 impl ChatMessage {
@@ -205,6 +207,7 @@ impl ChatMessage {
             wire_text: None,
             attachments: Vec::new(),
             reasoning: None,
+            activity: None,
         }
     }
 }
