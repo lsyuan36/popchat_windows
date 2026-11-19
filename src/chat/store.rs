@@ -1019,6 +1019,16 @@ impl ChatStore {
         }
     }
 
+    /// Merge the worker's final snapshot. UI frames need not have seen the
+    /// approval, dispatch or final reply yet. Never touch a different turn.
+    pub fn record_mcp_stop(&mut self, owner: Uuid, activities: Vec<super::activity::ToolActivity>) {
+        if self.streaming_message_id == Some(owner) {
+            for activity in activities {
+                self.upsert_activity(owner, activity);
+            }
+        }
+    }
+
     fn upsert_activity(&mut self, owner: Uuid, mut activity: super::activity::ToolActivity) {
         activity.owner = Some(owner);
         if let Some(row) = self.messages.iter_mut().find(|m| {
@@ -1063,7 +1073,7 @@ impl ChatStore {
     pub fn finish_turn(&mut self, turn: &ActiveTurn) {
         self.settle_activities(
             turn.assistant_id,
-            super::activity::ActivityState::Interrupted,
+            super::activity::ToolActivity::inactive_state,
         );
         // "Still ours": flush_reveal() clears streaming_message_id when a
         // new turn takes over mid-reveal.
@@ -1127,16 +1137,20 @@ impl ChatStore {
         self.pending_status = None;
         self.pending_reasoning = None;
         if let Some(owner) = self.streaming_message_id {
-            self.settle_activities(owner, super::activity::ActivityState::Cancelled);
+            self.settle_activities(owner, super::activity::ToolActivity::stopped_state);
         }
         self.flush_reveal();
     }
 
-    fn settle_activities(&mut self, owner: Uuid, state: super::activity::ActivityState) {
+    fn settle_activities(
+        &mut self,
+        owner: Uuid,
+        settle: fn(&super::activity::ToolActivity) -> super::activity::ActivityState,
+    ) {
         for row in &mut self.messages {
             if let Some(activity) = row.activity.as_mut().filter(|a| a.owner == Some(owner)) {
                 if activity.state.is_pending() {
-                    activity.state = state;
+                    activity.state = settle(activity);
                 }
             }
         }
@@ -2919,16 +2933,9 @@ mod tests {
         let mut store = reveal_store(StreamingMode::PerCharacter, "answer");
         let owner = store.messages[0].id;
         let mut activity = ToolActivity::new(ActivityKind::McpTool, "MCP／Synthetic／Read");
-        store.upsert_activity(owner, activity.clone());
-        let row_id = store.messages[0].id;
         activity.state = ActivityState::WaitingApproval;
         store.upsert_activity(owner, activity.clone());
-        assert_eq!(store.messages.len(), 2);
-        assert_eq!(store.messages[0].id, row_id);
-        assert_eq!(
-            store.messages[0].activity.as_ref().unwrap().state,
-            ActivityState::WaitingApproval
-        );
+        let row_id = store.messages[0].id;
         assert_eq!(store.messages[1].id, owner);
         let next = ChatMessage::new(ChatRole::Assistant, "next answer");
         let next_owner = next.id;
@@ -2942,7 +2949,7 @@ mod tests {
         store.stop();
         assert_eq!(
             store.messages[0].activity.as_ref().unwrap().state,
-            ActivityState::Cancelled
+            ActivityState::CancelledBeforeSend
         );
         assert_eq!(
             store.messages[2].activity.as_ref().unwrap().state,
@@ -2950,16 +2957,17 @@ mod tests {
         );
         activity.state = ActivityState::Succeeded;
         store.upsert_activity(owner, activity.clone());
+        assert_eq!(store.messages[0].id, row_id);
         assert_eq!(
             store.messages[0].activity.as_ref().unwrap().state,
-            ActivityState::Cancelled
+            ActivityState::CancelledBeforeSend
         );
         store.upsert_activity(next_owner, activity);
         assert_eq!(
             store.messages[2].activity.as_ref().unwrap().state,
             ActivityState::Succeeded
         );
-        store.settle_activities(next_owner, ActivityState::Interrupted);
+        store.settle_activities(next_owner, ToolActivity::inactive_state);
         assert_eq!(
             store.messages[2].activity.as_ref().unwrap().state,
             ActivityState::Succeeded
@@ -2967,6 +2975,43 @@ mod tests {
         let wire = history_for_wire(&store.messages, "sys", &caps_all());
         assert_eq!(wire.len(), 3);
         assert!(!serde_json::to_string(&wire).unwrap().contains("Synthetic"));
+    }
+
+    #[test]
+    fn frozen_mcp_snapshot_preserves_dispatch_and_final_replies_even_if_ui_lags() {
+        use super::super::activity::{ActivityKind, ActivityState, ToolActivity};
+        let mut store = reveal_store(StreamingMode::PerCharacter, "partial");
+        let owner = store.messages[0].id;
+        let waiting = {
+            let mut a = ToolActivity::new(ActivityKind::McpTool, "MCP／test／create");
+            a.state = ActivityState::WaitingApproval;
+            a
+        };
+        let mut dispatched = waiting.clone();
+        dispatched.state = ActivityState::OutcomeUnknown;
+        store.record_mcp_stop(Uuid::new_v4(), vec![dispatched.clone()]);
+        assert_eq!(
+            store.messages.len(),
+            1,
+            "a different turn must not receive this snapshot"
+        );
+        store.upsert_activity(owner, waiting);
+        let mut finished = ToolActivity::new(ActivityKind::McpTool, "MCP／test／finished");
+        finished.succeed();
+        store.record_mcp_stop(owner, vec![dispatched.clone(), finished]);
+        store.stop();
+        dispatched.state = ActivityState::Running;
+        store.upsert_activity(owner, dispatched);
+        assert_eq!(store.messages.len(), 3);
+        assert_eq!(
+            store.messages[0].activity.as_ref().unwrap().state,
+            ActivityState::OutcomeUnknown
+        );
+        assert_eq!(
+            store.messages[1].activity.as_ref().unwrap().state,
+            ActivityState::Succeeded
+        );
+        assert_eq!(store.messages[2].text, "partial");
     }
 
     #[test]
@@ -2983,7 +3028,7 @@ mod tests {
                 .is_none()
         );
         let mut activity = ToolActivity::web("web_search", r#"{"query":"fixture"}"#);
-        activity.finish("ERROR: HTTP 202: <!DOCTYPE html>synthetic-token");
+        activity.fail("HTTP 202: <!DOCTYPE html>synthetic-token");
         let mut message = ChatMessage::new(ChatRole::Activity, &activity.label);
         message.activity = Some(activity);
         let json = serde_json::to_value(&message).unwrap();

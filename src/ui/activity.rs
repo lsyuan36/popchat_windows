@@ -1,84 +1,282 @@
 //! Compact, bounded tool activity disclosure, separate from answer/reasoning.
 use eframe::egui;
+use uuid::Uuid;
 
 use crate::chat::{
-    activity::{single_line, ActivityKind, ActivityState},
+    activity::{error_summary, single_line, ActivityKind, ActivityState},
     store::{ChatMessage, ChatRole},
 };
 
-use super::typography::ACTIVITY_SIZE;
+use super::{find::find_ranges, theme, typography::ACTIVITY_SIZE};
 
-#[derive(Clone)]
-struct Row {
-    label: String,
-    state: Option<ActivityState>,
-    kind: Option<ActivityKind>,
-    detail: Option<String>,
-    queries: Vec<String>,
+/// The only activity text used by both Find and the widgets (including elided
+/// labels' egui tooltips). Disclosure controls and totals aren't transcript
+/// contents; a collapsed preview is a second view of a field, not a new hit.
+pub struct Group {
+    rows: Vec<Row>,
 }
 
-fn rows(messages: &[ChatMessage], active_owner: Option<uuid::Uuid>) -> Vec<Row> {
-    let mut rows: Vec<Row> = vec![];
-    for message in messages.iter().filter(|m| m.role == ChatRole::Activity) {
-        let row = if let Some(activity) = &message.activity {
-            let state = if activity.state.is_pending()
-                && (activity.owner.is_none() || activity.owner != active_owner)
-            {
-                ActivityState::Interrupted
-            } else {
-                activity.state
-            };
-            Row {
-                label: single_line(&activity.label, 180),
-                state: Some(state),
-                kind: Some(activity.kind),
-                detail: activity.detail.as_ref().map(|s| single_line(s, 500)),
-                queries: vec![single_line(&activity.label, 180)],
-            }
+struct Row {
+    state: Option<ActivityState>,
+    kind: Option<ActivityKind>,
+    owner: Option<Uuid>,
+    detail: Option<String>,
+    http_status: Option<u16>,
+    calls: Vec<(Uuid, String)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Field {
+    Heading,
+    Detail,
+    Query(Uuid),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hit {
+    row: Uuid,
+    field: Field,
+    occurrence: usize,
+}
+
+impl Row {
+    fn id(&self) -> Uuid {
+        self.calls[0].0
+    }
+
+    fn heading(&self) -> String {
+        let icon = self.state.map_or("·", ActivityState::icon);
+        let status = self.state.map_or("記錄", ActivityState::label);
+        if self.calls.len() == 1 {
+            format!("{icon} {} · {status}", self.calls[0].1)
         } else {
-            // Old transcripts are display-only: do not rewrite or discard them.
-            // In particular, never re-expose previously saved HTML error bodies.
-            let text = &message.text;
-            let failure = text.contains(" failed:");
-            let label = if failure {
-                let error = text.split_once(" failed:").map(|(_, e)| e).unwrap_or("");
-                crate::chat::activity::error_summary(
-                    if text.contains("web_search") {
-                        ActivityKind::Search
-                    } else {
-                        ActivityKind::Tool
-                    },
-                    error,
+            // All call labels, including the first, appear exactly once in
+            // details. Do not repeat the first query in the merged heading.
+            format!("{icon} {status}（{} 次）", self.calls.len())
+        }
+    }
+
+    fn details(&self) -> impl Iterator<Item = (Field, &str)> {
+        self.detail
+            .as_deref()
+            .map(|s| (Field::Detail, s))
+            .into_iter()
+            .chain(
+                self.calls
+                    .iter()
+                    .filter(|_| self.calls.len() > 1)
+                    .map(|(id, label)| (Field::Query(*id), label.as_str())),
+            )
+    }
+}
+
+// v0.2.9 emitted a separate activity with this exact envelope after a tool
+// returned ERROR:. Do not parse its arbitrary response body as a query, or
+// mistake "Searching: Rust Vec<T>, 2 < 3, build failed: why?" for an error.
+fn legacy_failure(text: &str) -> Option<String> {
+    let warning = text
+        .strip_prefix('⚠')?
+        .trim_start_matches(['\u{fe0e}', '\u{fe0f}'])
+        .strip_prefix(' ')?;
+    let (name, error) = warning.split_once(" failed:")?;
+    let kind = match name {
+        "web_search" => ActivityKind::Search,
+        "fetch_url" => ActivityKind::Fetch,
+        _ => ActivityKind::Tool,
+    };
+    Some(error_summary(kind, error))
+}
+
+impl Group {
+    pub fn new(messages: &[ChatMessage], active_owner: Option<Uuid>) -> Self {
+        let mut rows: Vec<Row> = vec![];
+        for message in messages.iter().filter(|m| m.role == ChatRole::Activity) {
+            let http_status = message.activity.as_ref().and_then(|a| a.http_status);
+            let (state, kind, owner, label, detail) = if let Some(activity) = &message.activity {
+                let state = if active_owner.is_some() && activity.owner == active_owner {
+                    activity.state
+                } else {
+                    activity.inactive_state()
+                };
+                (
+                    Some(state),
+                    Some(activity.kind),
+                    activity.owner,
+                    single_line(&activity.label, 180),
+                    activity.detail.as_ref().map(|s| single_line(s, 500)),
                 )
-            } else if text.contains('<') {
-                "工具活動記錄（原始內容已隱藏）".into()
+            } else if let Some(summary) = legacy_failure(&message.text) {
+                (Some(ActivityState::Failed), None, None, summary, None)
             } else {
-                single_line(text, 180)
+                (None, None, None, single_line(&message.text, 180), None)
             };
-            Row {
-                label,
-                state: None,
-                kind: None,
-                detail: None,
-                queries: vec![],
+            if matches!(state, Some(ActivityState::Failed | ActivityState::Skipped))
+                && detail.is_some()
+            {
+                if let Some(previous) = rows.iter_mut().find(|r| {
+                    r.owner == owner
+                        && r.state == state
+                        && r.kind == kind
+                        && (r.detail == detail
+                            || (http_status.is_some() && r.http_status == http_status))
+                        && (kind == Some(ActivityKind::Search) || r.calls[0].1 == label)
+                }) {
+                    previous.calls.push((message.id, label));
+                    previous.detail = detail; // retain the latest pause notice
+                    continue;
+                }
             }
-        };
-        // Merge repeated failures of the same backend/category, not successful
-        // operations. Keep every query accessible inside the bounded disclosure.
-        if row.state == Some(ActivityState::Failed) && row.detail.is_some() {
-            if let Some(previous) = rows.iter_mut().find(|r| {
-                r.state == row.state
-                    && r.kind == row.kind
-                    && r.detail == row.detail
-                    && (row.kind == Some(ActivityKind::Search) || r.label == row.label)
-            }) {
-                previous.queries.extend(row.queries);
-                continue;
+            rows.push(Row {
+                state,
+                kind,
+                owner,
+                detail,
+                http_status,
+                calls: vec![(message.id, label)],
+            });
+        }
+        Self { rows }
+    }
+
+    pub fn find_hits(&self, query: &str) -> Vec<Hit> {
+        let mut hits = Vec::new();
+        for row in &self.rows {
+            let heading = row.heading();
+            for (field, text) in
+                std::iter::once((Field::Heading, heading.as_str())).chain(row.details())
+            {
+                hits.extend((0..find_ranges(text, query).len()).map(|occurrence| Hit {
+                    row: row.id(),
+                    field,
+                    occurrence,
+                }));
             }
         }
-        rows.push(row);
+        hits
     }
-    rows
+
+    fn summary(&self, active: bool) -> String {
+        if self.rows.iter().all(|r| r.state.is_none()) {
+            return format!("工具活動 · {} 筆記錄", self.rows.len());
+        }
+        let mut succeeded = 0;
+        let mut failed = 0;
+        let mut skipped = 0;
+        let mut unknown = 0;
+        let mut unsent = 0;
+        let mut other = 0;
+        for row in &self.rows {
+            let count = row.calls.len();
+            match row.state {
+                Some(ActivityState::Succeeded) => succeeded += count,
+                Some(ActivityState::Failed) => failed += count,
+                Some(ActivityState::Skipped) => skipped += count,
+                Some(ActivityState::OutcomeUnknown) => unknown += count,
+                Some(ActivityState::CancelledBeforeSend | ActivityState::Denied) => unsent += count,
+                Some(state) if state.is_pending() => {}
+                _ => other += count,
+            }
+        }
+        let progress = if active { "進行中 · " } else { "" };
+        let mut summary = format!("工具活動 · {progress}完成 {succeeded}／失敗 {failed}");
+        for (count, label) in [
+            (skipped, "略過"),
+            (unknown, "結果未知"),
+            (unsent, "未執行"),
+            (other, "其他"),
+        ] {
+            if count > 0 {
+                summary.push_str(&format!("／{label} {count}"));
+            }
+        }
+        summary
+    }
+
+    pub fn show(&self, ui: &mut egui::Ui, query: &str, hit: Option<Hit>, navigate: bool) {
+        let Some(first) = self.rows.first() else {
+            return;
+        };
+        let hit = hit.filter(|hit| self.rows.iter().any(|r| r.id() == hit.row));
+        let navigate = navigate && hit.is_some();
+        let pending = self
+            .rows
+            .iter()
+            .rev()
+            .find(|r| r.state.is_some_and(ActivityState::is_pending));
+        let active = pending.is_some();
+        let id = egui::Id::new(("tool-activity-group", first.id()));
+        let mut disclosure = ui.data_mut(|d| d.get_temp::<Disclosure>(id).unwrap_or_default());
+        if navigate {
+            disclosure.expanded = true;
+        } else if disclosure.active && !active && hit.is_none() {
+            disclosure.expanded = false;
+        }
+        disclosure.active = active;
+        ui.push_id(id, |ui| {
+            ui.style_mut().override_font_id = Some(egui::FontId::proportional(ACTIVITY_SIZE));
+            toggle(ui, &self.summary(active), &mut disclosure.expanded)
+                .on_hover_text("展開／收合工具活動；不影響工具授權");
+            if disclosure.expanded {
+                let list = egui::ScrollArea::vertical()
+                    .id_salt("activity-list")
+                    .max_height(220.0)
+                    .min_scrolled_height(80.0)
+                    .auto_shrink([false, true])
+                    .animated(false)
+                    .show_viewport(ui, |ui, viewport| {
+                        let mut target = None;
+                        for row in &self.rows {
+                            let row_hit = hit.filter(|h| h.row == row.id());
+                            let rect = ui
+                                .push_id(row.id(), |ui| row.show(ui, query, row_hit, navigate))
+                                .inner;
+                            if let Some(rect) = rect.filter(|_| navigate) {
+                                target = Some(rect);
+                            }
+                        }
+                        target.map(|rect| {
+                            // The outer transcript may currently clip the *entire*
+                            // group. Use this list's own viewport, not ui.clip_rect().
+                            let center = ui.max_rect().top() + viewport.center().y;
+                            ui.scroll_with_delta(egui::vec2(0.0, center - rect.center().y));
+                            (rect, viewport.top())
+                        })
+                    });
+                if let Some((rect, old_offset)) = list.inner {
+                    // The inner scroll has consumed its request and clamped its
+                    // actual offset. Reveal that same word in the OUTER transcript.
+                    let rect = rect.translate(egui::vec2(0.0, old_offset - list.state.offset.y));
+                    ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                }
+            } else if let Some(row) = pending
+                .or_else(|| {
+                    // Leave the pause/no-request reason visible even if another
+                    // backend has since failed. Stop outcomes also have counters.
+                    self.rows
+                        .iter()
+                        .rev()
+                        .find(|r| r.state == Some(ActivityState::Skipped))
+                })
+                .or_else(|| {
+                    self.rows
+                        .iter()
+                        .rev()
+                        .find(|r| r.state.is_some_and(|s| s != ActivityState::Succeeded))
+                })
+            {
+                let heading = row.heading();
+                let preview = match row.state {
+                    Some(ActivityState::Failed | ActivityState::Skipped) => {
+                        row.detail.as_deref().unwrap_or(&heading)
+                    }
+                    _ => &heading,
+                };
+                line(ui, preview, query, None, false);
+            }
+        });
+        ui.ctx().data_mut(|data| data.insert_temp(id, disclosure));
+        ui.add_space(4.0);
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -87,197 +285,125 @@ struct Disclosure {
     active: bool,
 }
 
-pub fn show(ui: &mut egui::Ui, messages: &[ChatMessage], active_owner: Option<uuid::Uuid>) {
-    let Some(first) = messages.first() else {
-        return;
-    };
-    let rows = rows(messages, active_owner);
-    let active = rows
-        .iter()
-        .any(|r| r.state.is_some_and(ActivityState::is_pending));
-    let succeeded = messages
-        .iter()
-        .filter(|m| {
-            m.activity
-                .as_ref()
-                .is_some_and(|a| a.state == ActivityState::Succeeded)
-        })
-        .count();
-    let failed = messages
-        .iter()
-        .filter(|m| {
-            m.activity
-                .as_ref()
-                .is_some_and(|a| a.state == ActivityState::Failed)
-        })
-        .count();
-    let id = egui::Id::new(("tool-activity-group", first.id));
-    let mut disclosure = ui
-        .ctx()
-        .data_mut(|data| data.get_temp::<Disclosure>(id).unwrap_or_default());
-    if disclosure.active && !active {
-        disclosure.expanded = false;
-    }
-    disclosure.active = active;
-    let summary = if active {
-        format!("工具活動 · 進行中 · 完成 {succeeded}／失敗 {failed}")
-    } else if messages.iter().all(|m| m.activity.is_none()) {
-        format!("工具活動 · {} 筆記錄", messages.len())
-    } else {
-        let other = messages.len().saturating_sub(succeeded + failed);
-        format!(
-            "工具活動 · 完成 {succeeded}／失敗 {failed}{}",
-            if other > 0 {
-                format!("／其他 {other}")
-            } else {
-                String::new()
-            }
-        )
-    };
-    ui.push_id(id, |ui| {
-        ui.style_mut().override_font_id = Some(egui::FontId::proportional(ACTIVITY_SIZE));
-        let header = ui.add(
-            egui::Label::new(
-                egui::RichText::new(format!(
-                    "{} {summary}",
-                    if disclosure.expanded { "▾" } else { "▸" }
-                ))
+fn toggle(ui: &mut egui::Ui, text: &str, open: &mut bool) -> egui::Response {
+    let arrow = if *open { "▾" } else { "▸" };
+    let response = ui.add(
+        egui::Label::new(
+            egui::RichText::new(format!("{arrow} {text}"))
                 .size(ACTIVITY_SIZE)
                 .weak(),
-            )
-            .truncate()
-            .sense(egui::Sense::click()),
+        )
+        .wrap()
+        .selectable(false)
+        .sense(egui::Sense::click()),
+    );
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::CollapsingHeader, true, text));
+    if response.clicked() {
+        *open = !*open;
+    }
+    response
+}
+
+impl Row {
+    fn show(
+        &self,
+        ui: &mut egui::Ui,
+        query: &str,
+        hit: Option<Hit>,
+        navigate: bool,
+    ) -> Option<egui::Rect> {
+        let occurrence = |field| hit.filter(|h| h.field == field).map(|h| h.occurrence);
+        let mut target = line(
+            ui,
+            &self.heading(),
+            query,
+            occurrence(Field::Heading),
+            false,
         );
-        header.widget_info(|| {
-            egui::WidgetInfo::labeled(egui::WidgetType::CollapsingHeader, true, &summary)
-        });
-        if header
-            .on_hover_text("展開／收合工具活動；不影響工具授權")
-            .clicked()
-        {
-            disclosure.expanded = !disclosure.expanded;
-        }
-        if disclosure.expanded {
-            let height = ui.available_height().clamp(80.0, 220.0);
-            egui::ScrollArea::vertical()
-                .id_salt("activity-list")
-                .max_height(height)
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    for (index, row) in rows.iter().enumerate() {
-                        ui.push_id(index, |ui| {
-                            let state = row.state;
-                            let count = row.queries.len();
-                            let suffix = if count > 1 {
-                                format!("（{count} 次）")
-                            } else {
-                                String::new()
-                            };
-                            let text = format!(
-                                "{} {} · {}{suffix}",
-                                state.map_or("·", ActivityState::icon),
-                                row.label,
-                                state.map_or("記錄", ActivityState::label)
-                            );
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(text).size(ACTIVITY_SIZE).weak(),
-                                )
-                                .truncate(),
-                            );
-                            if row.detail.is_some() || count > 1 {
-                                egui::CollapsingHeader::new(
-                                    egui::RichText::new("詳情").size(ACTIVITY_SIZE),
-                                )
-                                .id_salt("detail")
-                                .show(ui, |ui| {
-                                    if let Some(detail) = &row.detail {
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(detail)
-                                                    .size(ACTIVITY_SIZE)
-                                                    .weak(),
-                                            )
-                                            .wrap()
-                                            .selectable(true),
-                                        );
-                                    }
-                                    if count > 1 {
-                                        for query in &row.queries {
-                                            ui.add(
-                                                egui::Label::new(
-                                                    egui::RichText::new(query)
-                                                        .size(ACTIVITY_SIZE)
-                                                        .weak(),
-                                                )
-                                                .truncate(),
-                                            );
-                                        }
-                                    }
-                                });
-                            }
-                        });
+        if self.detail.is_some() || self.calls.len() > 1 {
+            let id = ui.make_persistent_id("detail");
+            let mut open = ui.data_mut(|d| d.get_temp::<bool>(id).unwrap_or(false));
+            if navigate && hit.is_some_and(|h| h.field != Field::Heading) {
+                open = true;
+            }
+            toggle(ui, "詳情", &mut open);
+            ui.data_mut(|d| d.insert_temp(id, open));
+            if open {
+                ui.indent(id, |ui| {
+                    for (field, text) in self.details() {
+                        if let Some(rect) =
+                            line(ui, text, query, occurrence(field), field == Field::Detail)
+                        {
+                            target = Some(rect);
+                        }
                     }
                 });
-        } else if let Some(row) = rows
-            .iter()
-            .rev()
-            .find(|r| r.state.is_some_and(ActivityState::is_pending))
-        {
-            let state = row.state.unwrap();
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(format!(
-                        "{} {} · {}",
-                        state.icon(),
-                        row.label,
-                        state.label()
-                    ))
-                    .size(ACTIVITY_SIZE)
-                    .weak(),
-                )
-                .truncate(),
-            );
-        } else if let Some(row) = rows
-            .iter()
-            .rev()
-            .find(|r| r.state == Some(ActivityState::Failed))
-        {
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(format!(
-                        "⚠ {}",
-                        row.detail.as_deref().unwrap_or("工具未完成")
-                    ))
-                    .size(ACTIVITY_SIZE)
-                    .weak(),
-                )
-                .truncate(),
-            );
-        } else if let Some(row) = rows.iter().rev().find(|r| {
-            matches!(
-                r.state,
-                Some(ActivityState::Denied | ActivityState::Cancelled | ActivityState::Interrupted)
-            )
-        }) {
-            let state = row.state.unwrap();
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(format!(
-                        "{} {} · {}",
-                        state.icon(),
-                        row.label,
-                        state.label()
-                    ))
-                    .size(ACTIVITY_SIZE)
-                    .weak(),
-                )
-                .truncate(),
-            );
+            }
         }
-    });
-    ui.ctx().data_mut(|data| data.insert_temp(id, disclosure));
-    ui.add_space(4.0);
+        target
+    }
+}
+
+/// Even an offscreen match has a galley. Use its actual wrapped glyph row for
+/// navigation; a long line can itself be taller than the bounded list.
+fn line(
+    ui: &mut egui::Ui,
+    text: &str,
+    query: &str,
+    active: Option<usize>,
+    wrap: bool,
+) -> Option<egui::Rect> {
+    let ranges = find_ranges(text, query);
+    let font = egui::FontId::proportional(ACTIVITY_SIZE);
+    if ranges.is_empty() {
+        let label = egui::Label::new(egui::RichText::new(text).font(font).weak());
+        ui.add(if wrap { label.wrap() } else { label.truncate() });
+        return None;
+    }
+    let palette = theme::current_palette(ui.ctx());
+    let normal = egui::TextFormat {
+        font_id: font,
+        color: ui.visuals().weak_text_color(),
+        ..Default::default()
+    };
+    let mut job = egui::text::LayoutJob::default();
+    let mut start = 0;
+    for (i, range) in ranges.iter().enumerate() {
+        job.append(&text[start..range.start], 0.0, normal.clone());
+        let (background, color) = if Some(i) == active {
+            (palette.accent, palette.accent_text)
+        } else {
+            (
+                palette.accent.gamma_multiply(0.28),
+                ui.visuals().text_color(),
+            )
+        };
+        job.append(
+            &text[range.clone()],
+            0.0,
+            egui::TextFormat {
+                color,
+                background,
+                ..normal.clone()
+            },
+        );
+        start = range.end;
+    }
+    job.append(&text[start..], 0.0, normal);
+    if let Some(range) = active.and_then(|i| ranges.get(i)) {
+        job.wrap.max_width = ui.available_width().max(1.0);
+        let galley = ui.fonts(|f| f.layout_job(job));
+        let mut cursor = egui::text::CCursor::new(text[..range.start].chars().count());
+        cursor.prefer_next_row = true;
+        let word_row = galley.pos_from_cursor(cursor);
+        let response = ui.add(egui::Label::new(galley).halign(egui::Align::LEFT));
+        Some(word_row.translate(response.rect.left_top().to_vec2()))
+    } else {
+        let label = egui::Label::new(job);
+        ui.add(if wrap { label.wrap() } else { label.truncate() });
+        None
+    }
 }
 
 #[cfg(test)]
@@ -285,12 +411,16 @@ mod tests {
     use super::*;
     use crate::chat::activity::ToolActivity;
 
+    fn show(ui: &mut egui::Ui, messages: &[ChatMessage], owner: Option<Uuid>) {
+        Group::new(messages, owner).show(ui, "", None, false);
+    }
+
     fn failures() -> Vec<ChatMessage> {
         (0..30)
             .map(|i| {
                 let mut activity =
                     ToolActivity::web("web_search", &format!(r#"{{"query":"中文 query {i}"}}"#));
-                activity.finish("ERROR: HTTP 202: <!DOCTYPE html>private-token");
+                activity.fail("HTTP 202: <!DOCTYPE html>private-token");
                 let mut message = ChatMessage::new(ChatRole::Activity, &activity.label);
                 message.activity = Some(activity);
                 message
@@ -301,17 +431,41 @@ mod tests {
     #[test]
     fn repeated_failures_merge_without_losing_queries_or_claiming_success() {
         let messages = failures();
-        let rows = rows(&messages, None);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].queries.len(), 30);
-        assert_eq!(rows[0].state, Some(ActivityState::Failed));
+        let group = Group::new(&messages, None);
+        assert_eq!(group.rows.len(), 1);
+        assert_eq!(group.rows[0].calls.len(), 30);
+        assert_eq!(group.rows[0].state, Some(ActivityState::Failed));
+        assert_eq!(group.find_hits("query").len(), 30);
+        assert_eq!(group.find_hits("HTTP 202").len(), 1);
         let legacy = ChatMessage::new(
             ChatRole::Activity,
             "⚠︎ web_search failed: HTTP 202: <!DOCTYPE html>private-token",
         );
-        let rows = super::rows(&[legacy], None);
-        assert_eq!(rows[0].label, "搜尋未取得可用結果 · HTTP 202");
-        assert_eq!(rows[0].state, None);
+        let group = Group::new(&[legacy], None);
+        assert_eq!(group.rows[0].calls[0].1, "搜尋未取得可用結果 · HTTP 202");
+        assert_eq!(group.rows[0].state, Some(ActivityState::Failed));
+    }
+
+    #[test]
+    fn pause_on_second_http_error_preserves_same_status_group_and_safe_find_hits() {
+        let mut messages = vec![];
+        let owner = Uuid::new_v4();
+        for (i, paused) in [false, true].into_iter().enumerate() {
+            let mut a = ToolActivity::new(ActivityKind::Search, format!("搜尋：query {i}"));
+            a.owner = Some(owner);
+            a.fail_http(reqwest::StatusCode::ACCEPTED, paused);
+            let mut m = ChatMessage::new(ChatRole::Activity, &a.label);
+            m.activity = Some(a);
+            messages.push(m);
+        }
+        // The different text for the second attempt should not split the row.
+        let group = Group::new(&messages, None);
+        assert_eq!(group.rows.len(), 1);
+        assert_eq!(group.rows[0].calls.len(), 2);
+        assert!(group.summary(false).contains("失敗 2"));
+        assert_eq!(group.find_hits("HTTP 202").len(), 1);
+        assert_eq!(group.find_hits("本輪後續搜尋已暫停").len(), 1);
+        assert_eq!(group.find_hits("query").len(), 2);
     }
 
     #[test]
@@ -384,12 +538,23 @@ mod tests {
         events: Vec<egui::Event>,
         time: f64,
     ) -> (egui::FullOutput, egui::Rect) {
+        frame_at(ctx, messages, owner, events, time, 300.0)
+    }
+
+    fn frame_at(
+        ctx: &egui::Context,
+        messages: &[ChatMessage],
+        owner: Option<Uuid>,
+        events: Vec<egui::Event>,
+        time: f64,
+        width: f32,
+    ) -> (egui::FullOutput, egui::Rect) {
         let mut rect = egui::Rect::NOTHING;
         let output = ctx.run(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    egui::vec2(300.0, 500.0),
+                    egui::vec2(width, 500.0),
                 )),
                 events,
                 time: Some(time / 60.0),
@@ -425,6 +590,51 @@ mod tests {
                 modifiers: egui::Modifiers::NONE,
             },
         ]
+    }
+
+    #[test]
+    fn hovering_an_elided_legacy_warning_only_reveals_its_safe_summary() {
+        let messages = [ChatMessage::new(
+            ChatRole::Activity,
+            "⚠︎ fetch_url failed: HTTP 429: <!DOCTYPE html><body>private-token</body>",
+        )];
+        let ctx = egui::Context::default();
+        ctx.style_mut(|s| {
+            s.interaction.tooltip_delay = 0.;
+            s.interaction.show_tooltips_only_when_still = false;
+        });
+        let width = 120.;
+        let (initial, _) = frame_at(&ctx, &messages, None, vec![], 0., width);
+        let pos = text_rect(&initial, "HTTP 429").unwrap().0.center();
+        frame_at(
+            &ctx,
+            &messages,
+            None,
+            vec![egui::Event::PointerMoved(pos)],
+            1.,
+            width,
+        );
+        let (hovered, _) = frame_at(&ctx, &messages, None, vec![], 2., width);
+        let mut elided = false;
+        let mut tooltip = false;
+        for shape in &hovered.shapes {
+            if let egui::Shape::Text(text) = &shape.shape {
+                let displayed = text.galley.text();
+                assert!(!displayed.contains("DOCTYPE") && !displayed.contains("private-token"));
+                if displayed.contains("HTTP 429（請稍後再試）") {
+                    if text.galley.elided {
+                        elided = true
+                    } else {
+                        tooltip = true
+                    }
+                }
+            }
+        }
+        assert!(
+            elided && tooltip,
+            "expected both the truncated preview and full tooltip"
+        );
+        assert!(messages[0].text.contains("DOCTYPE"));
     }
 
     #[test]
@@ -522,11 +732,11 @@ mod tests {
         let mut messages = vec![ChatMessage::new(ChatRole::Activity, "MCP fixture")];
         messages[0].activity = Some(activity.clone());
         assert_eq!(
-            rows(&messages, None)[0].state,
+            Group::new(&messages, None).rows[0].state,
             Some(ActivityState::Interrupted)
         );
         assert_eq!(
-            rows(&messages, Some(owner))[0].state,
+            Group::new(&messages, Some(owner)).rows[0].state,
             Some(ActivityState::WaitingApproval)
         );
         let ctx = egui::Context::default();
@@ -550,5 +760,45 @@ mod tests {
             !ctx.data_mut(|data| data.get_temp::<Disclosure>(id).unwrap())
                 .expanded
         );
+    }
+
+    #[test]
+    fn collapsed_stop_and_skipped_counts_use_effective_states() {
+        let messages: Vec<_> = [
+            (ActivityState::Succeeded, None),
+            (ActivityState::Running, None), // reloaded after dispatch to an MCP tool
+            (ActivityState::CancelledBeforeSend, None),
+            (ActivityState::Skipped, Some("本輪搜尋已暫停，未再送出請求")),
+        ]
+        .into_iter()
+        .map(|(state, detail)| {
+            let mut activity = ToolActivity::new(ActivityKind::McpTool, "fixture");
+            activity.state = state;
+            activity.detail = detail.map(str::to_owned);
+            let mut message = ChatMessage::new(ChatRole::Activity, "not a display field");
+            message.activity = Some(activity);
+            message
+        })
+        .collect();
+        let ctx = egui::Context::default();
+        let (output, rect) = frame(&ctx, &messages, None, vec![], 1.0);
+        let summary = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text().contains("工具活動") => {
+                    Some(text)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(!summary.galley.elided);
+        assert!(summary
+            .galley
+            .text()
+            .contains("完成 1／失敗 0／略過 1／結果未知 1／未執行 1"));
+        assert!(text_rect(&output, "未再送出請求").is_some());
+        assert!(text_rect(&output, "詳情").is_none());
+        assert!(rect.height() < 80.0);
     }
 }

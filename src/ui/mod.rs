@@ -5,6 +5,7 @@ pub mod chat_layout;
 pub mod composer;
 pub mod controls;
 pub mod file_drop;
+pub mod find;
 mod font_catalog;
 mod font_cmap;
 pub mod fonts;

@@ -26,10 +26,11 @@ use popchat_windows::chat::{attach, backends, chatgpt_auth, clipboard, codex};
 use popchat_windows::instance::{InstanceGuard, InstanceLaunch, ReopenRequest};
 use popchat_windows::logf;
 use popchat_windows::ui::{
-    chat_layout,
+    activity, chat_layout,
     composer::{Composer, ComposerAction},
     controls,
     file_drop::FileDropFeedback,
+    find::find_ranges,
     fonts::{self, install_cjk_font},
     history,
     hotkey::{HotkeyEvent, HotkeyManager},
@@ -62,6 +63,7 @@ struct ActiveStream {
     rx: std::sync::mpsc::Receiver<ChatStreamEvent>,
     turn: ActiveTurn,
     handle: tokio::task::JoinHandle<()>,
+    mcp_progress: Option<popchat_windows::chat::mcp::McpCallProgress>,
 }
 
 enum AppEvent {
@@ -98,6 +100,96 @@ struct FindState {
     index: usize,
     focus: bool,
     scroll: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FindHit {
+    Message(Uuid, usize),
+    Activity(activity::Hit),
+}
+
+impl FindHit {
+    fn in_message(self, id: Uuid) -> Option<usize> {
+        match self {
+            Self::Message(message, occurrence) if message == id => Some(occurrence),
+            _ => None,
+        }
+    }
+}
+
+enum TranscriptRow<'a> {
+    Message(usize, &'a ChatMessage),
+    Activity(activity::Group),
+}
+
+fn transcript_rows(messages: &[ChatMessage], owner: Option<Uuid>) -> Vec<TranscriptRow<'_>> {
+    let mut rows = Vec::new();
+    let mut i = 0;
+    while let Some(message) = messages.get(i) {
+        if message.role == ChatRole::Activity {
+            let count = messages[i..]
+                .iter()
+                .take_while(|m| m.role == ChatRole::Activity)
+                .count();
+            rows.push(TranscriptRow::Activity(activity::Group::new(
+                &messages[i..i + count],
+                owner,
+            )));
+            i += count;
+        } else {
+            rows.push(TranscriptRow::Message(i, message));
+            i += 1;
+        }
+    }
+    rows
+}
+
+impl FindState {
+    fn needle(&self) -> &str {
+        if self.open {
+            self.query.trim()
+        } else {
+            ""
+        }
+    }
+
+    fn hits(&self, rows: &[TranscriptRow<'_>], full_text: impl Fn(Uuid) -> String) -> Vec<FindHit> {
+        let query = self.needle();
+        let mut hits = Vec::new();
+        if !query.is_empty() {
+            for row in rows {
+                match row {
+                    TranscriptRow::Activity(group) => {
+                        hits.extend(group.find_hits(query).into_iter().map(FindHit::Activity));
+                    }
+                    TranscriptRow::Message(_, message) => {
+                        let count: usize =
+                            searchable_message_strings(message, &full_text(message.id))
+                                .iter()
+                                .map(|text| find_ranges(text, query).len())
+                                .sum();
+                        hits.extend((0..count).map(|i| FindHit::Message(message.id, i)));
+                    }
+                }
+            }
+        }
+        hits
+    }
+
+    fn step(&mut self, delta: isize, count: usize) {
+        if count > 0 {
+            self.index = (self.index as isize + delta).rem_euclid(count as isize) as usize;
+        }
+        self.scroll = true;
+    }
+
+    fn show_activity(&self, ui: &mut egui::Ui, group: &activity::Group, active: Option<FindHit>) {
+        let hit = match active {
+            Some(FindHit::Activity(hit)) => Some(hit),
+            _ => None,
+        };
+        group.show(ui, self.needle(), hit, self.scroll);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1229,30 +1321,26 @@ impl PopChatApp {
         }
     }
 
-    fn find_hits(&self) -> Vec<(Uuid, usize)> {
-        if !self.find.open {
+    fn activity_owner(&self) -> Option<Uuid> {
+        self.active_stream
+            .as_ref()
+            .filter(|_| self.chat.is_streaming)
+            .map(|s| s.turn.assistant_id)
+    }
+
+    fn find_hits(&self) -> Vec<FindHit> {
+        if self.find.needle().is_empty() {
             return Vec::new();
         }
-        self.chat
-            .messages
-            .iter()
-            .flat_map(|message| {
-                let count = searchable_message_strings(message, &self.chat.full_text(message.id))
-                    .iter()
-                    .map(|text| find_ranges(text, self.find.query.trim()).len())
-                    .sum::<usize>();
-                (0..count).map(move |occurrence| (message.id, occurrence))
-            })
-            .collect()
+        self.find.hits(
+            &transcript_rows(&self.chat.messages, self.activity_owner()),
+            |id| self.chat.full_text(id),
+        )
     }
 
     fn step_find(&mut self, delta: isize) {
         let count = self.find_hits().len();
-        if count > 0 {
-            self.find.index =
-                (self.find.index as isize + delta).rem_euclid(count as isize) as usize;
-        }
-        self.find.scroll = true;
+        self.find.step(delta, count);
     }
 
     fn toggle_find(&mut self) {
@@ -2191,7 +2279,8 @@ impl PopChatApp {
         popchat_windows::ui::typography::apply(ui, self.settings_ui.settings.chat_font_size);
         let now = std::time::Instant::now();
         self.copied_messages.retain(|_, until| *until > now);
-        let hits = self.find_hits();
+        let rows = transcript_rows(&self.chat.messages, self.activity_owner());
+        let hits = self.find.hits(&rows, |id| self.chat.full_text(id));
         let active_hit = hits.get(self.find.index).copied();
         let mut action = None;
         let mut manual_exception = None;
@@ -2220,7 +2309,14 @@ impl PopChatApp {
             .stick_to_bottom(!self.find.open)
             .show(ui, |ui| {
                 chat_layout::transcript_contents(ui, |ui| {
-                    for (message_index, msg) in self.chat.messages.iter().enumerate() {
+                    for row in &rows {
+                        let (message_index, msg) = match row {
+                            TranscriptRow::Activity(group) => {
+                                self.find.show_activity(ui, group, active_hit);
+                                continue;
+                            }
+                            TranscriptRow::Message(index, message) => (*index, *message),
+                        };
                         let row_streaming = msg.role == ChatRole::Assistant
                             && self.chat.is_streaming
                             && self
@@ -2350,47 +2446,10 @@ impl PopChatApp {
                                 }
                                 ui.add_space(6.0);
                             }
-                            ChatRole::Activity => {
-                                if message_index == 0
-                                    || self.chat.messages[message_index - 1].role
-                                        != ChatRole::Activity
-                                {
-                                    let count = self.chat.messages[message_index..]
-                                        .iter()
-                                        .take_while(|m| m.role == ChatRole::Activity)
-                                        .count();
-                                    let group =
-                                        &self.chat.messages[message_index..message_index + count];
-                                    let rect = ui
-                                        .scope(|ui| {
-                                            popchat_windows::ui::activity::show(
-                                                ui,
-                                                group,
-                                                self.active_stream
-                                                    .as_ref()
-                                                    .filter(|_| self.chat.is_streaming)
-                                                    .map(|s| s.turn.assistant_id),
-                                            )
-                                        })
-                                        .response
-                                        .rect;
-                                    if self.find.open
-                                        && find_scroll
-                                        && active_hit
-                                            .is_some_and(|(id, _)| group.iter().any(|m| m.id == id))
-                                    {
-                                        ui.scroll_to_rect(rect, Some(egui::Align::Center));
-                                    }
-                                }
-                            }
+                            ChatRole::Activity => unreachable!("activity rows are projected above"),
                         }
-                        if self.find.open
-                            && msg.role != ChatRole::Activity
-                            && hits.iter().any(|(id, _)| *id == msg.id)
-                        {
-                            let active = active_hit
-                                .filter(|(id, _)| *id == msg.id)
-                                .map(|(_, occurrence)| occurrence);
+                        if self.find.open && hits.iter().any(|h| h.in_message(msg.id).is_some()) {
+                            let active = active_hit.and_then(|h| h.in_message(msg.id));
                             let active_rect = paint_find_matches(
                                 ui,
                                 shape_start,
@@ -2852,6 +2911,7 @@ impl PopChatApp {
                 }
             }
         };
+        let mcp_progress = mcp.as_ref().map(|m| m.call_progress());
         let (tx, rx) = std::sync::mpsc::channel::<ChatStreamEvent>();
         let handle = self.runtime.spawn(async move {
             let mut stream = popchat_windows::chat::compaction::run_with_mcp(
@@ -2863,18 +2923,41 @@ impl PopChatApp {
                 }
             }
         });
-        self.active_stream = Some(ActiveStream { rx, turn, handle });
+        self.active_stream = Some(ActiveStream {
+            rx,
+            turn,
+            handle,
+            mcp_progress,
+        });
     }
 
     /// Stop 按鈕：abort 背景 task 並以已到達的 partial/reasoning 收尾 persist。
     fn stop_active_stream(&mut self) {
-        if let Some(request) = self.mcp_approval.take() {
-            let _ = request.respond.send(false);
-        }
-        if let Some(active) = self.active_stream.take() {
+        // Freeze the RPC dispatch gate first. An accepted one-shot may not have
+        // been consumed yet and the last UI lifecycle event can be a frame old.
+        let calls = self
+            .active_stream
+            .as_ref()
+            .and_then(|s| s.mcp_progress.as_ref())
+            .map(|progress| progress.stop())
+            .unwrap_or_default();
+        if let Some(mut active) = self.active_stream.take() {
             active.handle.abort();
+            // Preserve final activities already forwarded (e.g. the server
+            // answered between UI frames) and their transcript order. Do not
+            // open queued dialogs. Then settle any calls for which UI events lag.
+            for event in active.rx.try_iter() {
+                if matches!(event, ChatStreamEvent::ToolActivity(_)) {
+                    self.chat
+                        .apply_event(&mut active.turn, event, &mut self.providers);
+                }
+            }
+            self.chat.record_mcp_stop(active.turn.assistant_id, calls);
             self.chat.stop();
             self.chat.finish_turn(&active.turn);
+        }
+        if let Some(request) = self.mcp_approval.take() {
+            let _ = request.respond.send(false);
         }
     }
 
@@ -3200,45 +3283,6 @@ mod attachment_drop_tests {
     }
 }
 
-/// Fold case/diacritics while retaining a mapping back to UTF-8 byte ranges.
-/// Lowercasing can expand one scalar, so offsets into the folded string must
-/// never be used to slice the user's original text.
-fn folded_with_ranges(text: &str) -> (String, Vec<std::ops::Range<usize>>) {
-    use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
-    let mut folded = String::new();
-    let mut ranges = Vec::new();
-    for (offset, character) in text.char_indices() {
-        for decomposed in character
-            .to_string()
-            .nfd()
-            .filter(|c| !is_combining_mark(*c))
-        {
-            for lower in decomposed.to_lowercase() {
-                folded.push(lower);
-                ranges.extend(std::iter::repeat_n(
-                    offset..offset + character.len_utf8(),
-                    lower.len_utf8(),
-                ));
-            }
-        }
-    }
-    (folded, ranges)
-}
-
-fn find_ranges(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
-    let (needle, _) = folded_with_ranges(query);
-    if needle.is_empty() {
-        return Vec::new();
-    }
-    let (haystack, mapping) = folded_with_ranges(text);
-    haystack
-        .match_indices(&needle)
-        .filter_map(|(start, matched)| {
-            Some(mapping.get(start)?.start..mapping.get(start + matched.len() - 1)?.end)
-        })
-        .collect()
-}
-
 fn markdown_display_text(markdown: &str) -> String {
     let mut result = String::new();
     for event in pulldown_cmark::Parser::new_ext(markdown, pulldown_cmark::Options::all()) {
@@ -3270,6 +3314,11 @@ fn markdown_display_text(markdown: &str) -> String {
 /// pasteable/code bodies are verbatim, cells are searched independently,
 /// and bitmap display math has no searchable text.
 fn searchable_message_strings(message: &ChatMessage, full_text: &str) -> Vec<String> {
+    if message.role == ChatRole::Activity {
+        // Activity is searched as a group of safe display fields, never by
+        // asking the store for its old transcript text.
+        return Vec::new();
+    }
     if message.role != ChatRole::Assistant {
         return vec![full_text.to_owned()];
     }
@@ -3464,6 +3513,320 @@ fn paint_find_matches(
         }
     });
     active_rect
+}
+
+#[cfg(test)]
+mod activity_find_tests {
+    use super::*;
+    use popchat_windows::chat::activity::{ActivityKind, ToolActivity};
+
+    fn activity_record(activity: ToolActivity) -> ChatMessage {
+        let mut record = ChatMessage::new(ChatRole::Activity, "hidden raw transcript sentinel");
+        record.activity = Some(activity);
+        record
+    }
+
+    fn hits(
+        find: &FindState,
+        rows: &[TranscriptRow<'_>],
+        messages: &[ChatMessage],
+    ) -> Vec<FindHit> {
+        find.hits(rows, |id| {
+            let message = messages.iter().find(|m| m.id == id).unwrap();
+            assert_ne!(
+                message.role,
+                ChatRole::Activity,
+                "raw activity passed to Find"
+            );
+            message.text.clone()
+        })
+    }
+
+    struct Frame {
+        output: egui::FullOutput,
+        outer: egui::Rect,
+        offset: f32,
+    }
+
+    // Exercise the transcript's actual group builder, Find selection, ordinary
+    // highlight painter and nested activity widgets in a small outer viewport.
+    fn draw(
+        ctx: &egui::Context,
+        rows: &[TranscriptRow<'_>],
+        find: &FindState,
+        active: Option<FindHit>,
+        time: &mut f64,
+    ) -> Frame {
+        *time += 1.0;
+        let mut outer = egui::Rect::NOTHING;
+        let mut offset = 0.;
+        let output = ctx.run(
+            egui::RawInput {
+                time: Some(*time),
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(205., 230.),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    popchat_windows::ui::typography::apply(ui, 24);
+                    let scroll = egui::ScrollArea::vertical()
+                        .max_height(145.)
+                        .min_scrolled_height(0.)
+                        .auto_shrink([false; 2])
+                        .stick_to_bottom(!find.open)
+                        .show(ui, |ui| {
+                            chat_layout::transcript_contents(ui, |ui| {
+                                for row in rows {
+                                    match row {
+                                        TranscriptRow::Activity(group) => {
+                                            find.show_activity(ui, group, active)
+                                        }
+                                        TranscriptRow::Message(_, msg) => {
+                                            let start = ui.ctx().graphics(|g| {
+                                                g.get(ui.layer_id()).map_or(0, |l| l.next_idx().0)
+                                            });
+                                            ui.label(&msg.text);
+                                            let occurrence =
+                                                active.and_then(|h| h.in_message(msg.id));
+                                            let rect = paint_find_matches(
+                                                ui,
+                                                start,
+                                                None,
+                                                find.needle(),
+                                                occurrence,
+                                            );
+                                            if let Some(rect) = rect.filter(|_| find.scroll) {
+                                                ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                                            }
+                                        }
+                                    }
+                                }
+                            })
+                        });
+                    outer = scroll.inner_rect;
+                    offset = scroll.state.offset.y;
+                });
+            },
+        );
+        Frame {
+            output,
+            outer,
+            offset,
+        }
+    }
+
+    fn jump(
+        ctx: &egui::Context,
+        rows: &[TranscriptRow<'_>],
+        find: &mut FindState,
+        all: &[FindHit],
+        time: &mut f64,
+    ) -> Frame {
+        let active = Some(all[find.index]);
+        assert!(find.scroll);
+        draw(ctx, rows, find, active, time);
+        find.scroll = false; // production consumes navigation only once
+        draw(ctx, rows, find, active, time);
+        draw(ctx, rows, find, active, time)
+    }
+
+    fn assert_active(
+        ctx: &egui::Context,
+        frame: &Frame,
+        label: &str,
+        query: &str,
+        occurrence: usize,
+    ) {
+        let accent = theme::current_palette(ctx).accent;
+        let mut found = 0;
+        for clipped in &frame.output.shapes {
+            let egui::Shape::Text(text) = &clipped.shape else {
+                continue;
+            };
+            let job = &text.galley.job;
+            for section in job
+                .sections
+                .iter()
+                .filter(|s| s.format.background == accent)
+            {
+                found += 1;
+                assert!(job.text.contains(label), "wrong call: {}", job.text);
+                let range = &find_ranges(&job.text, query)[occurrence];
+                assert_eq!(
+                    &section.byte_range, range,
+                    "wrong occurrence in {}",
+                    job.text
+                );
+                assert_eq!(section.format.font_id.size, 12.);
+                let start = job.text[..range.start].chars().count();
+                let length = job.text[range.clone()].chars().count();
+                let glyphs: Vec<_> = text
+                    .galley
+                    .rows
+                    .iter()
+                    .flat_map(|row| {
+                        row.glyphs.iter().map(|g| {
+                            g.logical_rect()
+                                .translate(text.pos.to_vec2() + row.pos.to_vec2())
+                        })
+                    })
+                    .skip(start)
+                    .take(length)
+                    .collect();
+                assert_eq!(glyphs.len(), length, "highlight was elided");
+                for glyph in glyphs {
+                    assert!(
+                        clipped.clip_rect.contains(glyph.center())
+                            && frame.outer.contains(glyph.center()),
+                        "selected glyph {glyph:?} outside inner {:?} or outer {:?}",
+                        clipped.clip_rect,
+                        frame.outer
+                    );
+                }
+            }
+        }
+        assert_eq!(found, 1, "expected one visible active '{label}' occurrence");
+    }
+
+    #[test]
+    fn find_activity_uses_safe_fields_for_count_display_and_legacy_angle_brackets() {
+        let legacy = "⚠︎ web_search failed: HTTP 202: <!DOCTYPE html>\n<head>private-token</head>";
+        let literal = "Searching: Rust Vec<T>, 2 < 3, build failed: why?";
+        let attempt = || {
+            let mut activity = ToolActivity::new(ActivityKind::Search, "same query");
+            activity.fail("HTTP 202: <!DOCTYPE html>private-token");
+            activity_record(activity)
+        };
+        let messages = vec![
+            ChatMessage::new(ChatRole::Activity, legacy),
+            ChatMessage::new(ChatRole::Activity, literal),
+            attempt(),
+            attempt(),
+        ];
+        let original = messages.clone();
+        let rows = transcript_rows(&messages, None);
+        let mut find = FindState {
+            open: true,
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let mut time = 0.;
+        for (query, expected) in [
+            ("DOCTYPE", 0),
+            ("private-token", 0),
+            ("raw transcript", 0),
+            ("web_search failed:", 0),
+            ("same query", 2),
+            ("HTTP 202", 2),
+            ("Vec<T>", 1),
+            ("2 < 3", 1),
+            ("failed:", 1),
+        ] {
+            find.query = query.into();
+            let all = hits(&find, &rows, &messages);
+            assert_eq!(all.len(), expected, "query {query:?}");
+            if query == "same query" {
+                assert_ne!(all[0], all[1], "distinct calls");
+            }
+            if query == "HTTP 202" || query == "Vec<T>" {
+                for i in 0..all.len() {
+                    find.index = i;
+                    find.scroll = true;
+                    let frame = jump(&ctx, &rows, &mut find, &all, &mut time);
+                    assert_active(
+                        &ctx,
+                        &frame,
+                        if query == "Vec<T>" {
+                            literal
+                        } else {
+                            "搜尋未取得可用結果"
+                        },
+                        query,
+                        0,
+                    );
+                    assert!(!frame.output.shapes.iter().any(|s| matches!(&s.shape,
+                        egui::Shape::Text(t) if t.galley.text().contains("DOCTYPE") || t.galley.text().contains("private-token"))));
+                }
+            }
+        }
+        assert_eq!(messages, original, "projection must not rewrite history");
+    }
+
+    #[test]
+    fn find_activity_next_reveals_exact_glyph_in_nested_scrollers_and_merged_calls() {
+        let mut detail = ToolActivity::new(ActivityKind::McpTool, "first tool");
+        detail.succeed();
+        detail.detail = Some("First detail Café".into());
+        let mut messages = vec![
+            ChatMessage::new(ChatRole::User, "Ordinary Café"),
+            activity_record(detail),
+        ];
+        messages.extend((0..25).map(|i| ChatMessage::new(ChatRole::User, format!("Earlier {i}"))));
+        for i in 0..45 {
+            let mut activity = ToolActivity::new(ActivityKind::McpTool, format!("tool {i}"));
+            activity.succeed();
+            messages.push(activity_record(activity));
+        }
+        for i in 0..35 {
+            let query = if (32..=33).contains(&i) {
+                format!("query {i}: Café {} CAFÉ", "wrapping ".repeat(15))
+            } else {
+                format!("query {i}")
+            };
+            let mut activity = ToolActivity::new(ActivityKind::Search, query);
+            activity.fail("HTTP 202: private-token");
+            messages.push(activity_record(activity));
+        }
+        messages.extend((0..25).map(|i| ChatMessage::new(ChatRole::User, format!("Later {i}"))));
+
+        let ctx = egui::Context::default();
+        let rows = transcript_rows(&messages, None);
+        let mut find = FindState {
+            open: true,
+            query: "cafe".into(),
+            scroll: true,
+            ..Default::default()
+        };
+        let all = hits(&find, &rows, &messages);
+        assert_eq!(all.len(), 6);
+        let mut time = 0.;
+        let initial = jump(&ctx, &rows, &mut find, &all, &mut time);
+        let ordinary = initial.output.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Vec(shapes)
+            if shapes.iter().any(|s| matches!(s, egui::Shape::Rect(_))) && shapes.iter().any(|s| matches!(s,
+                egui::Shape::Text(t) if t.galley.text() == "Ordinary Café" && t.galley.job.sections[0].format.font_id.size == 24.))));
+        assert!(ordinary, "ordinary 24pt highlight must still be painted");
+        assert!(!initial
+            .output
+            .shapes
+            .iter()
+            .any(|s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text().contains("詳情"))));
+        for (index, (label, occurrence)) in [
+            ("First detail", 0),
+            ("query 32:", 0),
+            ("query 32:", 1),
+            ("query 33:", 0),
+            ("query 33:", 1),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            find.step(1, all.len());
+            let frame = jump(&ctx, &rows, &mut find, &all, &mut time);
+            assert_active(&ctx, &frame, label, "cafe", occurrence);
+            if index > 0 {
+                assert!(
+                    frame.offset > 400.,
+                    "outer transcript did not reach the second group"
+                );
+            }
+        }
+        find.step(-1, all.len());
+        let back = jump(&ctx, &rows, &mut find, &all, &mut time);
+        assert_active(&ctx, &back, "query 33:", "cafe", 0);
+    }
 }
 
 fn validate_api_endpoint(raw: &str) -> Result<(), String> {

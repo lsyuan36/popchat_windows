@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use unicode_segmentation::UnicodeSegmentation;
 
+use super::web::{self, RoundToolChoice, ToolRounds};
 pub use crate::chat::providers::{ContentCapability, ProviderKind};
 
 // MARK: - ProviderConfig
@@ -286,18 +287,49 @@ pub enum WebAccess {
 }
 
 /// Compatibility adapter to the shared, real HTTP executor in `web.rs`.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct WebToolExecutor {
+    // Public in v0.2.10. A caller can explicitly select a different engine.
     pub engine: SearchEngineConfig,
-    pub(super) search_guard: super::web::SearchFailureGuard,
+    cached: std::sync::Mutex<(SearchEngineConfig, Arc<web::WebToolExecutor>)>,
+}
+
+impl Clone for WebToolExecutor {
+    fn clone(&self) -> Self {
+        Self {
+            engine: self.engine.clone(),
+            // Share the current turn's pool/guard. Reconfiguring the clone later
+            // must not reset the original's pause or credentials.
+            cached: std::sync::Mutex::new(self.cached.lock().expect("web tool executor").clone()),
+        }
+    }
 }
 
 impl WebToolExecutor {
     pub fn new(engine: SearchEngineConfig) -> Self {
-        WebToolExecutor {
+        let executor = web::WebToolExecutor::from_config(&engine);
+        Self::with_executor(engine, executor)
+    }
+
+    pub(super) fn with_executor(
+        engine: SearchEngineConfig,
+        executor: web::WebToolExecutor,
+    ) -> Self {
+        Self {
+            cached: std::sync::Mutex::new((engine.clone(), Arc::new(executor))),
             engine,
-            search_guard: Default::default(),
         }
+    }
+
+    fn resolved(&self) -> Arc<web::WebToolExecutor> {
+        let mut cache = self.cached.lock().expect("web tool executor");
+        if cache.0 != self.engine {
+            *cache = (
+                self.engine.clone(),
+                Arc::new(web::WebToolExecutor::from_config(&self.engine)),
+            );
+        }
+        Arc::clone(&cache.1)
     }
 
     /// Human-readable transcript label for a tool call, derived from the
@@ -307,31 +339,67 @@ impl WebToolExecutor {
     }
 
     pub async fn execute(&self, name: &str, arguments_json: &str) -> String {
-        if self.search_guard.blocked(name) {
-            return super::web::SEARCH_PAUSED.into();
-        }
-        let result = match super::web::SearchEngineConfig::try_from(&self.engine)
-            .and_then(super::web::WebToolExecutor::new)
-        {
-            Ok(executor) => executor.execute(name, arguments_json).await,
-            Err(error) => format!("ERROR: {error:#}"),
-        };
-        self.search_guard.observe(name, &result);
-        result
+        self.resolved().execute(name, arguments_json).await
     }
 
     pub async fn execute_tracked(
         &self,
         name: &str,
         arguments: &str,
-        mut emit: impl FnMut(ChatStreamEvent),
+        emit: impl FnMut(ChatStreamEvent),
     ) -> String {
-        let mut activity = super::activity::ToolActivity::web(name, arguments);
-        emit(ChatStreamEvent::ToolActivity(activity.clone()));
-        let result = self.execute(name, arguments).await;
-        activity.finish(&result);
-        emit(ChatStreamEvent::ToolActivity(activity));
-        result
+        self.resolved().execute_tracked(name, arguments, emit).await
+    }
+}
+
+/// Resolve the configured access once per turn. The same executor drives
+/// both the advertised search availability and the actual tool lifecycle.
+pub(super) enum TurnWeb {
+    Local(web::WebToolExecutor),
+    OpenRouterPlugin,
+    Off,
+}
+
+impl From<Option<WebAccess>> for TurnWeb {
+    fn from(access: Option<WebAccess>) -> Self {
+        match access {
+            Some(WebAccess::LocalTools(engine)) => {
+                Self::Local(web::WebToolExecutor::from_config(&engine))
+            }
+            Some(WebAccess::OpenRouterPlugin) => Self::OpenRouterPlugin,
+            _ => Self::Off,
+        }
+    }
+}
+
+impl TurnWeb {
+    pub(super) fn executor(&self) -> Option<&web::WebToolExecutor> {
+        match self {
+            Self::Local(web) => Some(web),
+            _ => None,
+        }
+    }
+}
+
+/// Both transports use the same authorized catalog/dispatch path. MCP
+/// owns its own execution, approval and activity semantics.
+pub(super) async fn execute_turn_tool(
+    rounds: &mut ToolRounds,
+    web: Option<&web::WebToolExecutor>,
+    mcp: Option<&mut super::mcp::ToolCatalog>,
+    name: &str,
+    arguments: &str,
+    tx: &mpsc::UnboundedSender<ChatStreamEvent>,
+) -> String {
+    if let Some(catalog) = mcp.filter(|c| c.contains(name)) {
+        rounds.note_attempt();
+        catalog.execute(name, arguments, tx).await
+    } else {
+        rounds
+            .web_call(web, name, arguments, |event| {
+                let _ = tx.send(event);
+            })
+            .await
     }
 }
 
@@ -401,8 +469,6 @@ fn delegated_backend() -> Option<Arc<dyn ChatBackend>> {
 }
 
 // MARK: - Streaming turn (optionally agentic)
-
-const MAX_TOOL_ROUNDS: usize = 10;
 
 const TOOLS_JSON: &str = r#"[
   {
@@ -522,7 +588,7 @@ async fn run_loop(
 pub(super) async fn run_loop_with_client(
     history: Vec<WireMessage>,
     config: ProviderConfig,
-    web_access: Option<WebAccess>,
+    web_access: impl Into<TurnWeb>,
     mcp: Option<super::mcp::McpTurn>,
     session_id: uuid::Uuid,
     tx: mpsc::UnboundedSender<ChatStreamEvent>,
@@ -531,10 +597,8 @@ pub(super) async fn run_loop_with_client(
     let mut messages = history;
     let mut visible = String::new();
     let mut reasoning = String::new();
-    let executor = match &web_access {
-        Some(WebAccess::LocalTools(engine)) => Some(WebToolExecutor::new(engine.clone())),
-        _ => None,
-    };
+    let web_access = web_access.into();
+    let executor = web_access.executor();
     let mut mcp = match mcp {
         Some(turn) => match turn.open(&tx).await {
             Ok(catalog) => Some(catalog),
@@ -546,16 +610,11 @@ pub(super) async fn run_loop_with_client(
         None => None,
     };
 
-    let mut round = 0usize;
+    let mut rounds = ToolRounds::default();
     loop {
-        // After max_tool_rounds, one final request with tools disabled forces
-        // an answer.
-        let rounds_exhausted = round >= MAX_TOOL_ROUNDS;
-        if rounds_exhausted {
-            let _ = tx.send(ChatStreamEvent::Activity(format!(
-                "Tool-call limit reached ({MAX_TOOL_ROUNDS} rounds) — finishing with what was gathered"
-            )));
-        }
+        let choice = rounds.choice(executor, |event| {
+            let _ = tx.send(event);
+        });
 
         let outcome = match stream_one_round(
             &client,
@@ -564,7 +623,7 @@ pub(super) async fn run_loop_with_client(
             &config,
             &web_access,
             mcp.as_ref().map(|c| c.schemas()).unwrap_or(&[]),
-            rounds_exhausted,
+            choice,
             &visible,
             &reasoning,
             &tx,
@@ -602,7 +661,7 @@ pub(super) async fn run_loop_with_client(
             let _ = tx.send(ChatStreamEvent::Done(visible));
             return;
         }
-        if outcome.tool_calls.is_empty() || rounds_exhausted {
+        if outcome.tool_calls.is_empty() || choice == RoundToolChoice::None {
             let _ = tx.send(ChatStreamEvent::Done(visible));
             return;
         }
@@ -618,31 +677,20 @@ pub(super) async fn run_loop_with_client(
             Some(outcome.tool_calls.clone()),
             None,
         ));
+        rounds.begin_batch();
         for call in &outcome.tool_calls {
             if tx.is_closed() {
                 return;
             }
-            let result =
-                if let Some(catalog) = mcp.as_mut().filter(|c| c.contains(&call.function.name)) {
-                    catalog
-                        .execute(&call.function.name, &call.function.arguments, &tx)
-                        .await
-                } else if let Some(executor) = &executor {
-                    executor
-                        .execute_tracked(&call.function.name, &call.function.arguments, |event| {
-                            let _ = tx.send(event);
-                        })
-                        .await
-                } else {
-                    let result = "ERROR: Unknown or disabled tool.".to_string();
-                    let mut activity = super::activity::ToolActivity::web(
-                        &call.function.name,
-                        &call.function.arguments,
-                    );
-                    activity.finish(&result);
-                    let _ = tx.send(ChatStreamEvent::ToolActivity(activity));
-                    result
-                };
+            let result = execute_turn_tool(
+                &mut rounds,
+                executor,
+                mcp.as_mut(),
+                &call.function.name,
+                &call.function.arguments,
+                &tx,
+            )
+            .await;
             messages.push(WireMessage::new(
                 "tool",
                 Some(WireContent::Text(result)),
@@ -650,7 +698,6 @@ pub(super) async fn run_loop_with_client(
                 Some(call.id.clone()),
             ));
         }
-        round += 1;
     }
 }
 
@@ -810,9 +857,9 @@ async fn stream_one_round(
     session_id: uuid::Uuid,
     messages: &[WireMessage],
     config: &ProviderConfig,
-    web_access: &Option<WebAccess>,
+    web_access: &TurnWeb,
     mcp_tools: &[serde_json::Value],
-    tools_disabled: bool,
+    choice: RoundToolChoice,
     visible_prefix: &str,
     reasoning_prefix: &str,
     tx: &mpsc::UnboundedSender<ChatStreamEvent>,
@@ -838,11 +885,19 @@ async fn stream_one_round(
     // client): `/models` standardizes no capability metadata, so the effort
     // only travels on backends that advertise it.
     match web_access {
-        Some(WebAccess::LocalTools(_)) if !tools_disabled => {
-            body["tools"] = serde_json::from_str(TOOLS_JSON)
+        TurnWeb::Local(_) if choice != RoundToolChoice::None => {
+            let mut tools: Vec<serde_json::Value> = serde_json::from_str(TOOLS_JSON)
                 .map_err(|e| ClientError::new(format!("Encoding tools failed: {e}")))?;
+            if choice == RoundToolChoice::WithoutSearch {
+                tools.retain(|tool| {
+                    tool["function"]["name"]
+                        .as_str()
+                        .is_some_and(|name| choice.allows(name))
+                });
+            }
+            body["tools"] = tools.into();
         }
-        Some(WebAccess::OpenRouterPlugin) => {
+        TurnWeb::OpenRouterPlugin => {
             body["plugins"] = serde_json::json!([{ "id": "web" }]);
         }
         _ => {}
@@ -855,7 +910,7 @@ async fn stream_one_round(
             .unwrap_or_default();
         tools.extend_from_slice(mcp_tools);
         body["tools"] = serde_json::Value::Array(tools);
-        if tools_disabled {
+        if choice == RoundToolChoice::None {
             body["tool_choice"] = serde_json::json!("none");
         }
     }
@@ -1511,6 +1566,92 @@ mod tests {
         );
         assert!(bodies[1].get("reasoning_effort").is_none());
         assert!(!bodies[1].to_string().contains("think-1"));
+    }
+
+    #[tokio::test]
+    async fn paused_search_is_removed_from_chat_tools_and_skip_only_forces_one_final_round() {
+        use super::web::pause_fixture as fixture;
+        let server = MockServer::start().await;
+        let executor = fixture::mount(&server, 1).await;
+        let page = format!("{}/page", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer offline-test-key",
+            ))
+            .respond_with(move |request: &Request| {
+                let body: Value = request.body_json().unwrap();
+                let messages = body["messages"].as_array().unwrap();
+                let round = messages.iter().filter(|m| m["role"] == "assistant").count();
+                let batch = fixture::calls(round, &page);
+                let delta = if batch.is_empty() {
+                    json!({"content":"fixture answer"})
+                } else {
+                    let calls: Vec<_> = batch
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, (id, name, args))| {
+                            json!({
+                                "index": index, "id": id,
+                                "function": {"name": name, "arguments": args.to_string()}
+                            })
+                        })
+                        .collect();
+                    json!({"tool_calls":calls})
+                };
+                ResponseTemplate::new(200)
+                    .set_body_string(format!("{}data: [DONE]\n\n", sse(delta)))
+            })
+            .expect(5)
+            .mount(&server)
+            .await;
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(run_loop_with_client(
+            history(),
+            config(server.uri()),
+            TurnWeb::Local(executor),
+            Some(fixture::mcp()),
+            uuid::Uuid::new_v4(),
+            tx,
+            reqwest::Client::new(),
+        ));
+        fixture::check_events(&collect(rx).await);
+
+        let bodies = fixture::model_requests(&server, "/chat/completions").await;
+        let all = bodies[0]["tools"].as_array().unwrap();
+        assert!(all.iter().any(|t| t["function"]["name"] == "web_search"));
+        assert!(all.iter().any(|t| t["function"]["name"] == "fetch_url"));
+        assert!(all.iter().any(|t| t["function"]["name"] == "mcp_status"));
+        let restricted: Vec<_> = all
+            .iter()
+            .filter(|t| t["function"]["name"] != "web_search")
+            .collect();
+        assert_eq!(bodies[1]["tools"], json!(all));
+        for body in &bodies[2..4] {
+            assert_eq!(body["tools"], json!(restricted));
+            assert!(body.get("tool_choice").is_none());
+        }
+        assert_eq!(bodies[4]["tool_choice"], "none");
+        for (round, body) in bodies.iter().enumerate() {
+            let messages = body["messages"].as_array().unwrap();
+            let ids: Vec<_> = messages
+                .iter()
+                .flat_map(|m| m["tool_calls"].as_array().into_iter().flatten())
+                .map(|c| c["id"].as_str().unwrap())
+                .collect();
+            let outputs: Vec<_> = messages
+                .iter()
+                .filter(|m| m["role"] == "tool")
+                .map(|m| {
+                    (
+                        m["tool_call_id"].as_str().unwrap(),
+                        m["content"].as_str().unwrap(),
+                    )
+                })
+                .collect();
+            fixture::check_history(round, &ids, &outputs);
+        }
     }
 
     #[tokio::test]

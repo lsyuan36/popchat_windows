@@ -399,7 +399,9 @@ async fn cancelling_connection_test_while_waiting_never_contacts_service() {
     saved.enabled = false;
     let id = saved.id;
     let (approval_tx, mut approval_rx) = mpsc::unbounded_channel();
-    let (tx, _) = mpsc::unbounded_channel();
+    // This fixture cancels *while the prompt is open*. Dropping this receiver
+    // here would already cancel the turn, before any prompt could be produced.
+    let (tx, _activity_rx) = mpsc::unbounded_channel();
     let turn = McpTurn::new(
         vec![(saved, String::new())],
         false,
@@ -410,16 +412,26 @@ async fn cancelling_connection_test_while_waiting_never_contacts_service() {
         },
     );
     let mut catalog = turn.open(&tx).await.unwrap();
-    let task = tokio::spawn(async move {
-        catalog
-            .execute(
-                "test_mcp_service",
-                &json!({"service_id":id}).to_string(),
-                &tx,
-            )
-            .await
-    });
-    let mut request = approval_rx.recv().await.unwrap();
+    let (closed_tx, closed_rx) = mpsc::unbounded_channel();
+    drop(closed_rx);
+    let args = json!({"service_id":id}).to_string();
+    let stopped = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        catalog.execute("test_mcp_service", &args, &closed_tx),
+    )
+    .await
+    .unwrap();
+    assert!(stopped.contains("未送出"));
+    assert!(
+        approval_rx.try_recv().is_err(),
+        "a cancelled chat cannot open a new prompt"
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+    let task = tokio::spawn(async move { catalog.execute("test_mcp_service", &args, &tx).await });
+    let mut request = tokio::time::timeout(std::time::Duration::from_secs(5), approval_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
     task.abort();
     let _ = task.await;
     tokio::time::timeout(std::time::Duration::from_secs(2), request.respond.closed())
@@ -815,6 +827,135 @@ async fn dropping_turn_while_awaiting_approval_never_executes_the_pending_tool()
 }
 
 #[tokio::test]
+async fn stopping_after_approved_rpc_reaches_service_leaves_outcome_unknown() {
+    use crate::chat::activity::{ActivityKind, ActivityState};
+    use std::time::Duration;
+    let remote = MockServer::start().await;
+    let (received, mut entered) = mpsc::unbounded_channel();
+    Mock::given(method("POST"))
+        .respond_with(move |request: &Request| {
+            let body: Value = request.body_json().unwrap();
+            let result = match body["method"].as_str().unwrap() {
+                "initialize" => json!({"protocolVersion":"2025-06-18","capabilities":{"tools":{}}}),
+                "tools/list" => json!({"tools":tools()}),
+                "tools/call" => {
+                    received.send(()).unwrap();
+                    return ResponseTemplate::new(200)
+                        .set_body_json(
+                            json!({"jsonrpc":"2.0","id":body["id"],"result":{"content":[]}}),
+                        )
+                        .set_delay(Duration::from_secs(15));
+                }
+                _ => return ResponseTemplate::new(202),
+            };
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"jsonrpc":"2.0","id":body["id"],"result":result}))
+        })
+        .mount(&remote)
+        .await;
+    let (approval_tx, mut approvals) = mpsc::unbounded_channel();
+    let turn = McpTurn::new(
+        vec![(service(&remote.uri()), String::new())],
+        false,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        move |r| {
+            approval_tx.send(r).unwrap();
+        },
+    );
+    let progress = turn.call_progress();
+    let (tx, mut events) = mpsc::unbounded_channel();
+    let mut catalog = turn.open(&tx).await.unwrap();
+    let name = catalog.schemas()[0]["function"]["name"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let task = tokio::spawn(async move { catalog.execute(&name, "{}", &tx).await });
+    let request = tokio::time::timeout(Duration::from_secs(5), approvals.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        entered.try_recv().is_err(),
+        "never send while waiting for authorization"
+    );
+    request.respond.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), entered.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let frozen = progress.stop();
+    assert_eq!(frozen.len(), 1);
+    assert_eq!(frozen[0].state, ActivityState::OutcomeUnknown);
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let mut updates = vec![];
+    while let Some(event) = events.recv().await {
+        if let ChatStreamEvent::ToolActivity(a) = event {
+            if a.kind == ActivityKind::McpTool {
+                assert_eq!(a.id, frozen[0].id);
+                updates.push(a);
+            }
+        }
+    }
+    assert_eq!(updates.last().unwrap().state, ActivityState::Running);
+    assert_eq!(
+        updates.last().unwrap().stopped_state(),
+        ActivityState::OutcomeUnknown
+    );
+    assert_eq!(
+        remote
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r
+                .body_json::<Value>()
+                .is_ok_and(|v| v["method"] == "tools/call"))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stop_between_consent_and_worker_dispatch_never_sends_rpc() {
+    use crate::chat::activity::ActivityState;
+    use std::time::Duration;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let server = server(calls.clone()).await;
+    let (prompts, mut approvals) = mpsc::unbounded_channel();
+    let turn = McpTurn::new(
+        vec![(service(&server.uri()), String::new())],
+        false,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        move |r| {
+            prompts.send(r).unwrap();
+        },
+    );
+    let progress = turn.call_progress();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut catalog = turn.open(&tx).await.unwrap();
+    let name = catalog.schemas()[0]["function"]["name"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let task = tokio::spawn(async move { catalog.execute(&name, "{}", &tx).await });
+    let prompt = tokio::time::timeout(Duration::from_secs(5), approvals.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    // Intentionally do not yield: consent is queued, but the worker hasn't
+    // crossed the dispatch gate. Replaying only the last UI event cannot tell.
+    prompt.respond.send(true).unwrap();
+    let stopped = progress.stop();
+    assert_eq!(stopped.len(), 1);
+    assert_eq!(stopped[0].state, ActivityState::CancelledBeforeSend);
+    assert!(task.await.unwrap().contains("未送出"));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn responses_actual_tool_loop_supports_mcp_without_native_credentials_or_web_tools() {
     use crate::chat::{
         chatgpt_auth::{TokenStore, Tokens},
@@ -932,6 +1073,7 @@ async fn tool_call_requires_explicit_approval_and_denial_executes_nothing() {
                 let _ = approval_tx.send(r);
             },
         );
+        let progress = turn.call_progress();
         let mut catalog = turn.open(&tx).await.unwrap();
         let mut discovery = vec![];
         while let Ok(ChatStreamEvent::ToolActivity(activity)) = rx.try_recv() {
@@ -971,6 +1113,19 @@ async fn tool_call_requires_explicit_approval_and_denial_executes_nothing() {
         );
         request.respond.send(approved).unwrap();
         let result = handle.await.unwrap();
+        // Stop before the UI consumes the final event must preserve what the
+        // worker actually received (including an explicit denial).
+        let finalized = progress.stop();
+        assert_eq!(finalized.len(), 1);
+        assert_eq!(finalized[0].id, lifecycle[0].id);
+        assert_eq!(
+            finalized[0].state,
+            if approved {
+                ActivityState::Succeeded
+            } else {
+                ActivityState::Denied
+            }
+        );
         while let Ok(ChatStreamEvent::ToolActivity(activity)) = rx.try_recv() {
             lifecycle.push(activity);
         }
