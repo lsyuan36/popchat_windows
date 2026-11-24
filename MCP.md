@@ -1,4 +1,9 @@
-# MCP Client（0.2.11）
+# MCP Client（0.2.12）
+
+## 0.2.12：OpenAI 工具相容性
+
+官方 Chat Completions 若拒絕工具與預設推理併用，本輪以 `reasoning_effort: "none"` 重送該模型請求一次。
+原有 MCP 工具與逐次授權維持不變；不重跑已執行的工具，也不更改設定或憑證。
 
 ## 0.2.11：停止等待與工具結果
 

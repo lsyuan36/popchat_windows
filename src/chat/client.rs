@@ -594,6 +594,31 @@ pub(super) async fn run_loop_with_client(
     tx: mpsc::UnboundedSender<ChatStreamEvent>,
     client: reqwest::Client,
 ) {
+    let reasoning_mode = CompletionToolReasoning::for_config(&config);
+    run_loop_with_reasoning_mode(
+        history,
+        config,
+        web_access,
+        mcp,
+        session_id,
+        tx,
+        client,
+        reasoning_mode,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_loop_with_reasoning_mode(
+    history: Vec<WireMessage>,
+    config: ProviderConfig,
+    web_access: impl Into<TurnWeb>,
+    mcp: Option<super::mcp::McpTurn>,
+    session_id: uuid::Uuid,
+    tx: mpsc::UnboundedSender<ChatStreamEvent>,
+    client: reqwest::Client,
+    mut reasoning_mode: CompletionToolReasoning,
+) {
     let mut messages = history;
     let mut visible = String::new();
     let mut reasoning = String::new();
@@ -624,6 +649,7 @@ pub(super) async fn run_loop_with_client(
             &web_access,
             mcp.as_ref().map(|c| c.schemas()).unwrap_or(&[]),
             choice,
+            &mut reasoning_mode,
             &visible,
             &reasoning,
             &tx,
@@ -725,6 +751,73 @@ impl ClientError {
             context_overflow: false,
             content_rejection: None,
         }
+    }
+}
+
+fn completion_endpoint(base_url: &str) -> Result<reqwest::Url, ClientError> {
+    let mut url = reqwest::Url::parse(base_url)
+        .map_err(|_| ClientError::new(format!("Invalid base URL: {base_url}")))?;
+    url.path_segments_mut()
+        .map_err(|_| ClientError::new(format!("Invalid base URL: {base_url}")))?
+        .pop_if_empty()
+        .push("chat")
+        .push("completions");
+    Ok(url)
+}
+
+/// Ordinary Chat Completions requests leave effort to the model. Only the
+/// official endpoint's specific tool/effort validation error opts this turn
+/// into `none`. Never switch endpoint, credentials, or saved preferences.
+#[derive(Default)]
+struct CompletionToolReasoning {
+    endpoint: Option<reqwest::Url>,
+    use_none: bool,
+}
+
+impl CompletionToolReasoning {
+    fn for_config(config: &ProviderConfig) -> Self {
+        let endpoint = completion_endpoint(&config.base_url).ok().filter(|url| {
+            config.kind == ProviderKind::OpenAICompatible
+                && url.as_str() == "https://api.openai.com/v1/chat/completions"
+        });
+        Self {
+            endpoint,
+            use_none: false,
+        }
+    }
+
+    fn should_retry(
+        &self,
+        request: &reqwest::Url,
+        response: &reqwest::Url,
+        status: reqwest::StatusCode,
+        body: &serde_json::Value,
+        error_body: &str,
+    ) -> bool {
+        if self.use_none
+            || self.endpoint.as_ref() != Some(request)
+            || request != response
+            || status != reqwest::StatusCode::BAD_REQUEST
+            || !body["tools"]
+                .as_array()
+                .is_some_and(|tools| tools.iter().any(|tool| tool["type"] == "function"))
+        {
+            return false;
+        }
+        let Ok(error) = serde_json::from_str::<serde_json::Value>(error_body) else {
+            return false;
+        };
+        let error = &error["error"];
+        error["type"] == "invalid_request_error"
+            && error["param"] == "reasoning_effort"
+            && error["message"].as_str().is_some_and(|message| {
+                let message = message.to_ascii_lowercase();
+                message.contains("function tools with reasoning_effort are not supported")
+                    && message.contains("/v1/chat/completions")
+                    && (message.contains("set reasoning_effort to 'none'")
+                        || message.contains("set reasoning_effort to \"none\"")
+                        || message.contains("set reasoning_effort to `none`"))
+            })
     }
 }
 
@@ -860,17 +953,12 @@ async fn stream_one_round(
     web_access: &TurnWeb,
     mcp_tools: &[serde_json::Value],
     choice: RoundToolChoice,
+    reasoning_mode: &mut CompletionToolReasoning,
     visible_prefix: &str,
     reasoning_prefix: &str,
     tx: &mpsc::UnboundedSender<ChatStreamEvent>,
 ) -> Result<RoundOutcome, ClientError> {
-    let mut url = reqwest::Url::parse(&config.base_url)
-        .map_err(|_| ClientError::new(format!("Invalid base URL: {}", config.base_url)))?;
-    url.path_segments_mut()
-        .map_err(|_| ClientError::new(format!("Invalid base URL: {}", config.base_url)))?
-        .pop_if_empty()
-        .push("chat")
-        .push("completions");
+    let url = completion_endpoint(&config.base_url)?;
 
     // The body mixes typed messages with schema JSON, so it is assembled as
     // a JSON value rather than one big struct.
@@ -881,9 +969,8 @@ async fn stream_one_round(
         "messages": serde_json::to_value(messages)
             .map_err(|e| ClientError::new(format!("Encoding messages failed: {e}")))?,
     });
-    // `reasoning_effort` is deliberately NOT sent here (same as the Swift
-    // client): `/models` standardizes no capability metadata, so the effort
-    // only travels on backends that advertise it.
+    // Do not send the saved effort on generic endpoints: `/models` does not
+    // standardize capability metadata. The verified OpenAI fallback is below.
     match web_access {
         TurnWeb::Local(_) if choice != RoundToolChoice::None => {
             let mut tools: Vec<serde_json::Value> = serde_json::from_str(TOOLS_JSON)
@@ -915,13 +1002,32 @@ async fn stream_one_round(
         }
     }
 
-    let response = completion_request(client, url, config, &body, session_id)
-        .send()
-        .await
-        .map_err(|e| ClientError::new(format!("Request failed: {e}")))?;
-    if response.status() != reqwest::StatusCode::OK {
-        let code = response.status().as_u16();
+    let response = loop {
+        if reasoning_mode.use_none && reasoning_mode.endpoint.as_ref() == Some(&url) {
+            body["reasoning_effort"] = serde_json::json!("none");
+        }
+        let response = completion_request(client, url.clone(), config, &body, session_id)
+            .send()
+            .await
+            .map_err(|e| ClientError::new(format!("Request failed: {e}")))?;
+        let status = response.status();
+        if status == reqwest::StatusCode::OK {
+            break response;
+        }
+        let response_url = response.url().clone();
         let error_body = read_error_body(response).await?;
+        if !tx.is_closed()
+            && reasoning_mode.should_retry(&url, &response_url, status, &body, &error_body)
+        {
+            // A rejected model request has no new calls to run. Replay the
+            // same messages, including any prior tool outputs, not the tools.
+            reasoning_mode.use_none = true;
+            let _ = tx.send(ChatStreamEvent::Status(
+                "OpenAI 工具相容模式：本輪關閉推理強度，保留工具…".into(),
+            ));
+            continue;
+        }
+        let code = status.as_u16();
         let host = url_host(&config.base_url);
         return Err(ClientError {
             context_overflow: matches!(code, 400 | 413 | 422)
@@ -939,7 +1045,7 @@ async fn stream_one_round(
             ),
             content_rejection: attribute_content_rejection(code, &error_body, messages),
         });
-    }
+    };
 
     let mut visible = visible_prefix.to_string();
     let mut round_text = String::new();
@@ -1466,6 +1572,239 @@ mod tests {
         })
         .await
         .expect("turn must complete without waiting for HTTP EOF")
+    }
+
+    fn tool_reasoning_error() -> Value {
+        json!({"error":{
+            "message":"Function tools with reasoning_effort are not supported for gpt-6.2-sol in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.",
+            "type":"invalid_request_error",
+            "param":"reasoning_effort",
+            "code":null
+        }})
+    }
+
+    #[test]
+    fn tool_reasoning_fallback_requires_official_endpoint_and_specific_validation_error() {
+        let config = config("https://api.openai.com/v1/".into());
+        let mode = CompletionToolReasoning::for_config(&config);
+        let url =
+            completion_endpoint(&config.base_url).unwrap_or_else(|_| panic!("valid endpoint"));
+        assert_eq!(mode.endpoint.as_ref(), Some(&url));
+        for base in [
+            "https://api.openai.com.example/v1",
+            "http://api.openai.com/v1",
+            "https://api.openai.com:8443/v1",
+            "https://api.openai.com/proxy/v1",
+            "https://api.openai.com/v1?tenant=custom",
+        ] {
+            let mut custom = config.clone();
+            custom.base_url = base.into();
+            assert!(CompletionToolReasoning::for_config(&custom)
+                .endpoint
+                .is_none());
+        }
+        for kind in [
+            ProviderKind::OpenCodeGo,
+            ProviderKind::ChatGPT,
+            ProviderKind::CodexAppServer,
+        ] {
+            let mut other = config.clone();
+            other.kind = kind;
+            assert!(CompletionToolReasoning::for_config(&other)
+                .endpoint
+                .is_none());
+        }
+        let body = json!({"tools":[{"type":"function","function":{"name":"fetch_url"}}]});
+        let error = tool_reasoning_error().to_string();
+        use reqwest::StatusCode;
+        assert!(mode.should_retry(&url, &url, StatusCode::BAD_REQUEST, &body, &error));
+        assert!(!mode.should_retry(&url, &url, StatusCode::TOO_MANY_REQUESTS, &body, &error));
+        assert!(!mode.should_retry(&url, &url, StatusCode::BAD_REQUEST, &json!({}), &error));
+        let redirected =
+            reqwest::Url::parse("https://example.invalid/v1/chat/completions").unwrap();
+        assert!(!mode.should_retry(&url, &redirected, StatusCode::BAD_REQUEST, &body, &error));
+        for (field, value) in [
+            ("type", "other_error"),
+            ("param", "messages[0].content"),
+            (
+                "message",
+                "Unsupported value: 'none' is not supported for this model.",
+            ),
+        ] {
+            let mut other = tool_reasoning_error();
+            other["error"][field] = json!(value);
+            assert!(!mode.should_retry(
+                &url,
+                &url,
+                StatusCode::BAD_REQUEST,
+                &body,
+                &other.to_string()
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_reasoning_replays_only_rejected_request_and_keeps_none_for_the_turn() {
+        for reject_after_tool in [false, true] {
+            let server = MockServer::start().await;
+            let page = format!("{}/page", server.uri());
+            Mock::given(method("GET"))
+                .and(path("/page"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("<p>fixture result</p>"))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(move |request: &Request| {
+                    let body: Value = request.body_json().unwrap();
+                    let has_output = body["messages"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|m| m["role"] == "tool");
+                    if has_output == reject_after_tool && body["reasoning_effort"].is_null() {
+                        return ResponseTemplate::new(400).set_body_json(tool_reasoning_error());
+                    }
+                    let stream = if has_output {
+                        format!("{}data: [DONE]\n\n", sse(json!({"content":"Final answer"})))
+                    } else {
+                        tool_sse("fetch_url", json!({"url":page}))
+                    };
+                    ResponseTemplate::new(200).set_body_string(stream)
+                })
+                .expect(3)
+                .mount(&server)
+                .await;
+            let mut config = config(format!("{}/v1", server.uri()));
+            config.model = "gpt-6.2-sol".into();
+            let mode = CompletionToolReasoning {
+                endpoint: Some(
+                    reqwest::Url::parse(&format!("{}/v1/chat/completions", server.uri())).unwrap(),
+                ),
+                ..Default::default()
+            };
+            let (tx, rx) = mpsc::unbounded_channel();
+            tokio::spawn(run_loop_with_reasoning_mode(
+                history(),
+                config,
+                Some(WebAccess::LocalTools(SearchEngineConfig::duckduckgo())),
+                Some(super::web::pause_fixture::mcp()),
+                uuid::Uuid::new_v4(),
+                tx,
+                reqwest::Client::new(),
+                mode,
+            ));
+            let events = collect(rx).await;
+            assert_eq!(
+                events.last(),
+                Some(&ChatStreamEvent::Done("Final answer".into()))
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(
+                        |e| matches!(e, ChatStreamEvent::Status(s) if s.contains("工具相容模式"))
+                    )
+                    .count(),
+                1
+            );
+            assert_eq!(events.iter().filter(|e| matches!(e, ChatStreamEvent::ToolActivity(a) if a.kind == super::super::activity::ActivityKind::Fetch)).count(), 2);
+            assert!(!events
+                .iter()
+                .any(|e| matches!(e, ChatStreamEvent::Error(_))));
+            server.verify().await;
+            let mut bodies: Vec<Value> = server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.url.path() == "/v1/chat/completions")
+                .map(|r| r.body_json().unwrap())
+                .collect();
+            assert!(bodies[0].get("reasoning_effort").is_none());
+            let retry = usize::from(reject_after_tool) + 1;
+            assert!(bodies[retry..]
+                .iter()
+                .all(|b| b["reasoning_effort"] == "none"));
+            assert!(bodies.last().unwrap()["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["tool_call_id"] == "call-1" && m["content"] == "fixture result"));
+            assert!(bodies[retry]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["function"]["name"] == "mcp_status"));
+            bodies[retry]
+                .as_object_mut()
+                .unwrap()
+                .remove("reasoning_effort");
+            assert_eq!(bodies[retry - 1], bodies[retry]);
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_reasoning_never_retries_custom_endpoint_or_loops_on_rejection() {
+        for eligible in [false, true] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v1/chat/completions"))
+                .respond_with(ResponseTemplate::new(400).set_body_json(tool_reasoning_error()))
+                .expect(if eligible { 2 } else { 1 })
+                .mount(&server)
+                .await;
+            let config = config(format!("{}/v1", server.uri()));
+            let (tx, rx) = mpsc::unbounded_channel();
+            let web = Some(WebAccess::LocalTools(SearchEngineConfig::duckduckgo()));
+            let session = uuid::Uuid::new_v4();
+            if eligible {
+                let mode = CompletionToolReasoning {
+                    endpoint: Some(
+                        reqwest::Url::parse(&format!("{}/v1/chat/completions", server.uri()))
+                            .unwrap(),
+                    ),
+                    ..Default::default()
+                };
+                tokio::spawn(run_loop_with_reasoning_mode(
+                    history(),
+                    config,
+                    web,
+                    None,
+                    session,
+                    tx,
+                    reqwest::Client::new(),
+                    mode,
+                ));
+            } else {
+                tokio::spawn(run_loop_with_client(
+                    history(),
+                    config,
+                    web,
+                    None,
+                    session,
+                    tx,
+                    reqwest::Client::new(),
+                ));
+            }
+            assert!(
+                matches!(collect(rx).await.last(), Some(ChatStreamEvent::Error(s)) if s.starts_with("HTTP 400"))
+            );
+            server.verify().await;
+            let requests = server.received_requests().await.unwrap();
+            assert!(requests[0]
+                .body_json::<Value>()
+                .unwrap()
+                .get("reasoning_effort")
+                .is_none());
+            if eligible {
+                assert_eq!(
+                    requests[1].body_json::<Value>().unwrap()["reasoning_effort"],
+                    "none"
+                );
+            }
+        }
     }
 
     #[tokio::test]

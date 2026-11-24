@@ -2,7 +2,7 @@
 
 輕量的 Windows 浮動 AI 聊天面板，以 **Rust + egui/eframe** 實作。
 
-**Windows 移植／維護：Evis Lai** · 目前版本：**0.2.11**
+**Windows 移植／維護：Evis Lai** · 目前版本：**0.2.12**
 
 > 本專案移植自 **Le Chen / lec77** 的 macOS 專案
 > **[lec77/PopChat](https://github.com/lec77/PopChat)**。
@@ -11,8 +11,10 @@
 
 ## 下載與啟動
 
-從 **[GitHub Releases](https://github.com/lsyuan36/popchat_windows/releases/tag/v0.2.11)**
-下載 **`PopChat-0.2.11-Windows-x64-Setup.exe`**（NSIS 安裝程式）。
+從 **[GitHub Releases](https://github.com/lsyuan36/popchat_windows/releases/tag/v0.2.12)**
+下載 **`PopChat-0.2.12-Windows-x64-Setup.exe`**（NSIS 安裝程式）。
+**0.2.12** 修正部分新 OpenAI 模型的工具相容性：官方 Chat Completions 回傳對應的 HTTP 400 時，
+只重送該模型請求一次並指定 `reasoning_effort: "none"`，不重跑工具、不切換服務或更改設定。
 **0.2.11** 修正工具活動的狀態：停止 MCP 時能區分「未送出」與「遠端結果未知」；
 連續兩次 HTTP 202／429 後，本輪暫停搜尋，後續未送出的查詢只算「略過」。
 `Ctrl+F` 可展開活動並定位到命中的文字，包含舊查詢中的 `Vec<T>`；原始錯誤 HTML 不會被搜到。
@@ -145,7 +147,7 @@ HTTP 首版僅支援手動 Bearer token，不提供自動 OAuth 登入。
 設定 → Skills → 管理技能／掃描來源，可讀取 OpenCode、Claude、Codex／共用 Agents
 的個人預設路徑，也可明確指定專案或自訂資料夾。新技能預設停用，需個別啟用；
 只先提供名稱與說明，模型需要時才載入全文與技能目錄內的文字參考檔。
-不修改其他工具設定，不自動執行技能腳本。詳見 [SKILLS.md](https://github.com/lsyuan36/popchat_windows/blob/v0.2.11/SKILLS.md)。
+不修改其他工具設定，不自動執行技能腳本。詳見 [SKILLS.md](https://github.com/lsyuan36/popchat_windows/blob/v0.2.12/SKILLS.md)。
 **0.2.4 及更早版本不含 Skills 設定，需升級至 0.2.6。**
 
 ## 資料與隱私
