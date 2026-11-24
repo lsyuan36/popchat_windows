@@ -25,9 +25,9 @@ pub use crate::chat::providers::{ContentCapability, ProviderKind};
 
 // MARK: - ProviderConfig
 
-/// Runtime config for one OpenAI-compatible endpoint. The base URL is used
-/// as-is with `chat/completions` appended — include a `/v1` suffix where the
-/// provider requires it.
+/// Runtime config for a provider. API-key endpoints use `chat/completions`
+/// unless a model has a documented route on the official OpenAI API. The base
+/// URL must include `/v1` where the provider requires it.
 #[derive(Debug, Clone)]
 pub struct ProviderConfig {
     pub base_url: String,
@@ -573,6 +573,12 @@ async fn run_loop(
     session_id: uuid::Uuid,
     tx: mpsc::UnboundedSender<ChatStreamEvent>,
 ) {
+    if let Some(endpoint) =
+        super::responses::openai_api_endpoint(config.kind, &config.base_url, &config.model)
+    {
+        super::responses::run_openai_api(history, config, web_access, mcp, endpoint, &tx).await;
+        return;
+    }
     let client = match http_client_builder(config.kind).build() {
         Ok(client) => client,
         Err(error) => {
@@ -1576,7 +1582,7 @@ mod tests {
 
     fn tool_reasoning_error() -> Value {
         json!({"error":{
-            "message":"Function tools with reasoning_effort are not supported for gpt-6.2-sol in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.",
+            "message":"Function tools with reasoning_effort are not supported for gpt-6-sol in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.",
             "type":"invalid_request_error",
             "param":"reasoning_effort",
             "code":null
@@ -1677,7 +1683,7 @@ mod tests {
                 .mount(&server)
                 .await;
             let mut config = config(format!("{}/v1", server.uri()));
-            config.model = "gpt-6.2-sol".into();
+            config.model = "gpt-6-sol".into();
             let mode = CompletionToolReasoning {
                 endpoint: Some(
                     reqwest::Url::parse(&format!("{}/v1/chat/completions", server.uri())).unwrap(),

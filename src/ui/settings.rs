@@ -1477,6 +1477,19 @@ impl SettingsUi {
                 self.start_model_fetch(runtime, ui.ctx().clone());
             }
         });
+        if self.provider.as_ref().is_some_and(|provider| {
+            crate::chat::responses::openai_api_endpoint(
+                provider.kind,
+                self.settings.base_url.trim(),
+                self.settings.model.trim(),
+            )
+            .is_some()
+        }) {
+            muted(
+                ui,
+                "此模型使用官方 OpenAI Responses API（/v1/responses），沿用此服務的 API 金鑰。",
+            );
+        }
         if self.fetch.is_some() {
             ui.horizontal(|ui| {
                 ui.spinner();

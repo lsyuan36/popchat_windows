@@ -1,3 +1,8 @@
+# v0.2.13
+
+- 在官方 OpenAI 端點選用 `gpt-6.2-sol`、`gpt-6.2-astra`、`gpt-6.1-sol` 或 `gpt-6-astra` 時，聊天、工具回合與 Auto Compact 摘要直接使用公開 `/v1/responses`，避免 `/v1/chat/completions` 要求 `reasoning_effort: "none"`、模型卻不接受的衝突。既有金鑰、Provider、模型選擇及歷史不需遷移；MCP 逐次授權、其他 API 服務及 Opencode Go 不變。
+- 完整離線回歸：724 項通過、3 項忽略。Responses 串流、工具結果回傳、MCP 逐次授權、重新導向攔截及 Auto Compact 復原均使用本機模擬驗證，未呼叫真實 OpenAI API。
+
 # v0.2.12
 
 - 修正部分新 OpenAI 模型在官方 `/v1/chat/completions` 拒絕「工具宣告＋預設推理」時的 HTTP 400。僅在收到對應的驗證錯誤時，以 `reasoning_effort: "none"` 重送該模型請求一次，並沿用於該次工具流程；不重跑已完成的工具，不切換端點、不更改其他 Provider 或 MCP 逐次授權。

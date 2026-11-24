@@ -1,4 +1,9 @@
-# MCP Client（0.2.12）
+# MCP Client（0.2.13）
+
+## 0.2.13：按模型選擇 OpenAI API
+
+官方 OpenAI 的指定推理模型改用 `/v1/responses`，沿用原 API 金鑰，不使用 ChatGPT 訂閱憑證。
+MCP 仍由 PopChat 本機連線、管理工具與逐次詢問授權，不把 MCP 憑證交給模型。
 
 ## 0.2.12：OpenAI 工具相容性
 

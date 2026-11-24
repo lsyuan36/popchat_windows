@@ -644,6 +644,94 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn public_responses_overflow_summary_and_recovered_answer_use_the_same_transport() {
+        fn local_responses_turn(
+            history: Vec<WireMessage>,
+            config: ProviderConfig,
+            web: Option<WebAccess>,
+            mcp: Option<super::super::mcp::McpTurn>,
+            _: Uuid,
+        ) -> mpsc::UnboundedReceiver<ChatStreamEvent> {
+            assert_eq!(
+                super::super::responses::openai_api_endpoint(
+                    config.kind,
+                    "https://api.openai.com/v1",
+                    &config.model,
+                ),
+                Some("https://api.openai.com/v1/responses")
+            );
+            let base = reqwest::Url::parse(&config.base_url).unwrap();
+            assert_eq!(base.host_str(), Some("127.0.0.1"));
+            let endpoint = base.join("/v1/responses").unwrap().to_string();
+            let (tx, rx) = mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                super::super::responses::run_openai_api(history, config, web, mcp, &endpoint, &tx)
+                    .await;
+            });
+            rx
+        }
+        let server = MockServer::start().await;
+        let answers = Arc::new(AtomicUsize::new(0));
+        let count = answers.clone();
+        Mock::given(method("POST")).and(path("/v1/responses"))
+            .respond_with(move |request: &Request| {
+                let body: serde_json::Value = request.body_json().unwrap();
+                assert_eq!(body["model"], "gpt-6.2-sol");
+                let instructions = body["instructions"].as_str().unwrap();
+                let input = body["input"].as_array().unwrap();
+                let text = if instructions.contains(SUMMARY_SYSTEM) {
+                    assert!(body.get("tools").is_none());
+                    assert_eq!(input.last().unwrap()["content"], SUMMARY_TASK);
+                    "Short checkpoint of old project facts."
+                } else {
+                    assert_eq!(instructions, "ORIGINAL_SYSTEM_EXACT");
+                    assert_eq!(input.last().unwrap()["content"], "LATEST_REQUEST");
+                    if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                        assert!(!input[0]["content"].as_str().unwrap().contains("<conversation_checkpoint>"));
+                        return ResponseTemplate::new(400)
+                            .set_body_json(json!({"error":{"code":"context_length_exceeded"}}));
+                    }
+                    assert!(input[0]["content"].as_str().unwrap().contains("<conversation_checkpoint>"));
+                    "recovered"
+                };
+                ResponseTemplate::new(200)
+                    .set_body_raw(format!("data: {}\n\ndata: {}\n\n",
+                        json!({"type":"response.output_text.delta","delta":text}),
+                        json!({"type":"response.completed","response":{"usage":{"input_tokens":81,"output_tokens":10}}})
+                    ),"text/event-stream")
+            }).mount(&server).await;
+        let mut config = config(&server);
+        config.model = "gpt-6.2-sol".into();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            run_inner(
+                history(),
+                config,
+                None,
+                request(1_000_000),
+                None,
+                &tx,
+                local_responses_turn,
+            )
+            .await;
+        });
+        let events = collect(&mut rx).await;
+        assert_eq!(
+            events.last(),
+            Some(&ChatStreamEvent::Done("recovered".into()))
+        );
+        assert_eq!(answers.load(Ordering::SeqCst), 2);
+        assert!(events.iter().any(|event| matches!(event, ChatStreamEvent::ContextUpdate(state) if state.checkpoint.is_some() && state.measurement.is_some())));
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests.len() >= 3
+                && requests
+                    .iter()
+                    .all(|request| request.url.path() == "/v1/responses")
+        );
+    }
+
     fn history() -> Vec<WireMessage> {
         let mut messages = vec![text_message("system", "ORIGINAL_SYSTEM_EXACT")];
         for index in 0..12 {

@@ -2,7 +2,7 @@
 
 輕量的 Windows 浮動 AI 聊天面板，以 **Rust + egui/eframe** 實作。
 
-**Windows 移植／維護：Evis Lai** · 目前版本：**0.2.12**
+**Windows 移植／維護：Evis Lai** · 目前版本：**0.2.13**
 
 > 本專案移植自 **Le Chen / lec77** 的 macOS 專案
 > **[lec77/PopChat](https://github.com/lec77/PopChat)**。
@@ -11,10 +11,10 @@
 
 ## 下載與啟動
 
-從 **[GitHub Releases](https://github.com/lsyuan36/popchat_windows/releases/tag/v0.2.12)**
-下載 **`PopChat-0.2.12-Windows-x64-Setup.exe`**（NSIS 安裝程式）。
-**0.2.12** 修正部分新 OpenAI 模型的工具相容性：官方 Chat Completions 回傳對應的 HTTP 400 時，
-只重送該模型請求一次並指定 `reasoning_effort: "none"`，不重跑工具、不切換服務或更改設定。
+從 **[GitHub Releases](https://github.com/lsyuan36/popchat_windows/releases/tag/v0.2.13)**
+下載 **`PopChat-0.2.13-Windows-x64-Setup.exe`**（NSIS 安裝程式）。
+**0.2.13** 讓 `gpt-6.2-sol` 等指定模型直接使用官方 `/v1/responses`，保留推理與工具，
+不再嘗試模型不支援的 `reasoning_effort: "none"`。不用改端點設定或重填 API 金鑰。
 **0.2.11** 修正工具活動的狀態：停止 MCP 時能區分「未送出」與「遠端結果未知」；
 連續兩次 HTTP 202／429 後，本輪暫停搜尋，後續未送出的查詢只算「略過」。
 `Ctrl+F` 可展開活動並定位到命中的文字，包含舊查詢中的 `Vec<T>`；原始錯誤 HTML 不會被搜到。
@@ -107,6 +107,14 @@ ChatGPT／Codex 整合的可用性取決於帳號、方案、外部工具及服�
 Codex app-server 沿用其原生上下文管理。實作邊界與隔離驗證見 [AUTO_COMPACT.md](https://github.com/lsyuan36/popchat_windows/blob/main/AUTO_COMPACT.md)。
 原先的 0.2.1 初始包只有預算設定；0.2.2 已包含完整接線，既有安裝不會因原始碼改動自行變更。
 
+## 官方 OpenAI 模型的 API 路由
+
+若 API 端點為 `https://api.openai.com/v1`，選用 `gpt-6.2-sol`、`gpt-6.2-astra`、
+`gpt-6.1-sol` 或 `gpt-6-astra` 時，聊天、工具與摘要會使用 `/v1/responses`，
+避免 [Chat Completions 的推理與函式工具限制](https://developers.openai.com/api/docs/guides/reasoning#reasoning-effort)。
+沿用此服務的 API 金鑰，**不必改寫端點或登入 ChatGPT**。搜尋及 MCP 工具仍由 PopChat 執行，
+MCP 維持逐次確認。其他模型、自訂相容端點與 Opencode Go 保持原路徑；失敗時不會改送別的端點。
+
 ## OpenCode Go（0.2.9）
 
 `MissingSessionID`／缺少 `x-opencode-session` 指向客戶端請求缺少標頭，並非金鑰錯誤的判定。
@@ -147,7 +155,7 @@ HTTP 首版僅支援手動 Bearer token，不提供自動 OAuth 登入。
 設定 → Skills → 管理技能／掃描來源，可讀取 OpenCode、Claude、Codex／共用 Agents
 的個人預設路徑，也可明確指定專案或自訂資料夾。新技能預設停用，需個別啟用；
 只先提供名稱與說明，模型需要時才載入全文與技能目錄內的文字參考檔。
-不修改其他工具設定，不自動執行技能腳本。詳見 [SKILLS.md](https://github.com/lsyuan36/popchat_windows/blob/v0.2.12/SKILLS.md)。
+不修改其他工具設定，不自動執行技能腳本。詳見 [SKILLS.md](https://github.com/lsyuan36/popchat_windows/blob/v0.2.13/SKILLS.md)。
 **0.2.4 及更早版本不含 Skills 設定，需升級至 0.2.6。**
 
 ## 資料與隱私
